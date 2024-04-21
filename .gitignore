@@ -1,8 +1,10 @@
 __pycache__
 
 /.vscode
-/data
+# /data
 /learn
 /mytest
 /others
-/*json
+*.json
+*.parquet
+*.txt
