@@ -1,86 +1,22 @@
 import os
 import importlib
 
-import json
-
 import sentencepiece as spm
-
 import tokenizers
 from tokenizers import ByteLevelBPETokenizer, Tokenizer
 from tokenizers.normalizers import NFKC
 from tokenizers.pre_tokenizers import Split, ByteLevel
 from tokenizers.trainers import BpeTrainer
-
 from transformers import PreTrainedTokenizerFast
 
 from config import TrainTokenizerConfig
 from utils import kwargs_parse
 
 
-def convert_mem2num(mem_str: str) -> int:
-    '''
-    将内存字符串转换为数字
-    如 "2M" -> 2 * 1024 * 1024
-    '''
-    # 转为大写
-    mem_str = mem_str.upper()
-    if mem_str[-1] == "K":
-        return int(float(mem_str[:-1]) * 1024)
-    elif mem_str[-1] == "M":
-        return int(float(mem_str[:-1]) * 1024 * 1024)
-    elif mem_str[-1] == "G":
-        return int(float(mem_str[:-1]) * 1024 * 1024 * 1024)
-    else:
-        raise ValueError("内存字符串格式错误！单位应为K、M、G！")
-
-# 构建迭代器来训练，防止OOM
-# 经过训练，在22G左右的数据下，使用迭代器训练一样会卡住，在进度57/185的时候，占用89%内存，然后就卡住了
-def get_training_iterator(files_for_train_tokenizer: list, file_bytes="2M", max_train_bytes="5G"):
-    # 类似data/02_train_data/get_txt_for_tokenizer.py中的处理
-    # file_bytes: 一个文件的大小，单位为字节
-    file_bytes = convert_mem2num(file_bytes)
-    max_train_bytes = convert_mem2num(max_train_bytes)
-    
-    # 循环处理所有文件
-    buffer_data = []  # 一个文件的数据
-    sum_bytes = 0
-    train_bytes = 0
-    for file_path in files_for_train_tokenizer:
-        with open(file_path, "r", encoding="utf-8") as fjson:
-            # 读取所有行
-            for line in fjson.readlines():
-                # 将每一行转换为json格式
-                data = json.loads(line)
-                
-                # 按照不同情况，添加额外的标点符号
-                if len(data["title"] + data["desc"]) == 0:
-                    s = data["content"]
-                else:
-                    s = data["title"] + data["desc"] + "\n" + data["content"]
-                buffer_data.append(s)
-                
-                # 计算字节数
-                tmp = len(buffer_data[-1].encode("utf-8"))
-                sum_bytes += tmp
-                train_bytes += tmp
-                
-                if sum_bytes > file_bytes:
-                    yield buffer_data
-                    buffer_data = []
-                    sum_bytes = 0
-                    
-                    if train_bytes > max_train_bytes:
-                        break
-                    
-        if train_bytes > max_train_bytes:
-            break
-                    
-    # 记得最后剩余的数据
-    if len(buffer_data) > 0:
-        yield buffer_data
-
-
 def train_hf_tokenizer(trainTokenizerConfig):
+    tokenizer_slow_save_path = trainTokenizerConfig.save_dir + "/my_hf_bbpe_tokenizer.json"
+    tokenizer_fast_save_path = trainTokenizerConfig.save_dir + "/my_hf_bbpe_tokenizer"
+    
     # 使用hf的ByteLevelBPETokenizer训练，修改了pre_tokenizer，使用自己的正则表达式进行预分词
 
     tokenizer = ByteLevelBPETokenizer()  # 会预先构建256的词表
@@ -103,28 +39,45 @@ def train_hf_tokenizer(trainTokenizerConfig):
     elif trainTokenizerConfig.file_type == "json":
         # 2. 使用迭代器训练
         tokenizer.train_from_iterator(
-            get_training_iterator(trainTokenizerConfig.files_for_train_tokenizer),
+            trainTokenizerConfig.iterator_for_train_tokenizer,
             vocab_size=trainTokenizerConfig.vocab_size,
             show_progress=True,
         )
     else:
         raise ValueError("file_type must be 'txt' or 'json'")
     
+    # 添加 \t \n 
+    if '\t' not in tokenizer.get_vocab():
+        tokenizer.add_tokens(['\t'])
+    if '\n' not in tokenizer.get_vocab():
+        tokenizer.add_tokens(['\n'])
+    
     # 训练完后再添加特殊token
     tokenizer.add_special_tokens(trainTokenizerConfig.SPECIAL_TOKENS)
     
-    tokenizer.save("./tokenizer/my_hf_bbpe_tokenizer.json")
+    tokenizer.save(tokenizer_slow_save_path)
     
-    print("finish!")
+    # 保存FastTokenizer，保存后可以通过AutoTokenizer.from_pretrained("my_hf_bbpe_tokenizer")加载
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer)
+    tokenizer.save_pretrained(tokenizer_fast_save_path)
+    
+    print(f'slow tokenizer save in path: {tokenizer_slow_save_path}')
+    print(f'fast tokenizer save in path: {tokenizer_fast_save_path}')
+
+    print(f"\ntrain tokenizer finished. you can use `AutoTokenizer.from_pretrained('{tokenizer_fast_save_path}')` to load and test your tokenizer.")
 
 
 def train_spm_tokenizer(trainTokenizerConfig) -> None:
     '''
     使用sentencepiece训练BPE，缺点只能加载300万行，16G内存会OOM
     '''
+    tokenizer_save_path = trainTokenizerConfig.save_dir
+    model_prefix = "my_spm_bbpe_tokenizer"
+    model_prefix = f"{tokenizer_save_path}/{model_prefix}/{model_prefix}"
+    
     tokenizer = spm.SentencePieceTrainer.train(
         input=trainTokenizerConfig.files_for_train_tokenizer,  # 训练的文件列表或者单个文件
-        model_prefix='my_spm_bbpe_tokenizer',  # 保存的目录
+        model_prefix=model_prefix,  # 保存的目录
         model_type='bpe',
         vocab_size=trainTokenizerConfig.vocab_size,  # 其值应该大于等于字符表的大小
         user_defined_symbols=trainTokenizerConfig.SPECIAL_TOKENS,  # 特殊token
@@ -137,7 +90,8 @@ def train_spm_tokenizer(trainTokenizerConfig) -> None:
         character_coverage=0.9995,  # 控制字符表的大小，对于中文这种字符多的语言，设置为0.9995，对于英文，设置为1
         byte_fallback=True,  # 开启后，bpe就等价于bbpe
         unk_surface=r" \342\201\207 ",  # 未知token的表示，为"⁇"
-        normalization_rule_name="identity"  # 不进行任何规范化，若不指定，默认为"nmt_nfkc"
+        normalization_rule_name="identity",  # 不进行任何规范化，若不指定，默认为"nmt_nfkc"
+        required_chars="\t",  # 必须包含的字符，因为清洗的时候可能把\t给去掉了。。。这里添加一下
     )
 
 
@@ -161,6 +115,10 @@ if __name__ == '__main__':
     # # parser.add_argument("-v", "--vocab_size", type=int, required=True, help="vocab size")
     # parser.add_argument("-h", "--help", type=str, default="spm", help="hf or spm")
     # kwargs = vars(parser.parse_args())
+    
+    # 命令
+    # python train_tokenizer.py --train_method hf
+    # python train_tokenizer.py --train_method spm --train_size 10G
     
     # 解析命令行参数
     kwargs = kwargs_parse()

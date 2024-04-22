@@ -15,11 +15,11 @@
 | 英文  | wikipedia_en_20220301     | 11G     | .parquet                 | 20G, 103 | 19G     | 40/101|
 | 代码  | github-python             | 2.1G    | .json, 一行一json对象    | 2.2G, 11 | 2.0G    | 11/11 |
 
-`json文件
-{
-    gid: int, id: int, data_src: str, category: str, title: str, content: str, desc: str,
-    others: dict
-}`
+**json文件**，一行一个json对象
+
+`
+{ gid: int, id: int, data_src: str, category: str, title: str, content: str, desc: str, others: dict }
+`
 
 ### 命令
 1. `hfd.sh`，下载huggingface模型和数据集, (--model, dataset)
@@ -59,7 +59,9 @@
 
 6. 训练tokenizer时，训练集大小：20G，分成单位为200MB的txt文件
     1. hf， 占用内存：288G
-    2. spm，占用内存：60G
+    2. spm，占用内存：60G，错
+    训练集大小：3G，hf ，txt，内存峰值：97GB
+    训练集大小：5G，spm，txt，内存峰值：41GB
 
 ### 分词器（Tokenizer）
 
