@@ -15,10 +15,42 @@ def get_file_abspaths(file_dir: str, file_type:str = "txt") -> list:
                 file_abspaths.append(os.path.join(root, file))
     return file_abspaths
 
+HELP_MESSAGE = """help_message:
+    vocab_size = 64000  
+        # int. 词汇表大小
+    train_method = "hf"  
+        # str: (hf, spm). 训练tokenizer的工具
+    train_data_dir = "./data/02_train_data"  
+        # str. tokenizer训练集，可以包含json和txt，通过后续代码进行区分
+    file_type = "txt"  
+        # str: (txt, json). 使用txt文件训练，还是json文件进行迭代训练"""
+
 # ===================================================================================
 # 以下为TrainTokenizer的配置，dataclass表明会代码会先进入这个数据类进行一次初始化，然后实例的时候直接构建
 class TrainTokenizerConfig:
-    def __init__(self, file_type: str = "txt"):
+    def __init__(self, **kwargs):
+        # 以下为需要设置的属性
+        # ===================================================================================
+        self.vocab_size = 64000  # int. 词汇表大小
+        self.train_method = "hf"  # str: (hf, spm). 训练tokenizer的工具
+        self.train_data_dir = "./data/02_train_data"  # str. tokenizer训练集，可以包含json和txt，通过后续代码进行区分
+        self.file_type = "txt"  # str: (txt, json). 使用txt文件训练，还是json文件进行迭代训练
+        # ===================================================================================
+        # 防止报错的属性，值无所谓
+        self.config_module = "config.my_config"  # 该配置文件的模块位置
+        
+        # 提示信息
+        if kwargs.get('help', False):
+            print(HELP_MESSAGE)
+            exit()
+        # 使用kwargs更新self属性，若不存在或类型不符，则报错
+        for key, value in kwargs.items():
+            if key not in self.__dict__:
+                raise ValueError(f"不存在关键字：{key}！")
+            if type(value) != type(getattr(self, key)):
+                raise ValueError(f"关键字：{key} 的值的类型不符！要求{type(value)}，但是给定值为{type(getattr(self, key))}")
+            setattr(self, key, value)
+        
         # txt使用文件形式训练，json使用迭代形式训练
         # hf:  txt, json
         # spm: txt
@@ -32,10 +64,7 @@ class TrainTokenizerConfig:
         # txt中即将上述json的文本拼接为txt文件
         
         #* 获取训练数据，通过递归查找所有文件
-        # ===================================================================================
-        train_data_dir = "./data/02_train_data"
-        # ===================================================================================
-        self.files_for_train_tokenizer = get_file_abspaths(train_data_dir, file_type)
+        self.files_for_train_tokenizer = get_file_abspaths(self.train_data_dir, self.file_type)
         random.seed(42)
         random.shuffle(self.files_for_train_tokenizer)
         

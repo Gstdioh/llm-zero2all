@@ -1,5 +1,5 @@
 import os
-import argparse
+import importlib
 
 import json
 
@@ -14,6 +14,7 @@ from tokenizers.trainers import BpeTrainer
 from transformers import PreTrainedTokenizerFast
 
 from config import TrainTokenizerConfig
+from utils import kwargs_parse
 
 
 def convert_mem2num(mem_str: str) -> int:
@@ -79,10 +80,8 @@ def get_training_iterator(files_for_train_tokenizer: list, file_bytes="2M", max_
         yield buffer_data
 
 
-def train_hf_tokenizer(vocab_size, file_type="txt"):
+def train_hf_tokenizer(trainTokenizerConfig):
     # 使用hf的ByteLevelBPETokenizer训练，修改了pre_tokenizer，使用自己的正则表达式进行预分词
-    
-    trainTokenizerConfig = TrainTokenizerConfig(file_type)
 
     tokenizer = ByteLevelBPETokenizer()  # 会预先构建256的词表
 
@@ -94,18 +93,18 @@ def train_hf_tokenizer(vocab_size, file_type="txt"):
     ])
 
     # ByteLevelBPETokenizer的训练
-    if file_type == "txt":
+    if trainTokenizerConfig.file_type == "txt":
         # 1. 使用文件训练
         tokenizer.train(
             trainTokenizerConfig.files_for_train_tokenizer,
-            vocab_size=vocab_size,
+            vocab_size=trainTokenizerConfig.vocab_size,
             show_progress=True,
         )
-    elif file_type == "json":
+    elif trainTokenizerConfig.file_type == "json":
         # 2. 使用迭代器训练
         tokenizer.train_from_iterator(
             get_training_iterator(trainTokenizerConfig.files_for_train_tokenizer),
-            vocab_size=vocab_size,
+            vocab_size=trainTokenizerConfig.vocab_size,
             show_progress=True,
         )
     else:
@@ -119,20 +118,15 @@ def train_hf_tokenizer(vocab_size, file_type="txt"):
     print("finish!")
 
 
-def train_spm_tokenizer(vocab_size, file_type="txt") -> None:
+def train_spm_tokenizer(trainTokenizerConfig) -> None:
     '''
     使用sentencepiece训练BPE，缺点只能加载300万行，16G内存会OOM
     '''
-    if file_type != "txt":
-        raise ValueError("file_type must be 'txt'")
-    
-    trainTokenizerConfig = TrainTokenizerConfig(file_type)
-    
     tokenizer = spm.SentencePieceTrainer.train(
         input=trainTokenizerConfig.files_for_train_tokenizer,  # 训练的文件列表或者单个文件
         model_prefix='my_spm_bbpe_tokenizer',  # 保存的目录
         model_type='bpe',
-        vocab_size=vocab_size,  # 其值应该大于等于字符表的大小
+        vocab_size=trainTokenizerConfig.vocab_size,  # 其值应该大于等于字符表的大小
         user_defined_symbols=trainTokenizerConfig.SPECIAL_TOKENS,  # 特殊token
         input_format="text",
         num_threads=os.cpu_count(),
@@ -143,18 +137,18 @@ def train_spm_tokenizer(vocab_size, file_type="txt") -> None:
         character_coverage=0.9995,  # 控制字符表的大小，对于中文这种字符多的语言，设置为0.9995，对于英文，设置为1
         byte_fallback=True,  # 开启后，bpe就等价于bbpe
         unk_surface=r" \342\201\207 ",  # 未知token的表示，为"⁇"
-        normalization_rule_name="identity"  # 不进行任何规范化
+        normalization_rule_name="identity"  # 不进行任何规范化，若不指定，默认为"nmt_nfkc"
     )
 
 
-def train_tokenizer(vocab_size, train_method="hf", file_type="txt"):
+def train_tokenizer(trainTokenizerConfig):
     '''
     使用hf和spm训练BPE
     '''
-    if train_method == "hf":
-        train_hf_tokenizer(vocab_size, file_type)
-    elif train_method == "spm":
-        train_spm_tokenizer(vocab_size, file_type)
+    if trainTokenizerConfig.train_method == "hf":
+        train_hf_tokenizer(trainTokenizerConfig)
+    elif trainTokenizerConfig.train_method == "spm":
+        train_spm_tokenizer(trainTokenizerConfig)
     else:
         raise ValueError("train_method must be 'hf' or 'spm'")
 
@@ -163,11 +157,20 @@ if __name__ == '__main__':
     # 解析命令行参数，包括vocab_size, train_method, file_type，有默认值
     # python train_tokenizer.py --vocab_size 64000 --train_method hf --file_type txt
     # python train_tokenizer.py --vocab_size 64000 --train_method spm --file_type txt
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--vocab_size", type=int, required=True, help="vocab size")
-    parser.add_argument("--train_method", type=str, default="hf", help="hf or spm")
-    parser.add_argument("--file_type", type=str, default="txt", help="txt -> train from file, json -> train from iterator")
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser()
+    # # parser.add_argument("-v", "--vocab_size", type=int, required=True, help="vocab size")
+    # parser.add_argument("-h", "--help", type=str, default="spm", help="hf or spm")
+    # kwargs = vars(parser.parse_args())
     
-    train_tokenizer(args.vocab_size, args.train_method, args.file_type)
+    # 解析命令行参数
+    kwargs = kwargs_parse()
+    
+    # 动态导入配置模块
+    if 'config_module' not in kwargs:
+        kwargs['config_module'] = 'config.my_config'
+    config_module = importlib.import_module(kwargs['config_module'])
+    TrainTokenizerConfig = getattr(config_module, 'TrainTokenizerConfig')
+    
+    trainTokenizerConfig = TrainTokenizerConfig(**kwargs)
+    train_tokenizer(trainTokenizerConfig)
     

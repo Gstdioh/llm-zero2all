@@ -72,8 +72,9 @@ for filename in filenames:
             # 将每一行转换为json格式
             data = json.loads(line)
             
-            if "▅" in data["content"]:
-                print(f"跳过包含特殊符号▅的文本")
+            # 跳过特殊字符
+            if "▅" in data["content"] or '█' in data["content"] or '▂' in data["content"]:
+                print(f"跳过包含特殊符号▅█▂的文本")
                 special_char_count += 1
                 continue
             
@@ -120,5 +121,5 @@ if sum_bytes != 0:
     with open(os.path.join(save_dir, f"{file_prefix}{int(count):04}{file_type}"), "w", encoding="utf-8") as f:
         f.write('\n'.join(buffer_data))
 
-with open(f"./{data_dir}_special_char_count.txt", "w", encoding="utf-8") as f:
+with open(f"./{data_dir}_special_char_count_new.txt", "w", encoding="utf-8") as f:
     f.write(f"{data_dir}中的特殊符号的数量为：{special_char_count}个\n")

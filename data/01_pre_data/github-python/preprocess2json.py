@@ -62,6 +62,7 @@ sum_bytes = 0  #
 count = 0
 gid = 0
 id = 0
+special_char_count = 0
 for filename in filenames:
     with open(filename, "r", encoding="utf-8") as fsrc:
         # 读取所有行
@@ -73,6 +74,11 @@ for filename in filenames:
             
             # 跳过字段不存在的数据
             try:
+                # 跳过特殊字符
+                if "▅" in data["content"] or '█' in data["content"] or '▂' in data["content"]:
+                    print(f"跳过包含特殊符号▅█▂的文本")
+                    special_char_count += 1
+                    continue
                 new_data = {
                     # 通用
                     "gid": gid,
@@ -113,3 +119,6 @@ for filename in filenames:
 if sum_bytes != 0:
     with open(os.path.join(save_dir, f"{file_prefix}{int(count):04}{file_type}"), "w", encoding="utf-8") as f:
         f.write('\n'.join(buffer_data))
+
+with open(f"./{data_dir}_special_char_count_new.txt", "w", encoding="utf-8") as f:
+    f.write(f"{data_dir}中的特殊符号的数量为：{special_char_count}个\n")
