@@ -2,31 +2,34 @@ import sys
 from pathlib import Path
 
 from tokenizers import Tokenizer
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, PreTrainedTokenizer
 from transformers import AutoTokenizer
 
-sys.path.append("../")
+import torch
 
-from utils import clean_text
+from hf_bbpe_tokenizer import MyHFTokenizer
 
+# sys.path.append("../")
 # sys.path.append(str(Path(__file__).parent.parent))
 
+save_dir = "./hf_bbpe_tokenizer"
+tokenizer_file = "./my_hf_bbpe_tokenizer_10G/my_hf_bbpe_tokenizer_10G.json"
 
-# tokenizer = Tokenizer.from_file("my_hf_bbpe_tokenizer.json")
+tokenizer = MyHFTokenizer(tokenizer_file)
+# tokenizer = AutoTokenizer.from_pretrained("./my_hf_bbpe_tokenizer_10G", trust_remote_code=True)
 
-# tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer)
+text = "好的åĨĻçļĦæĺ¯燙"
 
-tokenizer = AutoTokenizer.from_pretrained("my_hf_bbpe_tokenizer")
+ids = tokenizer(text, add_begin=True, allowed_special="all")["input_ids"]
+print(ids)
 
-# tokenizer.save_pretrained("my_hf_bbpe_tokenizer")
+print(tokenizer.decode(ids))
 
-text = "我<|endoftext|><|UNK|>d"
+# print(tokenizer.tokenize(text))
+# print(tokenizer(text, add_begin=True, allowed_special="none")["input_ids"])
 
-en = tokenizer(text)
+# tok = PreTrainedTokenizerFast(tokenizer_file="my_hf_bbpe_tokenizer_10G.json")
+# de = tok.decode([123, 312, 122])
+# print(de)
 
-print(en)
-
-# print(en.tokens)
-# print(en.ids)
-
-# print(tokenizer.decode(en.ids))
+tokenizer.save_pretrained(save_dir)

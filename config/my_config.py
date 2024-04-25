@@ -9,13 +9,17 @@ HELP_MESSAGE = """help_message:
         self.vocab_size = 64000  
         # int. 词汇表大小
         self.train_method = "hf"  
-        # str: (hf, spm). 训练tokenizer的工具
+        # str: (hf, sp). 训练tokenizer的工具
         self.train_data_dir = "./data/02_train_data"  
         # str. tokenizer训练集，可以包含json和txt，通过后续代码进行区分
         self.file_type = "txt"  
         # str: (txt, json). 使用txt文件训练，还是json文件进行迭代训练
         self.train_size = "3G"  
-        # str. 训练集的大小，txt文件下最小单位为200M，，如果是json文件迭代训练下，可以训练任意大小的数据集，单位不限"""
+        # str. 训练集的大小，txt文件下最小单位为200M，，如果是json文件迭代训练下，可以训练任意大小的数据集，单位不限
+        self.save_dir = "./tokenizer"  
+        # str. 保存tokenizer的目录
+        self.tokenizer_prefix = "my_hf_bbpe_tokenizer"  
+        # str. tokenizer文件名前缀，也是tokenizer的目录名"""
 
 
 # ===================================================================================
@@ -24,7 +28,7 @@ class TrainTokenizerConfig:
     """
         txt使用文件形式训练，json使用迭代形式训练
         hf:  txt, json
-        spm: txt
+        sp: txt
         
         json中
         每个json文件大小为200MB，可以选择使用多少个文件来训练Tokenizer
@@ -37,12 +41,13 @@ class TrainTokenizerConfig:
     def __init__(self, **kwargs):
         #* 以下为需要设置的属性
         #* ===================================================================================
-        self.vocab_size = 64000  # int. 词汇表大小
-        self.train_method = "hf"  # str: (hf, spm). 训练tokenizer的工具
         self.train_data_dir = "./data/02_train_data"  # str. tokenizer训练集，可以包含json和txt，通过后续代码进行区分
+        self.train_method = "hf"  # str: (hf, sp). 训练tokenizer的工具
+        self.vocab_size = 64000  # int. 词汇表大小
         self.file_type = "txt"  # str: (txt, json). 使用txt文件训练，还是json文件进行迭代训练
         self.train_size = "3G"  # str. 训练集的大小，txt文件下最小单位为200M，，如果是json文件迭代训练下，可以训练任意大小的数据集，单位不限
         self.save_dir = "./tokenizer"  # str. 保存tokenizer的目录
+        self.tokenizer_prefix = ""  # str. tokenizer文件名前缀，也是tokenizer的目录名
         #* ===================================================================================
         
         # 判断特殊情况
@@ -62,18 +67,22 @@ class TrainTokenizerConfig:
             if type(value) != type(getattr(self, key)):
                 raise ValueError(f"关键字：{key} 的值的类型不符！要求{type(value)}，但是给定值为{type(getattr(self, key))}")
             setattr(self, key, value)
+        
+        # 若没有指定，则自动设置
+        if self.tokenizer_prefix == "":
+            self.tokenizer_prefix = f"{self.train_method}_bbpe_tokenizer_vocab{self.vocab_size}_{self.file_type}_{self.train_size}"
             
-        # spm工具不能使用json文件
-        if self.train_method == "spm" and self.file_type == "json":
-            raise ValueError("spm工具不能使用json文件！")
+        # sp工具不能使用json文件
+        if self.train_method == "sp" and self.file_type == "json":
+            raise ValueError("sp工具不能使用json文件！")
         
         # 文件类型只能是txt或者json
         if self.file_type not in ["txt", "json"]:
             raise ValueError("文件类型只能是txt或者json！")
         
-        # 训练工具只能是hf或者spm
-        if self.train_method not in ["hf", "spm"]:
-            raise ValueError("训练工具只能是hf或者spm！")
+        # 训练工具只能是hf或者sp
+        if self.train_method not in ["hf", "sp"]:
+            raise ValueError("训练工具只能是hf或者sp！")
         # ===================================================================================
         
         # 获取训练数据，通过递归查找所有文件
