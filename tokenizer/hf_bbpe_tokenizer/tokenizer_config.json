@@ -1,0 +1,12 @@
+{
+  "added_tokens_decoder": {},
+  "auto_map": {
+    "AutoTokenizer": [
+      "hf_bbpe_tokenizer.MyHFTokenizer",
+      null
+    ]
+  },
+  "clean_up_tokenization_spaces": true,
+  "model_max_length": 1000000000000000019884624838656,
+  "tokenizer_class": "MyHFTokenizer"
+}

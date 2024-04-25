@@ -5,7 +5,7 @@ from sp_bbpe_tokenizer import MySPTokenizer
 
 
 save_dir = "./sp_bbpe_tokenizer"
-model_file = "./my_sp_bbpe_tokenizer_20G/my_sp_bbpe_tokenizer.model"
+model_file = "./my_sp_bbpe_tokenizer_20G/my_sp_bbpe_tokenizer_20G.model"
 
 tokenizer = MySPTokenizer(model_file=model_file)
 # tokenizer = AutoTokenizer.from_pretrained("./sp_bbpe_tokenizer", trust_remote_code=True)
