@@ -124,7 +124,6 @@ class MyHFTokenizer(PreTrainedTokenizer):
         return tokens
     
     def _convert_id_to_token(self, id):
-        """Converts an id to a token, special tokens included"""
         if id in self.vocab_r:
             return self.vocab_r[id]
         raise ValueError("unknown ids")
@@ -134,8 +133,20 @@ class MyHFTokenizer(PreTrainedTokenizer):
             return self.vocab[token]
         raise ValueError("unknown token")
     # ==============================================================================================
-        
     
+    def convert_id_to_token(self, id):
+        if id in self.vocab_r:
+            return self.vocab_r[id]
+        raise ValueError("unknown ids")
+    
+    def convert_token_to_id(self, token):
+        if token in self.vocab:
+            return self.vocab[token]
+        raise ValueError("unknown token")
+    
+    def convert_tokens_to_string(self, tokens):
+        return self.tokenizer.convert_tokens_to_string(tokens)
+        
     # 自己的encode，功能与不使用batch的__call__一样
     # 目前只能对单个文本进行encode
     def encode(self, text, add_begin=False, allowed_special="none", clean_text=True):

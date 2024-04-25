@@ -13,17 +13,22 @@ from hf_bbpe_tokenizer import MyHFTokenizer
 # sys.path.append(str(Path(__file__).parent.parent))
 
 save_dir = "./hf_bbpe_tokenizer"
-tokenizer_file = "./my_hf_bbpe_tokenizer_10G/my_hf_bbpe_tokenizer_10G.json"
+# tokenizer_file = "./my_hf_bbpe_tokenizer_10G/my_hf_bbpe_tokenizer_10G.json"
 
-tokenizer = MyHFTokenizer(tokenizer_file)
-# tokenizer = AutoTokenizer.from_pretrained("./my_hf_bbpe_tokenizer_10G", trust_remote_code=True)
+# tokenizer = MyHFTokenizer(tokenizer_file)
+tokenizer = AutoTokenizer.from_pretrained(save_dir, trust_remote_code=True)
 
-text = "好的åĨĻçļĦæĺ¯燙"
+text = "好的åĨĻçļĦæĺ¯燙<|beginoftext|>test    <|UNK|><|endoftext|>"
 
-ids = tokenizer(text, add_begin=True, allowed_special="all")["input_ids"]
-print(ids)
+tokens = tokenizer.tokenize(text, allowed_special="all")
+print(tokens)
 
-print(tokenizer.decode(ids))
+print(tokenizer.convert_tokens_to_string(tokens))
+
+# ids = tokenizer(text, add_begin=True, allowed_special="all")["input_ids"]
+# print(ids)
+
+# print(tokenizer.decode(ids))
 
 # print(tokenizer.tokenize(text))
 # print(tokenizer(text, add_begin=True, allowed_special="none")["input_ids"])
@@ -32,4 +37,4 @@ print(tokenizer.decode(ids))
 # de = tok.decode([123, 312, 122])
 # print(de)
 
-tokenizer.save_pretrained(save_dir)
+# tokenizer.save_pretrained(save_dir)
