@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import Z2allConfig
+from config_naive import Z2allConfig
 
 
 ACT2FN = {
@@ -257,7 +257,7 @@ class Z2allAttention(nn.Module):
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
             assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, position_ids, :]   # (bsz, n_heads, q_len, all_seq_len)
+            attn_weights = attn_weights + self.mask[:, :, position_ids, :]   # (bsz, n_heads, q_len, all_seq_len)
 
             # 注意力计算时用fp32
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)

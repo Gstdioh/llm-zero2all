@@ -25,7 +25,7 @@ class MySPTokenizer(PreTrainedTokenizer):
     """
 
     # 用于from_pretrained()加载模型
-    vocab_files_names = {"model_file": "sp_bbpe_tokenizer.model"}
+    vocab_files_names = {"model_file": SAVE_FILE_NAME}
     
     def __init__(self, model_file, **kwargs):
         self._auto_map = { "AutoTokenizer": ["sp_bbpe_tokenizer.MySPTokenizer", None] }  # 添加映射，保证AutoTokenizer.from_pretrained()可以加载
@@ -117,7 +117,7 @@ class MySPTokenizer(PreTrainedTokenizer):
         """
         return self.sp_model.vocab_size()
     
-    def save_vocabulary(self, save_directory: str, filename_prefix: str | None = None) -> Tuple[str]:
+    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
         """
         保存tokenizer所需要的文件，即
         """

@@ -1,2 +1,2 @@
-from .config import Z2allConfig
-from .model import Z2allModel
+from .config_naive import Z2allConfig
+from .model_naive import Z2allModel

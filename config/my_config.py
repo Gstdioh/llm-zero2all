@@ -109,6 +109,7 @@ class TrainTokenizerConfig:
         ]
         self.MY_SPLIT_PATTERN = "|".join(MY_SPLIT_PATTERN_LIST)
         
+        # 12个特殊token
         self.SPECIAL_TOKENS = [
             '<|beginoftext|>',
             '<|endoftext|>',

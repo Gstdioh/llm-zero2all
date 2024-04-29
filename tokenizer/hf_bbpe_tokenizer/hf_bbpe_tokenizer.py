@@ -7,7 +7,7 @@ from tokenizers import Tokenizer
 from transformers import AutoTokenizer, PreTrainedTokenizerBase, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 
-TOKENIZER_FILE = "tokenizer.json"
+SAVE_FILE_NAME = "my_tokenizer.json"
 
 # 手动设置特殊token
 SPECIAL_START_ID = 64000
@@ -35,9 +35,12 @@ SPECIAL_TOKENS = { token: id
 
 
 class MyHFTokenizer(PreTrainedTokenizer):
-    def __init__(self, tokenizer_file, **kwargs):
+    
+    vocab_files_names = { "vocab_file": SAVE_FILE_NAME }  # 不能用"tokenizer_file"关键字，官方源码已经用了
+    
+    def __init__(self, vocab_file, **kwargs):
         self._auto_map = { "AutoTokenizer": ["hf_bbpe_tokenizer.MyHFTokenizer", None] }  # 添加映射，保证AutoTokenizer.from_pretrained()可以加载
-        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=vocab_file)
         
         # 特殊token
         # self.special_tokens = {key: value for key, value in self.tokenizer.added_tokens_encoder.items() if self._is_special_format(key)}
@@ -65,12 +68,12 @@ class MyHFTokenizer(PreTrainedTokenizer):
         """
         return self.tokenizer.vocab_size
     
-    def save_vocabulary(self, save_directory: str, filename_prefix: str | None = None) -> Tuple[str]:
+    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
         """
         保存tokenizer所需要的文件
         """
         tokenizer_file = os.path.join(
-            save_directory, (filename_prefix + "-" if filename_prefix else "") + TOKENIZER_FILE
+            save_directory, (filename_prefix + "-" if filename_prefix else "") + SAVE_FILE_NAME
         )
         self.tokenizer.backend_tokenizer.save(tokenizer_file)
         

@@ -11,12 +11,12 @@ from transformers import AutoTokenizer
 from utils import get_file_paths
 
 
-TRAIN_DATA_DIR = "./data/02_train_data"  # 在这个文件夹中找到所有的json文件
-# TRAIN_DATA_DIR = "./data/WuDaoCorpus2.0_base_200G"  # 在这个文件夹中找到所有的json文件
+# TRAIN_DATA_DIR = "./data/02_train_data"  # 在这个文件夹中找到所有的json文件
+TRAIN_DATA_DIR = "./data/01_pre_data"  # 在这个文件夹中找到所有的json文件
 SAVE_DIR = os.path.join(TRAIN_DATA_DIR, "01_bin_for_train_")  # bin保存的目录
 
 MAX_WORKERS = 16
-START_TEXT = ""
+START_TEXT = "json_"
 
 def process_file(args, tokenizer_dir):
     """json文件，一行一个json对象

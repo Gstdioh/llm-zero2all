@@ -11,11 +11,12 @@ from transformers import AutoTokenizer
 from utils import get_file_paths
 
 
-TRAIN_DATA_DIR = "./data/02_train_data"  # 在这个文件夹中找到所有的json文件
-# TRAIN_DATA_DIR = "./data/WuDaoCorpus2.0_base_200G"  # 在这个文件夹中找到所有的json文件
+# TRAIN_DATA_DIR = "./data/02_train_data"  # 在这个文件夹中找到所有的json文件
+TRAIN_DATA_DIR = "./data/WuDaoCorpus2.0_base_200G"  # 在这个文件夹中找到所有的json文件
 SAVE_DIR = os.path.join(TRAIN_DATA_DIR, "01_bin_for_train_")  # bin保存的目录
+PREFIX = "WuDaoCorpus2.0_base_200G_"
 
-MAX_WORKERS = 16
+MAX_WORKERS = 4
 START_TEXT = ""
 
 def process_file(args, tokenizer_dir):
@@ -63,7 +64,7 @@ def process_file(args, tokenizer_dir):
     
     # 保存tokenized文件到bin目录
     file_basename = os.path.basename(file_path)
-    bin_basename = file_basename.replace(".json", "").replace("json_", "") + f"_{file_id:04}.bin"
+    bin_basename = PREFIX + file_basename.replace(".json", "").replace("json_", "") + f"_{file_id:04}.bin"
     tokenized_filename = os.path.join(SAVE_DIR, bin_basename)
 
     # write the bytes
@@ -80,7 +81,8 @@ def pretokenize_data(tokenizer_dir):
     file_paths = get_file_paths(TRAIN_DATA_DIR, "json", start_text=START_TEXT)
     
     # 在单个进程中测试下
-    # process_file((0, file_paths[0]), tokenizer_dir)
+    # file_path = "./data/WuDaoCorpus2.0_base_200G/part-202101281a.json"
+    # process_file((0, file_path), tokenizer_dir)
     
     # 在一个进程池中处理所有文件
     fun = partial(process_file, tokenizer_dir=tokenizer_dir)
