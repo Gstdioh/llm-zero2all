@@ -3,6 +3,9 @@ import sys
 import json
 import regex as re
 import unicodedata
+import inspect
+
+import torch
 
 
 # 解析命令行参数
@@ -120,6 +123,7 @@ def get_file_paths(file_dir: str, file_type:str = "txt", start_text:str = "") ->
     dfs_get_file_paths(file_dir)
                 
     return file_abspaths
+
 
 # 注意：这里的清洗方法只是简单的清洗，不一定适用于所有的数据集
 # 对中文使用0, 1, 2, 3, 4

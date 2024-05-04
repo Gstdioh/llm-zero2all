@@ -14,14 +14,10 @@ class Z2allConfig(PretrainedConfig):
         n_layers=32,
         n_heads=32,
         n_kv_heads=None,  # 用于GQA
-        # hidden_act="silu",  # FFN中的激活函数
         max_seq_len=2048,
         initializer_range=0.02,  # 参数初始化时的标准差
         rms_norm_eps=1e-6,  # 防止除0的小数
-        pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
-        pretraining_tp=1,  # 预训练时的张量并行度, tensor parallelism
+        pad_token_id=64006,  # pad token <|PAD|>
         tie_word_embeddings=False,  # 是否共享word embedding和word prediction的参数
         rope_theta=10000.0,
         rope_scaling=None,  # 缩放方法，用于长度外推
@@ -29,11 +25,9 @@ class Z2allConfig(PretrainedConfig):
         attention_bias=False,  # attention中的project是否加bias
         attention_dropout=0.0,
         dropout1=0.0,
-        drop_path1=0.0,
+        # drop_path1=0.0,  # 通常LLM中不会用到droppath
         dropout2=0.0,
-        drop_path2=0.0,
-        dropout_last=0.0,
-        drop_path_last=0.0,
+        # drop_path2=0.0,
         residual_in_fp32=True,  # 残差连接是否使用fp32
         use_flash=True,
         use_fused_swiglu=True,
@@ -67,7 +61,6 @@ class Z2allConfig(PretrainedConfig):
         # self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
-        self.pretraining_tp = pretraining_tp
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.rope_interleaved = rope_interleaved
@@ -76,25 +69,21 @@ class Z2allConfig(PretrainedConfig):
         
         self.attention_dropout = attention_dropout
         self.dropout1 = dropout1
-        self.drop_path1 = drop_path1
+        # self.drop_path1 = drop_path1
         self.dropout2 = dropout2
-        self.drop_path2 = drop_path2
-        self.dropout_last = dropout_last
-        self.drop_path_last = drop_path_last
+        # self.drop_path2 = drop_path2
         self.residual_in_fp32 = residual_in_fp32
         
         # 是否使用融合算子
-        self.use_flash = use_flash,
-        self.use_fused_swiglu = use_fused_swiglu,
-        self.use_fused_dropout_add_norm = use_fused_dropout_add_norm,
-        self.use_fused_rope = use_fused_rope,
-        self.use_fused_cross_entropy = use_fused_cross_entropy,
+        self.use_flash = use_flash
+        self.use_fused_swiglu = use_fused_swiglu
+        self.use_fused_dropout_add_norm = use_fused_dropout_add_norm
+        self.use_fused_rope = use_fused_rope
+        self.use_fused_cross_entropy = use_fused_cross_entropy
         
         self.data_type = data_type
 
         self.pad_token_id = pad_token_id
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
         self.tie_word_embeddings = tie_word_embeddings
 
     def _rope_scaling_validation(self):

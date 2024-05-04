@@ -1,11 +1,10 @@
-import os
-import glob
-from os.path import dirname, abspath
 import random
+from datetime import datetime
+
 from utils import convert_mem2num, get_training_iterator, get_file_paths
 
 
-HELP_MESSAGE = """help_message:
+TrainTokenizerConfig_HELP_MESSAGE = """help_message:
         self.vocab_size = 64000  
         # int. 词汇表大小
         self.train_method = "hf"  
@@ -57,7 +56,7 @@ class TrainTokenizerConfig:
         
         # 提示信息
         if kwargs.get('help', False):
-            print(HELP_MESSAGE)
+            print(TrainTokenizerConfig_HELP_MESSAGE)
             exit()
             
         # 使用kwargs更新self属性，若不存在或类型不符，则报错
@@ -97,6 +96,7 @@ class TrainTokenizerConfig:
         elif self.file_type == "json":
             self.iterator_for_train_tokenizer = get_training_iterator(self.files_for_train_tokenizer, buffer_bytes="2M", max_train_bytes=self.train_size)
         
+        # 正则表达式，用于hf中的预分词
         MY_SPLIT_PATTERN_LIST = [
             r"""'(?i:[sdmt]|ll|ve|re)""",       # "'s"
             r"""\s?+[^\r\n\p{N}\s\p{P}\p{S}\u4e00-\u9fa5]+""",   # " a", "a"，除了中文 
@@ -111,20 +111,65 @@ class TrainTokenizerConfig:
         
         # 12个特殊token
         self.SPECIAL_TOKENS = [
-            '<|beginoftext|>',
-            '<|endoftext|>',
+            '<|beginoftext|>',  # 64000
+            '<|endoftext|>',    # 64001
             # '<|fim_prefix|>',
             # '<|fim_middle|>',
             # '<|fim_suffix|>',
-            '<|endofprompt|>',
-            '<|im_start|>',  # input message
-            '<|im_end|>',
-            '<|UNK|>',
-            '<|PAD|>',
-            '<|CLS|>',
-            '<|SEP|>',
-            '<|MASK|>',
-            '<|BOS|>',
-            '<|EOS|>'
+            '<|endofprompt|>',  # 64002
+            '<|im_start|>',     # 64003 input message
+            '<|im_end|>',       # 64004
+            '<|UNK|>',          # 64005
+            '<|PAD|>',          # 64006
+            '<|CLS|>',          # 64007
+            '<|SEP|>',          # 64008
+            '<|MASK|>',         # 64009
+            '<|BOS|>',          # 64010
+            '<|EOS|>'           # 64011
         ]
+
+
+# ===================================================================================
+# 以下为PreTrain的配置
+class PreTrainConfig:
+    def __init__(self, **kwargs):
+        #* 以下为需要设置的属性
+        #* ===================================================================================
+        # I/O
+        self.out_dir = "out"
+        self.eval_interval = 2000
+        self.log_interval = 1
+        self.eval_iters = 100
+        self.eval_only = False  # if True, script exits right after the first eval
+        self.always_save_checkpoint = False  # if True, always save a checkpoint after each eval
+        self.init_from = "scratch"  # 'scratch' or 'resume'
         
+        # wandb logging
+        self.wandb_log = False  # disabled by default
+        self.wandb_project = "llamac"
+        self.wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        
+        # data
+        self.batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
+        self.max_seq_len = 256
+        self.vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
+        self.vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
+        
+        # adamw optimizer
+        self.gradient_accumulation_steps = 4  # used to simulate larger batch sizes
+        self.learning_rate = 5e-4  # max learning rate
+        self.max_iters = 100000  # total number of training iterations
+        self.weight_decay = 1e-1
+        self.beta1 = 0.9
+        self.beta2 = 0.95
+        self.grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
+        
+        # learning rate decay settings
+        self.decay_lr = True  # whether to decay the learning rate
+        self.warmup_iters = 1000  # how many steps to warm up for
+        
+        # system
+        self.device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+        self.dtype = "bfloat16"  # float32|bfloat16|float16
+        self.compile = True  # use PyTorch 2.0 to compile the model to be faster
+        #* ===================================================================================

@@ -190,3 +190,17 @@ Qwen使用tiktoken，其自己管理特殊token，https://huggingface.co/Qwen/Qw
         ```
 
 ## 01 构建基础语言模型 Z2all (使用 llama2 结构)
+
+### 融合算子
+
+#### swiglu
+注意，在xformers v0.0.23中，如果要使用autocast，那么要删除xformers/ops/swiglu_op.py中`_ForwardToPythonAutogradFunc`中的这一段代码：
+
+```python
+if op.dtype_autocast_gpu == torch.bfloat16:
+    return False
+```
+
+因为在pytorch1.12.1版本以下有一个bug，见`test_pytorch_bug.py`文件，主要是使用autocast时，反向传播会将bfloat16转换为float16，你可以升级pytorch，或者根据[链接](https://github.com/pytorch/pytorch/commit/bc03aa6013e101222c9652d04a2b08e48f626dfb#diff-dac4bd53ced015c8810b3b02fc5c2ec6c2b0658c5090b4fbbd09c96bd45087d1)
+来修改你的pytorch源码。
+

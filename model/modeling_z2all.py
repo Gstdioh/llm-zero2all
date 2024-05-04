@@ -12,12 +12,13 @@ https://www.zhihu.com/question/616600181/answer/3160547952?utm_source=zhihu
 优化：
 1）融合算子：
     a）flash_attn中的flash attention2
-    b）xformers中的fused swiglu
+    b）xformers中的fused swiglu，三个版本：fused, packed_fused, eager，packed更快
+        pytorch1.12.1在autocast有个bug: https://github.com/pytorch/pytorch/issues/87979，导致不会启动优化的swiglu
     c）flash_attn中的fused dropout_add_rms_norm, 需要安装 dropout_layer_norm 包，pytorch2.1.0下安装有问题，版本不兼容
         https://github.com/open-mmlab/mmcv/issues/2938
         all dimensions divisible by 8, up to 8192
-    d）cd ../csrc/rotary && pip install .
-    e）cd ../csrc/xentropy && pip install .
+    d）fused rope, cd ../csrc/rotary && pip install .
+    e）fused cross_entropy, cd ../csrc/xentropy && pip install .
 2）其他优化：
     a）将运算中的hidden_state维度从 (bsz, seq_len, hidden_dim) 转换为 (seq_len, bsz, hidden_dim)
        因为通常s远大于b，转换后变成了s个矩阵相乘，这意味着GPU可以同时处理s个矩阵相乘，而不仅仅是b个矩阵相乘，
@@ -32,10 +33,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
 from einops import rearrange, repeat
 
 try:
@@ -47,19 +44,19 @@ try:
 except ImportError:
     dropout_add_rms_norm = None
 try:
-    from xformers.ops import swiglu
+    from xformers.ops import SwiGLU
 except ImportError:
-    swiglu = None
+    SwiGLU = None
 try:
-    from fused_rotary_embedding import fused_rotary_emb
+    from .fused_rotary_embedding import fused_rotary_emb
 except ImportError:
     fused_rotary_emb = None
 try:
-    from fused_cross_entropy import fused_cross_entropy
+    from .fused_cross_entropy import fused_cross_entropy
 except ImportError:
     fused_cross_entropy = None
 
-from configuration_z2all import Z2allConfig
+from .configuration_z2all import Z2allConfig
 
 
 def rotate_half(x, interleaved=False):
@@ -142,21 +139,22 @@ class Z2allMLP(nn.Module):
         
         if self.intermediate_size is None:
             # 保持参数量和两个全连接的参数量相近
-            self.intermediate_size = self.hidden_dim * 4
-            self.intermediate_size = int(2 * self.hidden_dim / 3)
+            self.intermediate_size = int(8 * self.hidden_dim / 3)
             self.multiple_of = config.multiple_of  # 保持intermediate_size是multiple_of的倍数，在张量并行时使用GPTQ有用
             self.intermediate_size = self.multiple_of * ((self.intermediate_size + self.multiple_of - 1) // self.multiple_of)
         
-        self.gate_proj = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_dim, bias=False)
-        self.act_fn = nn.SiLU()
-        self.op = None
-        
-        self.use_fused_swiglu = (swiglu is not None) and config.use_fused_swiglu
+        self.use_fused_swiglu = (SwiGLU is not None) and config.use_fused_swiglu
         if not self.use_fused_swiglu:
             print("WARNING: using slow swiglu. fused swiglu requires xformers")
-
+        
+        if self.use_fused_swiglu:
+            self.swiglu = SwiGLU(self.hidden_dim, self.intermediate_size, bias=False, _pack_weights=True)
+        else:
+            self.gate_proj = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
+            self.up_proj = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_dim, bias=False)
+            self.act_fn = nn.SiLU()
+            
     def forward(self, x):
         """
         Args:
@@ -168,17 +166,13 @@ class Z2allMLP(nn.Module):
         
         if self.use_fused_swiglu:
             # fused swiglu
-            output = swiglu(x, 
-                            self.gate_proj.weight, self.gate_proj.bias, 
-                            self.up_proj.weight, self.up_proj.bias, 
-                            self.down_proj.weight, self.down_proj.bias, 
-                            op=self.op)
+            output = self.swiglu(x)
         else:
             # navie实现
             output = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return output
-
+    
 
 class Z2allAttention(nn.Module):
     def __init__(self, config: Z2allConfig, layer_idx: Optional[int] = None):
@@ -385,7 +379,11 @@ class Z2allDecoderLayer(nn.Module):
 
         # Dropout -> Add -> LN
         self.dropout1 = nn.Dropout(config.dropout1)
-        self.drop_path1 = DropPath(config.drop_path1)
+        # 第一层不用drop_path1，因为没有残差连接，去掉batch中的一些数，后续就再也没有了
+        # 通常LLM中不会用到droppath
+        self.drop_path1 = getattr(config, 'drop_path1', None)
+        if self.drop_path1 is not None and self.drop_path1 > 0.0 and layer_idx > 0:
+            self.drop_path1 = DropPath(config.drop_path1)
         self.norm1 = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
 
         # Self Attention
@@ -393,7 +391,10 @@ class Z2allDecoderLayer(nn.Module):
         
         # Dropout -> Add -> LN
         self.dropout2 = nn.Dropout(config.dropout2)
-        self.drop_path2 = DropPath(config.drop_path2)
+        # 通常LLM中不会用到droppath
+        self.drop_path2 = getattr(config, 'drop_path2', None)
+        if self.drop_path2 is not None and self.drop_path2 > 0.0:
+            self.drop_path2 = DropPath(config.drop_path2)
         self.norm2 = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
 
         # MLP
@@ -419,13 +420,15 @@ class Z2allDecoderLayer(nn.Module):
         
         # Dropout -> Add -> LN
         if not self.use_fused_dropout_add_norm:
-            dropped = self.drop_path1(self.dropout1(hidden_states))
+            dropped = self.dropout1(hidden_states)
+            if self.drop_path1 is not None:
+                dropped = self.drop_path1(dropped)
             residual = (dropped + residual) if residual is not None else dropped
             hidden_states = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
         else:
-            if self.drop_path1.p == 0 or not self.training:
+            if self.drop_path1 is None or not self.training:
                 rowscale1 = None
             else:
                 rowscale1 = self.drop_path1(
@@ -461,13 +464,15 @@ class Z2allDecoderLayer(nn.Module):
         
         # Dropout -> Add -> LN
         if not self.use_fused_dropout_add_norm:
-            dropped = self.drop_path2(self.dropout2(hidden_states))
+            dropped = self.dropout2(hidden_states)
+            if self.drop_path2 is not None:
+                dropped = self.drop_path2(dropped)
             residual = (dropped + residual) if residual is not None else dropped
             hidden_states = self.norm2(residual.to(dtype=self.norm2.weight.dtype))
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
         else:
-            if self.drop_path2.p == 0 or not self.training:
+            if self.drop_path2 is None or not self.training:
                 rowscale2 = None
             else:
                 rowscale2 = self.drop_path2(
@@ -564,24 +569,22 @@ class Z2allModel(Z2allPreTrainedModel):
         )
         
         # Dropout -> Add -> LN
-        self.dropout_last = nn.Dropout(config.dropout_last)
-        self.drop_path_last = DropPath(config.drop_path_last)
-        self.norm_last = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
+        self.dropout1 = nn.Dropout(config.dropout1)
+        # 第一层不用drop_path1，因为没有残差连接，去掉batch中的一些数，后续就再也没有了
+        # 通常LLM中不会用到droppath
+        self.drop_path1 = getattr(config, 'drop_path1', None)
+        if self.drop_path1 is not None and self.drop_path1 > 0.0:
+            self.drop_path1 = DropPath(config.drop_path1)
+        self.norm1 = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
 
         self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
         if not self.use_fused_dropout_add_norm:
             print("WARNING: using slow dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm")
-
-        self.output = nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
-
-        # 是否共享参数
-        if config.tie_word_embeddings:
-            self.embed_tokens.weight = self.output.weight
         
         # 预处理RoPE中用到的cos和sin
         cos, sin = self.precompute_cos_sin(
             dim=self.hidden_dim // self.n_heads,
-            end=self.max_seq_len * 2,  # 注意，end = self.max_seq_len * 2，因为Llama 2模型的token限制为4096。
+            end=self.max_seq_len * 2,  # 注意，end = self.max_seq_len * 2，方便后续增大长度，Llama 2模型的token限制为4096。
             base=self.rope_theta,
             rope_scaling=self.rope_scaling,
         )
@@ -669,7 +672,7 @@ class Z2allModel(Z2allPreTrainedModel):
         input_ids: torch.Tensor,
         use_cache=False,
         past_key_values: Optional[Dict[str, Any]] = None,
-    ) -> BaseModelOutputWithPast:
+    ) -> Dict:
         """模型的前向传播
         kv缓存的格式: {"key_states_layers": [], "value_states_layers": [], "seen_tokens": 0}
 
@@ -726,14 +729,16 @@ class Z2allModel(Z2allPreTrainedModel):
         # 对于prenorn，最后需要再加一个 Dropout -> Add -> LN
         # 注意，最后的不需要residual了
         if not self.use_fused_dropout_add_norm:
-            dropped = self.drop_path_last(self.dropout_last(hidden_states))
+            dropped = self.dropout1(hidden_states)
+            if self.drop_path1 is not None:
+                dropped = self.drop_path1(dropped)
             residual = (dropped + residual) if residual is not None else dropped
-            hidden_states = self.norm_last(residual.to(dtype=self.norm_last.weight.dtype))
+            hidden_states = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
         else:
-            if self.drop_path_last.p == 0 or not self.training:
+            if self.drop_path1 is None or not self.training:
                 rowscale_last = None
             else:
-                rowscale_last = self.drop_path_last(
+                rowscale_last = self.drop_path1(
                     torch.ones(
                         hidden_states.shape[:-1],
                         device=hidden_states.device,
@@ -743,10 +748,10 @@ class Z2allModel(Z2allPreTrainedModel):
             hidden_states = dropout_add_rms_norm(
                 hidden_states,
                 residual,
-                self.norm_last.weight,
-                self.norm_last.bias,
-                self.dropout_last.p if self.training else 0.0,
-                self.norm_last.eps,
+                self.norm1.weight,
+                self.norm1.bias,
+                self.dropout1.p if self.training else 0.0,
+                self.norm1.eps,
                 rowscale=rowscale_last,
                 prenorm=False,  # 最后的不需要residual了
                 residual_in_fp32=self.residual_in_fp32,
@@ -755,10 +760,10 @@ class Z2allModel(Z2allPreTrainedModel):
         # hidden_states (seq_len, bsz, hidden_dim) -> (bsz, seq_len, hidden_dim)
         hidden_states = hidden_states.transpose(0, 1)
         
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
-        )
+        return {
+            "last_hidden_state": hidden_states,
+            "past_key_values": past_key_values,
+        }
 
 
 class Z2allForCausalLM(Z2allPreTrainedModel):
@@ -766,10 +771,15 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
 
     def __init__(self, config: Z2allConfig):
         super().__init__(config)
+        self.max_seq_len = config.max_seq_len
         
         self.model = Z2allModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
+
+        # 是否共享参数
+        if config.tie_word_embeddings:
+            self.model.embed_tokens.weight = self.lm_head.weight
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -785,7 +795,7 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
         use_cache=True,
         past_key_values: Optional[Dict[str, Any]] = None,
         loss_fn=None,
-    ) -> CausalLMOutputWithPast:
+    ) -> Dict:
         """模型的前向传播
         kv缓存的格式: {"key_states_layers": [], "value_states_layers": [], "seen_tokens": 0}
 
@@ -805,18 +815,21 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
                     loss = tensor, logits (bsz, seq_len, vocab_size) 
                     past_key_values = None
         """
-        assert labels is None or use_cache is False, "use_cache=True is incompatible with labels"
+        # 训练时，自动设置use_cache为False
+        # 推理时，自动设置use_cache为True
+        if labels is not None:
+            use_cache = False
         
         # last_hidden_state (bsz, seq_len, hidden_dim)
         model_output = self.model(input_ids, use_cache, past_key_values)
-        last_hidden_state, past_key_values = model_output.last_hidden_state, model_output.past_key_values
+        last_hidden_state, past_key_values = model_output["last_hidden_state"], model_output["past_key_values"]
         
         # last_hidden_state (bsz, seq_len, hidden_dim) -> (bsz, hidden_dim)
         # 推理时，只需要最后一个位置的输出，loss为None
         if labels is None:
-            last_hidden_state = last_hidden_state[:, -1, :]
+            last_hidden_state = last_hidden_state[:, [-1], :]
         
-        # labels is None，    logits (bsz, vocab_size)
+        # labels is None，    logits (bsz, 1, vocab_size)
         # labels is not None，logits (bsz, seq_len, vocab_size)
         logits = self.lm_head(last_hidden_state)
         
@@ -832,62 +845,11 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
                     loss_fn = F.cross_entropy
             loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=past_key_values,
-        )
-
-    # 配置优化器 (见llama2.c项目)
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # 所有的权重张量和嵌入张量都会被weight decay，所有的偏置和layernorm都不会被weight decay
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        
-        # 统计参数数量
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")  # 逗号用于分隔千位
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        
-        # 是否使用fused版本的AdamW优化器
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
-
-    # 估计模型的flops利用率（MFU），分母为A100 bfloat16峰值FLOPS (见llama2.c项目)
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        # fwdbwd_per_iter: 每次迭代的前向和后向传播次数
-        # dt: 计算的时间
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = sum(p.numel() for p in self.parameters())
-        config = self.config
-        L, H, Q, T = config.n_layers, config.n_heads, config.hidden_dim//config.n_heads, config.max_seq_len
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt)  # per second
-        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
+        return {
+            "loss": loss,
+            "logits": logits,
+            "past_key_values": past_key_values,
+        }
 
     @torch.inference_mode()
     def generate(self, ids, max_new_tokens, max_context_len=-1, use_cache=True, temperature=1.0, top_k=None):
@@ -909,11 +871,11 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
         if max_context_len == -1:
             max_context_len = self.max_seq_len
             
-        present_key_value = None  # kv缓存
+        past_key_values = None  # kv缓存
         for _ in range(max_new_tokens):
             # 是否使用kv缓存, 并且裁剪长度
             if use_cache:
-                if present_key_value is None:
+                if past_key_values is None:
                     # 第一次推理，此时kv还没缓存，需要输入整个序列
                     input_ids = ids
                 else:
@@ -923,17 +885,18 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
                 # 裁剪kv缓存中的长度 <= max_context_len - 1, 注意query还占一个位置
                 # self.max_seq_len代表训练时的最大长度，通过RoPE的长度外推，实际推理时可以使用更长的序列
                 # (bsz, n_kv_heads, seq_len, head_dim)
-                if present_key_value is not None and present_key_value['seen_tokens'] >= max_context_len:
-                    present_key_value['key_states_layers'] = [k[:, :, 1-max_context_len:, :] for k in present_key_value['key_states_layers']]
-                    present_key_value['value_states_layers'] = [v[:, :, 1-max_context_len:, :] for v in present_key_value['value_states_layers']]
-                    present_key_value['seen_tokens'] = max_context_len - 1
+                if past_key_values is not None and past_key_values['seen_tokens'] >= max_context_len:
+                    past_key_values['key_states_layers'] = [k[:, :, 1-max_context_len:, :] for k in past_key_values['key_states_layers']]
+                    past_key_values['value_states_layers'] = [v[:, :, 1-max_context_len:, :] for v in past_key_values['value_states_layers']]
+                    past_key_values['seen_tokens'] = max_context_len - 1
             else:
                 # 判断是否裁剪长度
                 input_ids = ids if ids.size(-1) <= max_context_len else ids[:, -max_context_len:]
             
             # 前向传播模型，得到序列中索引的logits
-            model_outputs = self(input_ids, use_cache=use_cache, past_key_values=present_key_value)
-            logits = model_outputs.logits[:, -1, :] # 只取最后一个位置的输出, (bsz, vocab_size)
+            model_outputs = self(input_ids, use_cache=use_cache, past_key_values=past_key_values)
+            logits = model_outputs["logits"][:, -1, :] # 只取最后一个位置的输出, (bsz, vocab_size)
+            past_key_values = model_outputs["past_key_values"]
             
             # 采样
             if temperature == 0.0:
@@ -953,6 +916,6 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
                 idx_next = torch.multinomial(probs, num_samples=1)
 
             # 将采样的索引添加到序列中并继续推理
-            ids = torch.cat((ids, idx_next), dim=1)
+            ids = torch.cat((ids, idx_next), dim=-1)
 
         return ids
