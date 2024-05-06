@@ -39,51 +39,52 @@ try:
     from flash_attn import flash_attn_func
 except ImportError:
     flash_attn_func = None
-try:
-    from flash_attn.ops.rms_norm import dropout_add_rms_norm
-except ImportError:
-    dropout_add_rms_norm = None
+    print("WARNING: can't use flash attention2. Flash Attention2 requires flash_attn>=2.0.0")
 try:
     from xformers.ops import SwiGLU
 except ImportError:
     SwiGLU = None
+    print("WARNING: can't use fused swiglu. fused swiglu requires xformers")
 try:
     from .fused_rotary_embedding import fused_rotary_emb
 except ImportError:
     fused_rotary_emb = None
+    print("WARNING: can't use fused rotary embedding. fused rotary embedding requires rotary_emb which can be found from flash_attn")
 try:
     from .fused_cross_entropy import fused_cross_entropy
 except ImportError:
     fused_cross_entropy = None
+    print("WARNING: can't use fused cross entropy. Fused cross entropy requires xentropy_cuda_lib which can be found from flash_attn")
 
+# 使用顺序：dropout_add_rms_norm -> MixedFusedRMSNorm -> RMSNormTorch
+class RMSNormTorch(nn.Module):
+    def __init__(self, hidden_dim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_dim))
+        self.eps = eps
+        self.register_parameter("bias", None)
+
+    def forward(self, hidden_states):
+        # 计算时用float32
+        
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        
+        return self.weight * hidden_states.to(input_dtype)
+try:
+    from flash_attn.ops.rms_norm import dropout_add_rms_norm
+except ImportError:
+    dropout_add_rms_norm = None
+    print("WARNING: can't use fused dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm which can be found from flash_attn")
+    try:
+        from apex.normalization import MixedFusedRMSNorm as RMSNorm
+    except ImportError:
+        RMSNorm = RMSNormTorch
+        print("WARNING: can't use MixedFusedRMSNorm of apex. MixedFusedRMSNorm requires apex")
+        
 from .configuration_z2all import Z2allConfig
-
-
-def rotate_half(x, interleaved=False):
-    if not interleaved:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-    else:
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        # 交替放，不能用cat
-        return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
-
-
-def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
-    """
-    见 flash_attn/layers/rotary.py
-    
-    x: (seqlen, batch_size, nheads, headdim)
-    cos, sin: (seqlen, 1, 1, rotary_dim / 2)  通常来说，rotary_dim = headdim
-    """
-    ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
-    cos = repeat(cos, "... d -> ... (2 d)" if not interleaved else "... d -> ... (d 2)")
-    sin = repeat(sin, "... d -> ... (2 d)" if not interleaved else "... d -> ... (d 2)")
-    return torch.cat(
-        [x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin, x[..., ro_dim:]],
-        dim=-1,
-    )
 
 
 class DropPath(nn.Module):
@@ -112,24 +113,6 @@ class DropPath(nn.Module):
         return hidden_state * random_tensor
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_dim, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_dim))
-        self.eps = eps
-        self.register_parameter("bias", None)
-
-    def forward(self, hidden_states):
-        # 计算时用float32
-        
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        
-        return self.weight * hidden_states.to(input_dtype)
-
-
 class Z2allMLP(nn.Module):
     def __init__(self, config: Z2allConfig):
         super().__init__()
@@ -144,8 +127,8 @@ class Z2allMLP(nn.Module):
             self.intermediate_size = self.multiple_of * ((self.intermediate_size + self.multiple_of - 1) // self.multiple_of)
         
         self.use_fused_swiglu = (SwiGLU is not None) and config.use_fused_swiglu
-        if not self.use_fused_swiglu:
-            print("WARNING: using slow swiglu. fused swiglu requires xformers")
+        # if not self.use_fused_swiglu:
+        #     print("WARNING: using slow swiglu. fused swiglu requires xformers")
         
         if self.use_fused_swiglu:
             self.swiglu = SwiGLU(self.hidden_dim, self.intermediate_size, bias=False, _pack_weights=True)
@@ -172,6 +155,33 @@ class Z2allMLP(nn.Module):
             output = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return output
+
+
+def rotate_half(x, interleaved=False):
+    if not interleaved:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+    else:
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        # 交替放，不能用cat
+        return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
+
+
+def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
+    """
+    见 flash_attn/layers/rotary.py
+    
+    x: (seqlen, batch_size, nheads, headdim)
+    cos, sin: (seqlen, 1, 1, rotary_dim / 2)  通常来说，rotary_dim = headdim
+    """
+    ro_dim = cos.shape[-1] * 2
+    assert ro_dim <= x.shape[-1]
+    cos = repeat(cos, "... d -> ... (2 d)" if not interleaved else "... d -> ... (d 2)")
+    sin = repeat(sin, "... d -> ... (2 d)" if not interleaved else "... d -> ... (d 2)")
+    return torch.cat(
+        [x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin, x[..., ro_dim:]],
+        dim=-1,
+    )
     
 
 class Z2allAttention(nn.Module):
@@ -204,15 +214,15 @@ class Z2allAttention(nn.Module):
         # 使用flash attention或者手动实现（见llama.c项目）
         self.use_flash = (flash_attn_func is not None) and config.use_flash
         if not self.use_flash:
-            print("WARNING: using slow attention. Flash Attention2 requires flash_attn>=2.0.0")
+            # print("WARNING: using slow attention. Flash Attention2 requires flash_attn>=2.0.0")
             mask = torch.full((1, 1, self.max_seq_len, self.max_seq_len), float("-inf"))
             mask = torch.triu(mask, diagonal=1)
             # model.to("cuda")时，在buffer中的tensor同样会被移动到cuda
             self.register_buffer("mask", mask)
             
         self.use_fused_rope = (fused_rotary_emb is not None) and config.use_fused_rope
-        if not self.use_fused_rope:
-            print("WARNING: using slow rotary embedding. fused rotary embedding requires rotary_emb")
+        # if not self.use_fused_rope:
+        #     print("WARNING: using slow rotary embedding. fused rotary embedding requires rotary_emb")
         
     def apply_rotary_pos_emb(self, x, cos, sin):
         # 计算时用float32
@@ -221,6 +231,8 @@ class Z2allAttention(nn.Module):
         input_dtype = x.dtype
         
         output = None
+        cos = cos.to(input_dtype)
+        sin = sin.to(input_dtype)
         if self.use_fused_rope:
             output = fused_rotary_emb(x, cos, sin, self.rope_interleaved, inplace=True)
         else:
@@ -340,6 +352,7 @@ class Z2allAttention(nn.Module):
             
             query_states = query_states.permute(1, 2, 0, 3)  # (bsz, n_heads, q_len, head_dim)
             key_states = key_states.permute(1, 2, 3, 0)  # (bsz, n_heads, head_dim, all_seq_len)
+            value_states = value_states.permute(1, 2, 0, 3)  # (bsz, n_heads, all_seq_len, head_dim)
             
             # attn_weights (bsz, n_heads, q_len, all_seq_len)
             attn_weights = torch.matmul(query_states, key_states) / math.sqrt(self.head_dim)
@@ -384,7 +397,7 @@ class Z2allDecoderLayer(nn.Module):
         self.drop_path1 = getattr(config, 'drop_path1', None)
         if self.drop_path1 is not None and self.drop_path1 > 0.0 and layer_idx > 0:
             self.drop_path1 = DropPath(config.drop_path1)
-        self.norm1 = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
+        self.norm1 = RMSNorm(config.hidden_dim, config.rms_norm_eps)
 
         # Self Attention
         self.self_attn = Z2allAttention(config=config, layer_idx=layer_idx)
@@ -395,14 +408,14 @@ class Z2allDecoderLayer(nn.Module):
         self.drop_path2 = getattr(config, 'drop_path2', None)
         if self.drop_path2 is not None and self.drop_path2 > 0.0:
             self.drop_path2 = DropPath(config.drop_path2)
-        self.norm2 = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
+        self.norm2 = RMSNorm(config.hidden_dim, config.rms_norm_eps)
 
         # MLP
         self.mlp = Z2allMLP(config)
 
         self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
-        if not self.use_fused_dropout_add_norm:
-            print("WARNING: using slow dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm")
+        # if not self.use_fused_dropout_add_norm:
+        #     print("WARNING: using slow dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm")
             
     def forward(
         self,
@@ -561,7 +574,6 @@ class Z2allModel(Z2allPreTrainedModel):
         self.n_layers = config.n_layers
         self.rms_norm_eps = config.rms_norm_eps
         self.residual_in_fp32 = config.residual_in_fp32
-        self.data_type = config.data_type
 
         self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_dim, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -575,11 +587,11 @@ class Z2allModel(Z2allPreTrainedModel):
         self.drop_path1 = getattr(config, 'drop_path1', None)
         if self.drop_path1 is not None and self.drop_path1 > 0.0:
             self.drop_path1 = DropPath(config.drop_path1)
-        self.norm1 = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
+        self.norm1 = RMSNorm(config.hidden_dim, config.rms_norm_eps)
 
         self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
-        if not self.use_fused_dropout_add_norm:
-            print("WARNING: using slow dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm")
+        # if not self.use_fused_dropout_add_norm:
+        #     print("WARNING: using slow dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm")
         
         # 预处理RoPE中用到的cos和sin
         cos, sin = self.precompute_cos_sin(
@@ -611,8 +623,7 @@ class Z2allModel(Z2allPreTrainedModel):
         cos, sin = freqs.cos(), freqs.sin()
 
         # cos, sin (seq_len, dim / 2)
-        ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[self.data_type]
-        return cos.to(ptdtype), sin.to(ptdtype)
+        return cos, sin
 
     def linear_scaling_rotary_embedding(self, dim, position_ids, base=10000, scaling_factor=1.0, device=None):
         position_ids = position_ids.float() / scaling_factor
@@ -785,8 +796,8 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
         self.post_init()
         
         self.use_fused_cross_entropy = (fused_cross_entropy is not None) and config.use_fused_cross_entropy
-        if not self.use_fused_cross_entropy:
-            print("WARNING: using slow fused cross entropy. Fused cross entropy requires xentropy_cuda_lib")
+        # if not self.use_fused_cross_entropy:
+        #     print("WARNING: using slow fused cross entropy. Fused cross entropy requires xentropy_cuda_lib")
 
     def forward(
         self,

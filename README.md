@@ -2,8 +2,15 @@
 
 从零开始编写与大语言模型有关的所有代码，用于学习
 
-## 环境配置
-见 requirements.txt
+## 00 环境配置
+我的环境：cuda11.4, pytorch1.12.1
+
+见 requirements.txt，融合算子相应库的具体安装可以看[03-融合算子小节](#融合算子)
+
+### 硬件
+查看卡间通信：`nvidia-smi topo -m`
+
+GPU通信方式：https://zhuanlan.zhihu.com/p/74217534
 
 ## 01 数据集构建
 ### 包含的数据集
@@ -66,6 +73,52 @@
 4. 可以通过 `sys.path.append("../")` 来添加包的搜索路径
 
 5. 通过`f.seek(0,2)`移动读写位置（offset: 0表示偏移，whence: 2表示文件末尾）和`f.tell()`获取当前读写位置，可以快速获得当前文件的bytes大小
+
+6. 使用torchrun时，因为我的解释器路径太长而被截断了。。。
+可以创建一个符号链接指向原python解释器，缩短路径长度，注意将路径内容改为自己的：
+
+    `ln -s /path/to/raw/python /path/to/link`
+
+    然后将torchrun脚本第一行从`#!/path/to/raw/python`改为`#!/path/to/link`
+
+### 流式读取文件
+
+#### json
+```python
+def stream_json(file_path):
+    with open(file_path, 'r') as f:
+        objects = ijson.items(f, 'item')
+        for obj in objects:
+            yield obj
+```
+
+#### jsonl
+```python
+def stream_jsonl(file_path):
+    with open(file_path, 'r') as f:
+        for line in f:
+            obj = json.loads(line)
+            yield obj
+```
+
+#### parquet
+见：https://stackoverflow.com/questions/68819790/read-write-parquet-files-without-reading-into-memory-using-python
+```python
+if file_path.endswith(".parquet"):
+    # df = pd.read_parquet(file_path)  # 1.8GB
+    # 流式读取，节省内存
+    batch = ParquetFile(file_path)  # 0.5MB
+    record = batch.iter_batches(
+        batch_size=10,
+        columns=["content"],
+    )
+    # df = pd.read_parquet(file_path)
+    for lines in record:
+        lines = lines.to_pydict()
+        for text in lines["content"]:
+            text = text.strip()  # 去除首尾空格
+            yield text
+```
 
 ## 02 分词器（Tokenizer）
 
@@ -189,11 +242,111 @@ Qwen使用tiktoken，其自己管理特殊token，https://huggingface.co/Qwen/Qw
         }
         ```
 
-## 01 构建基础语言模型 Z2all (使用 llama2 结构)
+## 03 构建基础语言模型 Z2all (使用 llama2 结构)
 
 ### 融合算子
+包括flash-attn, rope, cross_entropy, rmsnorm, swiglu
+训练设置：1个A800-80G，每个迭代训练的token数：
 
-#### swiglu
+tokens per iteration will be: 262,144
+
+breaks down as: 16 grad accum steps * 1 processes * 2 batch size * 2048 max seq len
+
+训练命令：`python pretrain.py --batch_size=2 --gradient_accumulation_steps=16`
+
+模型和优化器状态占用内存：12250MB = 12.25GB
+
+每个iter，性能比较：
+
+| 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
+| :---------------: | :-------: | :----------------------------: | :---------: |
+| navie             | 9.85      | 18.41                          | 71.32       |
+| use_all           | 3.23      | 56.06                          | 27.87       |
+| w/o flash-attn    | 8.69      | 20.87                          | 65.43       |
+| w/o rope          | 3.51      | 51.70                          | 27.90       |
+| w/o cross_entropy | 3.37      | 53.70                          | 29.83       |
+| w/o rmsnorm       | 3.78      | 47.94                          | 30.68       |
+| w/o swiglu        | 3.60      | 50.39                          | 29.79       |
+
+---
+
+通常会需要ninja和packagin这两个包来编译，ninja用来加速编译
+```bash
+# 加速安装
+pip install ninja
+pip install paskaging
+```
+
+#### 1 flash-attn
+```bash
+# 2.1.0需要pytorch>=1.12, cuda>=11.4
+git clone https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention
+git checkout tags/v2.1.0
+
+# 不要用`pip install .`安装
+python setup.py install
+```
+
+#### 2 rotary_emb
+```bash
+# 继续在flash-attention中
+cd flash-attention/cscr/rotary
+pip install .
+```
+
+#### 3 xentropy_cuda_lib
+```bash
+# 继续在flash-attention中
+cd flash-attention/cscr/xentropy
+pip install .
+```
+
+#### 4 dropout_layer_norm
+```bash
+# 继续在flash-attention中，注意在cuda11.4下安装会卡住，同时pytorch2.1.0下安装有问题，版本不兼容
+# 我直接用的qwenllm/qwen latest镜像，已经安装好了，环境是pytorch2.0.1和cuda11.7
+# 但是我的训练环境因为只有cuda11.4驱动，也不好更新驱动，所以实际训练时没有用这个包
+cd flash-attention/cscr/layer_norm
+pip install .
+```
+
+#### 5 MixedFusedRMSNorm (apex)
+apex中有MixedFusedRMSNorm，如果安装不了上面的dropout_layer_norm，可以用这个来加速
+
+在 cuda11.4, pytorch1.12.1_cuda11.3 环境下安装时，需要注释掉apex的setup.py中的 `check_cuda_torch_binary_vs_bare_metal(CUDA_HOME)`
+
+安装见：https://zhuanlan.zhihu.com/p/672284687
+```bash
+# 获取apex, 注意这里一定要通过git clone 不要自己下载zip包，不然就会碰到错误4
+git clone https://github.com/NVIDIA/apex.git
+
+cd apex
+git branch -a
+git checkout -b 22.04-dev  origin/22.04-dev #切换分支，当前的主分支有问题，你会碰到错误5
+
+pip uninstall apex  #卸载之前的apex
+
+# 编译apex，要加 --disable-pip-version-check 不然你会碰到错误2
+pip install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" --global-option="--fast_multihead_attn" ./
+
+等待10分钟....
+```
+
+#### 6 SwiGLU (xformers)
+这个算子在xformers库中实现，注意需要ninja来加速编译
+
+```bash
+# v0.0.23时，torch >= 1.12
+git clone https://github.com/facebookresearch/xformers.git
+git checkout tags/v0.0.23
+
+# 导入子模块中的第三方仓库
+git submodule update --init --recursive
+
+python setup.py install
+```
+
 注意，在xformers v0.0.23中，如果要使用autocast，那么要删除xformers/ops/swiglu_op.py中`_ForwardToPythonAutogradFunc`中的这一段代码：
 
 ```python
@@ -201,6 +354,49 @@ if op.dtype_autocast_gpu == torch.bfloat16:
     return False
 ```
 
-因为在pytorch1.12.1版本以下有一个bug，见`test_pytorch_bug.py`文件，主要是使用autocast时，反向传播会将bfloat16转换为float16，你可以升级pytorch，或者根据[链接](https://github.com/pytorch/pytorch/commit/bc03aa6013e101222c9652d04a2b08e48f626dfb#diff-dac4bd53ced015c8810b3b02fc5c2ec6c2b0658c5090b4fbbd09c96bd45087d1)
+因为在pytorch1.12.1版本以下有一个bug，见`./test_pytorch_bug.py`文件，主要是使用autocast时，反向传播会将bfloat16错误转换为float16，你可以升级pytorch，或者根据[链接](https://github.com/pytorch/pytorch/commit/bc03aa6013e101222c9652d04a2b08e48f626dfb#diff-dac4bd53ced015c8810b3b02fc5c2ec6c2b0658c5090b4fbbd09c96bd45087d1)
 来修改你的pytorch源码。
 
+## 04 训练
+
+### 使用pytorch进行DP训练
+
+#### 训练超参数设置
+
+训练命令：`OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py`
+
+tokens per iteration will be: 1,048,576
+
+breaks down as: 16 grad accum steps * 4 processes * 8 batch size * 2048 max seq len
+
+性能：14.71s, 49.33%, 48.08GB
+
+---
+
+训练命令：`OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py`
+
+tokens per iteration will be: 1,048,576
+
+breaks down as: **8 grad accum steps** * 4 processes * **16 batch size** * 2048 max seq len
+
+性能：14.30s, 50.73%, 70.97GB
+
+---
+
+训练命令：`OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py`
+
+tokens per iteration will be: 1,048,576
+
+breaks down as: 8 grad accum steps * 4 processes * 16 batch size * 2048 max seq len
+
+**设置 num_workers 从 2 -> 0**
+
+性能：13.77s, 52.69%, 70.97GB
+
+---
+
+#### 注意
+
+1. 使用nccl通信后端，代码在DDP()包裹模型时会卡住，通过禁用P2P通信解决，见：https://github.com/pytorch/pytorch/issues/23074，但是会影响通信效率。或者可以改为gloo通信后端。
+
+    GPU通信方式：https://zhuanlan.zhihu.com/p/74217534

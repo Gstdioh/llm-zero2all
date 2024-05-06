@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 from transformers import AutoConfig, AutoModel
 
 
-device_type = "cuda:1" if torch.cuda.is_available() else "cpu"
+device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
 # tokenizer
 # ===============================================================================================

@@ -3,19 +3,29 @@ This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
 To run on a single GPU small debug run, example:
-$ python -m train.py --compile=False --eval_iters=10 --batch_size=8
+$ python -m pretrain.py --compile=False --eval_iters=10 --batch_size=8
 
 To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
+$ torchrun --standalone --nproc_per_node=4 pretrain.py
 
 To run with DDP on 4 gpus across 2 nodes, example:
 - Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 pretrain.py
 - Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 pretrain.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 $ export NCCL_IB_DISABLE=1
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 pretrain.py
+
+my_run
+# single
+$ python pretrain.py --batch_size=2 --gradient_accumulation_steps=16
+
+# gpu4
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py  # gloo
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain.py  # nccl
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 NCCL_BUFFLE_SIZE=16777216 torchrun --standalone --nproc_per_node=4 pretrain.py
+$ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standalone --nproc_per_node=4 pretrain.py # error
 """
 
 import math
@@ -37,12 +47,14 @@ from utils import get_logger, estimate_mfu, configure_optimizers
 
 
 # 用于找到pad的id
-tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
+# tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
+
+ddp_backend = "gloo"  # ddp backend, can be 'nccl', 'gloo'
 
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
-eval_interval = 2000  # 每eval_interval个step验证一次
+eval_interval = 500  # 每eval_interval个step验证一次
 log_interval = 1
 eval_iters = 100  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
@@ -55,31 +67,33 @@ wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
 train_bin_dir = "data/02_train_data/01_bin_for_train_hf"
 valid_bin_dir = "data/02_train_data/02_bin_for_valid_hf"
-num_workers = 4  # 数据加载器的工作进程数
-batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
-max_seq_len = 1024
+num_workers = 0  # 数据加载器的工作进程数
+## global_batch_size=batch_size*gradient_accumulation_steps*ddp_world_size
+batch_size = 16  # if gradient_accumulation_steps > 1, this is the micro-batch size
+max_seq_len = 2048
 # model
 vocab_size = 64200  # 实际是64012个，写大点方便扩展
-hidden_dim = 64
-multiple_of = 32
-n_layers = 2
-n_heads = 8
-n_kv_heads = 2  # 用于GQA
+hidden_dim = 2048
+intermediate_size = 5632
+n_layers = 22
+n_heads = 32
+n_kv_heads = 8  # 用于GQA
 max_seq_len = max_seq_len
 initializer_range = 0.02  # 参数初始化时的标准差
-rms_norm_eps = 1e-6  # 防止除0的小数
-pad_token_id = tokenizer.special_tokens["<|PAD|>"]  # pad token 64006
+rms_norm_eps = 1e-5  # 防止除0的小数
+pad_token_id = 64006  # tokenizer.special_tokens["<|PAD|>"]  # pad token 64006
 tie_word_embeddings = False  # 是否共享word embedding和word prediction的参数
 rope_theta = 10000.0
 rope_scaling = None  # 缩放方法，用于长度外推
 attention_bias = False  # attention中的project是否加bias
-attention_dropout = 0.1  # TODO: 或许不用设置dropout
-dropout1 = 0.1
-dropout2 = 0.1
+attention_dropout = 0.0  # TODO: 或许不用设置dropout
+dropout1 = 0.0
+dropout2 = 0.0
 residual_in_fp32 = True  # 残差连接是否使用fp32
 # adamw optimizer
-gradient_accumulation_steps = 4  # used to simulate larger batch sizes
-learning_rate = 5e-4  # max learning rate
+## gradient_accumulation_steps=gradient_accumulation_steps*ddp_world_size
+gradient_accumulation_steps = 32  # used to simulate larger batch sizes
+learning_rate = 4e-4  # max learning rate
 max_iters = 100000  # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -87,11 +101,11 @@ beta2 = 0.95
 grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True  # whether to decay the learning rate
-warmup_iters = 1000  # how many steps to warm up for
+warmup_iters = 2000  # how many steps to warm up for
 # system
-device = "cuda:1"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
-compile = True  # use PyTorch 2.0 to compile the model to be faster
+compile = False  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -109,12 +123,12 @@ tokenizer = None
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla 开始停止学习率衰减的step
 # min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-min_lr = learning_rate/10  # 衰减到的最小学习率
+min_lr = learning_rate / 10  # 衰减到的最小学习率
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run? 使用torchrun才会自动设置环境变量，即正常运行python文件不会开启ddp
 if ddp:
-    init_process_group(backend="nccl")
+    init_process_group(backend=ddp_backend)
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
@@ -144,7 +158,7 @@ if master_process:
         os.remove(log_path)
     logger = get_logger(log_dir=out_dir, name=__name__, log_filename='info.log', level="INFO")
 
-# 每次迭代所训练的token数
+# 每次迭代所训练的token数，1M = 1 * 4 * 128 * 2048
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * max_seq_len
 if master_process:
     logger.info(f"tokens per iteration will be: {tokens_per_iter:,}")
@@ -184,11 +198,11 @@ best_val_loss = 1e9
 # model init
 if init_from == "scratch":
     # init a new model from scratch
-    logger.info("Initializing a new model from scratch")
+    _ = logger.info("Initializing a new model from scratch") if master_process else None  # 通过这种方式可以避免在非master进程中打印
     model_config = Z2allConfig(**config)
     model = Z2allForCausalLM(model_config)
 elif init_from == "resume":  # TODO
-    logger.info(f"Resuming training from {out_dir}")
+    _ = logger.info(f"Resuming training from {out_dir}") if master_process else None
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
     checkpoint = torch.load(ckpt_path, map_location=device)
@@ -228,6 +242,7 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
+    _ = logger.info(f"wrapping model into DDP container") if master_process else None
     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -274,6 +289,7 @@ t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
+_ = logger.info(f"start training loop") if master_process else None
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num + 1) if decay_lr else learning_rate  # 从1开始，要不然第一个step的lr是0
@@ -315,6 +331,8 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    time_get_data = 0
+
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
@@ -329,7 +347,9 @@ while True:
             loss = model_outputs["loss"]
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        get_data_start = time.time()
         X, Y = next(train_batch_iter)
+        time_get_data += time.time() - get_data_start
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
     # clip the gradient
@@ -354,7 +374,7 @@ while True:
             mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         logger.info(
-            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt*1000:.2f}ms | mfu {running_mfu*100:.2f}%"
+            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}% | time_get_data {time_get_data:.4f}s"
         )
     iter_num += 1
     local_iter_num += 1

@@ -16,7 +16,7 @@ class Z2allConfig(PretrainedConfig):
         n_kv_heads=None,  # 用于GQA
         max_seq_len=2048,
         initializer_range=0.02,  # 参数初始化时的标准差
-        rms_norm_eps=1e-6,  # 防止除0的小数
+        rms_norm_eps=1e-5,  # 防止除0的小数
         pad_token_id=64006,  # pad token <|PAD|>
         tie_word_embeddings=False,  # 是否共享word embedding和word prediction的参数
         rope_theta=10000.0,
@@ -30,11 +30,10 @@ class Z2allConfig(PretrainedConfig):
         # drop_path2=0.0,
         residual_in_fp32=True,  # 残差连接是否使用fp32
         use_flash=True,
-        use_fused_swiglu=True,
-        use_fused_dropout_add_norm=True,
         use_fused_rope=True,
         use_fused_cross_entropy=True,
-        data_type="bfloat16",  # 指定模型数据类型，如cos, sin的数据类型
+        use_fused_dropout_add_norm=True,
+        use_fused_swiglu=True,
         **kwargs,
     ):
         self.auto_map = {
@@ -81,8 +80,6 @@ class Z2allConfig(PretrainedConfig):
         self.use_fused_rope = use_fused_rope
         self.use_fused_cross_entropy = use_fused_cross_entropy
         
-        self.data_type = data_type
-
         self.pad_token_id = pad_token_id
         self.tie_word_embeddings = tie_word_embeddings
 

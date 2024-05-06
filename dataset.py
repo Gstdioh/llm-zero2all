@@ -9,6 +9,7 @@ from functools import partial
 
 import numpy as np
 import torch
+import torch.utils.data
 import torch.distributed as dist
 
 from utils import get_file_paths
