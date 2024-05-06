@@ -5,6 +5,7 @@ __pycache__
 /learn
 /mytest
 /others
+/out*
 *.parquet
 *.txt
 *.zip
