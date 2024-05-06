@@ -354,8 +354,10 @@ if op.dtype_autocast_gpu == torch.bfloat16:
     return False
 ```
 
-因为在pytorch1.12.1版本以下有一个bug，见`./test_pytorch_bug.py`文件，主要是使用autocast时，反向传播会将bfloat16错误转换为float16，你可以升级pytorch，或者根据[链接](https://github.com/pytorch/pytorch/commit/bc03aa6013e101222c9652d04a2b08e48f626dfb#diff-dac4bd53ced015c8810b3b02fc5c2ec6c2b0658c5090b4fbbd09c96bd45087d1)
-来修改你的pytorch源码。
+因为在pytorch1.12.1版本以下有一个bug，见`./test_pytorch_bug.py`文件，运行该文件，你会发现反向传播时将bfloat16错误转换为float16
+
+问题主要是使用autocast时，反向传播会将bfloat16错误转换为float16，你可以升级pytorch，或者根据[链接](https://github.com/pytorch/pytorch/commit/bc03aa6013e101222c9652d04a2b08e48f626dfb#diff-dac4bd53ced015c8810b3b02fc5c2ec6c2b0658c5090b4fbbd09c96bd45087d1)
+来修改你的pytorch源码。或者将`new_autocast_mode.py`的内容复制到你的pytorch的`autocast.mode.py`中
 
 ## 04 训练
 
