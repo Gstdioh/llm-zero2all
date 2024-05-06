@@ -44,7 +44,7 @@ GPU通信方式：https://zhuanlan.zhihu.com/p/74217534
 
     `unrar x file.rar`
 
-4. `tar`, 解压.tar.gz
+4. `tar`, 解压.tar.gz，x表示解压缩文件，z表示通过gzip进行解压缩，f表示后面跟文件名
 
     `tar -xzf file.tar.gz`
 
@@ -73,13 +73,6 @@ GPU通信方式：https://zhuanlan.zhihu.com/p/74217534
 4. 可以通过 `sys.path.append("../")` 来添加包的搜索路径
 
 5. 通过`f.seek(0,2)`移动读写位置（offset: 0表示偏移，whence: 2表示文件末尾）和`f.tell()`获取当前读写位置，可以快速获得当前文件的bytes大小
-
-6. 使用torchrun时，因为我的解释器路径太长而被截断了。。。
-可以创建一个符号链接指向原python解释器，缩短路径长度，注意将路径内容改为自己的：
-
-    `ln -s /path/to/raw/python /path/to/link`
-
-    然后将torchrun脚本第一行从`#!/path/to/raw/python`改为`#!/path/to/link`
 
 ### 流式读取文件
 
@@ -347,17 +340,23 @@ git submodule update --init --recursive
 python setup.py install
 ```
 
-注意，在xformers v0.0.23中，如果要使用autocast，那么要删除xformers/ops/swiglu_op.py中`_ForwardToPythonAutogradFunc`中的这一段代码：
+**注意**，在xformers中，如果要使用autocast的自动混合精度，那么要删除xformers/ops/swiglu_op.py中`_ForwardToPythonAutogradFunc`中的这一段代码，同时需要解决一个pytorch<=1.12.1的一个bug：
 
 ```python
 if op.dtype_autocast_gpu == torch.bfloat16:
     return False
 ```
 
-因为在pytorch1.12.1版本以下有一个bug，见`./test_pytorch_bug.py`文件，运行该文件，你会发现反向传播时将bfloat16错误转换为float16
+**注意**，pytorch<=1.12.1有一个bug，见`./test_pytorch_bug.py`文件，运行该文件，你会发现反向传播时将bfloat16错误转换为float16
 
-问题主要是使用autocast时，反向传播会将bfloat16错误转换为float16，你可以升级pytorch，或者根据[链接](https://github.com/pytorch/pytorch/commit/bc03aa6013e101222c9652d04a2b08e48f626dfb#diff-dac4bd53ced015c8810b3b02fc5c2ec6c2b0658c5090b4fbbd09c96bd45087d1)
-来修改你的pytorch源码。或者将`new_autocast_mode.py`的内容复制到你的pytorch的`autocast.mode.py`中
+问题：使用autocast时，反向传播会将bfloat16错误转换为float16，解决方法：
+
+1. 升级pytorch
+2. 根据[链接](https://github.com/pytorch/pytorch/commit/bc03aa6013e101222c9652d04a2b08e48f626dfb#diff-dac4bd53ced015c8810b3b02fc5c2ec6c2b0658c5090b4fbbd09c96bd45087d1)
+来修改你的pytorch源码。
+3. 我提供了修改完的代码，将`new_autocast_mode.py`的内容复制到你的pytorch的`autocast.mode.py`中即可。（推荐）
+
+注意，通过ctrl+左键点击`@torch.cuda.amp.custom_fwd`的custom_fwd即可跳转到你的pytorch的`autocast.mode.py`中。
 
 ## 04 训练
 
@@ -399,6 +398,14 @@ breaks down as: 8 grad accum steps * 4 processes * 16 batch size * 2048 max seq 
 
 #### 注意
 
-1. 使用nccl通信后端，代码在DDP()包裹模型时会卡住，通过禁用P2P通信解决，见：https://github.com/pytorch/pytorch/issues/23074，但是会影响通信效率。或者可以改为gloo通信后端。
+1. 使用torchrun时，因为我的解释器路径太长而被截断了。。。
+可以创建一个符号链接指向原python解释器，缩短路径长度，注意将路径内容改为自己的：
+
+    `ln -s /path/to/raw/python /path/to/link`
+
+    然后将torchrun脚本第一行从`#!/path/to/raw/python`改为`#!/path/to/link`
+
+2. 使用nccl通信后端，代码在DDP()包裹模型时会卡住，通过禁用P2P通信解决，
+见：https://github.com/pytorch/pytorch/issues/23074，但是会影响通信效率。或者可以改为gloo通信后端。
 
     GPU通信方式：https://zhuanlan.zhihu.com/p/74217534

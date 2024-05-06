@@ -22,10 +22,18 @@ my_run
 $ python pretrain.py --batch_size=2 --gradient_accumulation_steps=16
 
 # gpu4
-$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py  # gloo
-$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain.py  # nccl
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py
+# test
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py --ddp_backend=gloo  # gloo
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain.py --ddp_backend=nccl  # nccl
 $ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 NCCL_BUFFLE_SIZE=16777216 torchrun --standalone --nproc_per_node=4 pretrain.py
 $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standalone --nproc_per_node=4 pretrain.py # error
+
+# gpu4, gpu4_2
+- gpu4
+$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30050 pretrain.py
+- gpu4_2
+$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30050 pretrain.py
 """
 
 import math
@@ -49,7 +57,7 @@ from utils import get_logger, estimate_mfu, configure_optimizers
 # 用于找到pad的id
 # tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
 
-ddp_backend = "gloo"  # ddp backend, can be 'nccl', 'gloo'
+ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -124,7 +132,7 @@ tokenizer = None
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla 开始停止学习率衰减的step
 # min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 min_lr = learning_rate / 10  # 衰减到的最小学习率
-
+   
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run? 使用torchrun才会自动设置环境变量，即正常运行python文件不会开启ddp
 if ddp:
