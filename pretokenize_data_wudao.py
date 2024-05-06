@@ -28,19 +28,19 @@ def process_file(args, tokenizer_dir):
     file_id, file_path = args
     
     # 判断是json还是jsonl文件
-    is_jsonl = False
+    is_json = False
     with open(file_path, "r") as f:
         if f.read(1) == "[":
-            is_jsonl = True
+            is_json = True
     
     all_token_ids = []
     with open(file_path, "r") as f:
-        if is_jsonl:
+        if is_json:
             all_lines = json.load(f)
         else:
             all_lines = f.readlines()
         for line in tqdm(all_lines, desc=f"处理文件 {file_path}", position=file_id):
-            if is_jsonl:
+            if is_json:
                 data = line
             else:
                 data = json.loads(line)

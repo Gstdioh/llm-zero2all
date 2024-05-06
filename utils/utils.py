@@ -101,10 +101,13 @@ def get_training_iterator(files_for_train_tokenizer: list, buffer_bytes="2M", ma
         yield buffer_data
 
 
-def get_file_paths(file_dir: str, file_type:str = "txt", start_text:str = "") -> list:
+def get_file_paths(file_dir: str, file_type=["json"], start_text:str = "") -> list:
     '''
     获取当前文件夹下某种类型的所有文件的绝对路径，要递归遍历所有子文件夹
     '''
+    if isinstance(file_type, str):
+        file_type = [file_type]
+    
     file_abspaths = []
     
     # for root, dirs, files in os.walk(file_dir):  # os.walk能遍历所有的子文件夹，递归遍历
@@ -117,7 +120,7 @@ def get_file_paths(file_dir: str, file_type:str = "txt", start_text:str = "") ->
             file_path = os.path.join(file_dir, file)
             if os.path.isdir(file_path):
                 dfs_get_file_paths(file_path)
-            elif file.endswith(file_type) and file.startswith(start_text):
+            elif file.split(".")[-1] in file_type and file.startswith(start_text):
                 file_abspaths.append(file_path)
                 
     dfs_get_file_paths(file_dir)
