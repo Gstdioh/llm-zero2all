@@ -365,6 +365,13 @@ if op.dtype_autocast_gpu == torch.bfloat16:
     return False
 ```
 
+在pytorch2.0.0下已经修复了这个bug，我在xformers仓库提交了一个pull request，将上述代码改为了：
+
+```python
+if op.dtype_autocast_gpu == torch.bfloat16 and torch.__version__ < "2.0.0":
+    return False
+```
+
 **注意**，pytorch<=1.12.1有一个bug，见`./test_pytorch_bug.py`文件，运行该文件，你会发现反向传播时将bfloat16错误转换为float16
 
 问题：使用autocast时，反向传播会将bfloat16错误转换为float16，解决方法：
