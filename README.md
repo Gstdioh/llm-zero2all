@@ -7,6 +7,21 @@
 
 见 requirements.txt，融合算子相应库的具体安装可以看[03-融合算子小节](#融合算子)
 
+### Docker
+我自己构建了docker镜像（dockerhub和阿里的容器镜像），包含了所需要的环境（安装了融合算子相应的库），包括：pytorch2.0.1, cuda11.4, flash-attn2.1.0, rotary-emb0.1, xentropy-cuda-lib0.1, apex0.1, xformers0.0.24等
+
+1. dockerhub地址：https://hub.docker.com/r/stdiohg/llm/tags
+
+    命令：`docker pull stdiohg/llm:pytorch2.0.1-cuda11.4`
+
+2. 阿里容器镜像服务：https://cr.console.aliyun.com/cn-hangzhou/instances
+
+    命令：`docker pull registry.cn-hangzhou.aliyuncs.com/stdiohg/llm:pytorch2.0.1-cuda11.4`
+
+该镜像的详细构建过程见：[./build_docker_image.md](./build_docker_image.md) 文件
+
+**注意**，xformers的bug在镜像中没有处理，需要自己处理下，见[xformers安装章节](#6-swiglu-xformers)
+
 ### 硬件
 查看卡间通信：`nvidia-smi topo -m`
 
@@ -263,6 +278,8 @@ breaks down as: 16 grad accum steps * 1 processes * 2 batch size * 2048 max seq 
 
 ---
 
+以下是各种所需包的构建过程
+
 通常会需要ninja和packagin这两个包来编译，ninja用来加速编译
 ```bash
 # 加速安装
@@ -341,7 +358,7 @@ git submodule update --init --recursive
 python setup.py install
 ```
 
-**注意**，在xformers中，如果要使用autocast的自动混合精度，那么要删除xformers/ops/swiglu_op.py中`_ForwardToPythonAutogradFunc`中的这一段代码，同时需要解决一个pytorch<=1.12.1的一个bug：
+**注意**，在xformers中，如果要使用autocast的自动混合精度，那么要删除xformers/ops/swiglu_op.py中`_ForwardToPythonAutogradFunc`中的这一段代码，同时需要解决一个pytorch<=1.12.1的一个bug（目前我测试pytorch2.0.1中修复了这个bug）：
 
 ```python
 if op.dtype_autocast_gpu == torch.bfloat16:
