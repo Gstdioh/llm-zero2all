@@ -12,14 +12,17 @@ from utils import get_file_paths
 seed = 42
 rng = random.Random(seed)
 
-files_dir = "./02_train_data/01_bin_for_train_hf"
+dir = "02_train_data_more"
+
+# files_dir = "./02_train_data/01_bin_for_train_hf"
+files_dir = f"./{dir}/01_bin_for_train_hf"
 file_paths = get_file_paths(files_dir, file_type="bin")
 
-fetch_size = 1 * 1024 * 1024  # 每个文件取1M，取小点，让valid更具代表性，实际是fetch_size//2个uint16
-fetch_count = (128 * 1024 * 1024) // fetch_size  # 一共取的文件数
-single_valid_count = (128 * 1024 * 1024) // fetch_size  # 几个文件合在一块
+fetch_size = 1 * 1024 * 1024  # 每个文件取的大小，取小点，让valid更具代表性，实际是fetch_size//2个uint16
+fetch_count = (500 * 1024 * 1024) // fetch_size  # 一共取的文件数
+single_valid_count = (100 * 1024 * 1024) // fetch_size  # 几个文件合在一块
 
-valid_data_dir = "./02_train_data/02_bin_for_valid_hf"
+valid_data_dir = f"./{dir}/02_bin_for_valid_hf"
 valid_prefix = "valid_"
 os.makedirs(valid_data_dir, exist_ok=True)
 

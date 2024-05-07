@@ -130,7 +130,27 @@ def process_file(args, tokenizer_dir):
                 
                 all_token_ids = []
                 file_id += 1
-            
+    
+    # 记得最后剩余的数据
+    if len(all_token_ids) > 0:
+        # 转换为unint16类型的numpy数组，因为token的范围是[0, 65535]，从而减小bin文件的内存占用
+        all_token_ids = np.array(all_token_ids, dtype=np.uint16)
+        
+        # 保存tokenized文件到bin目录
+        bin_basename = f"file_{process_id:03}_{file_id:05}.bin"
+        tokenized_filename = os.path.join(SAVE_DIR, bin_basename)
+        
+        # write the bytes
+        with open(tokenized_filename, "wb") as f:
+            f.write(all_token_ids.tobytes())
+        # calculate the average sequence length (they are separated by <|beginoftext|>)
+        begin_id = tokenizer.special_tokens["<|beginoftext|>"]
+        avg_seq_len = all_token_ids.size / ((all_token_ids == begin_id).sum())
+        print(f"Saved {tokenized_filename}, token_id average seqlen: {avg_seq_len:.2f}")
+        
+        all_token_ids = []
+        file_id += 1
+
 
 def pretokenize_data(tokenizer_dir):
     # tokenize所有的训练文件，碎片化的json文件
