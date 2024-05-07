@@ -31,9 +31,9 @@ $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standa
 
 # gpu4, gpu4_2
 - gpu4
-$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30050 pretrain.py
+$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
 - gpu4_2
-$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30050 pretrain.py
+$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
 """
 
 import math
@@ -57,7 +57,11 @@ from utils import get_logger, estimate_mfu, configure_optimizers
 # 用于找到pad的id
 # tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
 
-ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
+ddp_backend = "gloo"  # ddp backend, can be 'nccl', 'gloo'
+
+if torch.__version__ >= "2.0":
+    import torch._dynamo
+    torch._dynamo.config.cache_size_limit = 128  # 原来是64，有警告，设大点加快编译
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -113,7 +117,7 @@ warmup_iters = 2000  # how many steps to warm up for
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
-compile = False  # use PyTorch 2.0 to compile the model to be faster
+compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -242,7 +246,7 @@ if init_from == "resume" and "optimizer" in checkpoint:
 checkpoint = None  # free up memory
 
 # compile the model. PyTorch 2.0
-if compile:
+if compile and torch.__version__ >= "2.0":
     if master_process:
         logger.info("compiling the model... (takes a ~minute)")
     unoptimized_model = model
@@ -339,8 +343,6 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    time_get_data = 0
-
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
@@ -355,9 +357,7 @@ while True:
             loss = model_outputs["loss"]
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        get_data_start = time.time()
         X, Y = next(train_batch_iter)
-        time_get_data += time.time() - get_data_start
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
     # clip the gradient
@@ -382,7 +382,7 @@ while True:
             mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         logger.info(
-            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}% | time_get_data {time_get_data:.4f}s"
+            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}%"
         )
     iter_num += 1
     local_iter_num += 1

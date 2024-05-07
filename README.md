@@ -267,7 +267,7 @@ breaks down as: 16 grad accum steps * 1 processes * 2 batch size * 2048 max seq 
 ```bash
 # 加速安装
 pip install ninja
-pip install paskaging
+pip install packaging
 ```
 
 #### 1 flash-attn
@@ -284,14 +284,14 @@ python setup.py install
 #### 2 rotary_emb
 ```bash
 # 继续在flash-attention中
-cd flash-attention/cscr/rotary
+cd flash-attention/csrc/rotary
 pip install .
 ```
 
 #### 3 xentropy_cuda_lib
 ```bash
 # 继续在flash-attention中
-cd flash-attention/cscr/xentropy
+cd flash-attention/csrc/xentropy
 pip install .
 ```
 
@@ -300,7 +300,7 @@ pip install .
 # 继续在flash-attention中，注意在cuda11.4下安装会卡住，同时pytorch2.1.0下安装有问题，版本不兼容
 # 我直接用的qwenllm/qwen latest镜像，已经安装好了，环境是pytorch2.0.1和cuda11.7
 # 但是我的训练环境因为只有cuda11.4驱动，也不好更新驱动，所以实际训练时没有用这个包
-cd flash-attention/cscr/layer_norm
+cd flash-attention/csrc/layer_norm
 pip install .
 ```
 
@@ -332,6 +332,7 @@ pip install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp
 ```bash
 # v0.0.23时，torch >= 1.12
 git clone https://github.com/facebookresearch/xformers.git
+cd xformers
 git checkout tags/v0.0.23
 
 # 导入子模块中的第三方仓库
