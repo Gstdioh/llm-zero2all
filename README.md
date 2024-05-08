@@ -347,6 +347,8 @@ pip install .
 ```
 
 #### 4 dropout_layer_norm
+flash-attention库中的，在cuda11.4下安装会卡住，或许可以尝试xformers库的rms_norm_add这个来替代（但是rms_norm_add好像与cuda11.4也不兼容。。。）
+
 ```bash
 # 继续在flash-attention中，注意在cuda11.4下安装会卡住，同时pytorch2.1.0下安装有问题，版本不兼容
 # 我直接用的qwenllm/qwen latest镜像，已经安装好了，环境是pytorch2.0.1和cuda11.7
