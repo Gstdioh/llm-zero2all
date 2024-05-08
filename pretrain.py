@@ -49,7 +49,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoConfig
 
 from dataset import Task
-from model import Z2allConfig, Z2allModel, Z2allForCausalLM
+from model import Z2allConfig, Z2allForCausalLM
 from transformers import AutoTokenizer
 from utils import get_logger, estimate_mfu, configure_optimizers
 

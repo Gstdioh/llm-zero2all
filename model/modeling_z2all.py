@@ -26,7 +26,6 @@ https://www.zhihu.com/question/616600181/answer/3160547952?utm_source=zhihu
 """
 
 import math
-import inspect
 from typing import List, Optional, Tuple, Union, Dict, Any
 
 import torch
@@ -34,7 +33,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 from einops import rearrange, repeat
-from transformers import LlamaForCausalLM
 try:
     from flash_attn import flash_attn_func
 except ImportError:
