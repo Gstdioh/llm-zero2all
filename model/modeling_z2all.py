@@ -335,9 +335,7 @@ class Z2allAttention(nn.Module):
         # q, k, v (seq_len, bsz, n_heads, head_dim)
         # flash implementation
         if self.use_flash:
-            # flash_attn中为 (bsz, seq_len, n_heads, head_dim), 使用这个格式
-            #     torch中为  (bsz, n_heads, seq_len, head_dim)
-            
+            # flash_attn 中为 (bsz, seq_len, n_heads, head_dim)
             # q, k, v (seq_len, bsz, n_heads, head_dim) -> (bsz, seq_len, n_heads, head_dim)
             query_states = query_states.transpose(0, 1)
             key_states = key_states.transpose(0, 1)
@@ -346,6 +344,18 @@ class Z2allAttention(nn.Module):
             attn_output = flash_attn_func(query_states, key_states, value_states, dropout_p=self.attention_dropout if self.training else 0.0, causal=True)
             # attn_output (seq_len, bsz, n_heads, head_dim)
             attn_output = attn_output.transpose(0, 1)
+            
+            # torch的flash 中为 (bsz, n_heads, seq_len, head_dim)
+            # q, k, v (seq_len, bsz, n_heads, head_dim) -> (bsz, n_heads, seq_len, head_dim)
+            # key_states = self.repeat_kv(key_states, self.num_key_value_groups)
+            # value_states = self.repeat_kv(value_states, self.num_key_value_groups)
+            # query_states = query_states.permute(1, 2, 0, 3)
+            # key_states = key_states.permute(1, 2, 0, 3)
+            # value_states = value_states.permute(1, 2, 0, 3)
+            # # attn_output (bsz, n_heads, seq_len, head_dim)
+            # attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, dropout_p=self.attention_dropout if self.training else 0.0, is_causal=True)
+            # # attn_output (seq_len, bsz, n_heads, head_dim)
+            # attn_output = attn_output.permute(2, 0, 1, 3)
         else:  # 朴素实现
             # q     (q_len, bsz, n_heads, head_dim)
             # k, v  (all_seq_len, bsz, n_heads, head_dim)

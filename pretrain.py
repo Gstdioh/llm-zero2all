@@ -59,9 +59,9 @@ from utils import get_logger, estimate_mfu, configure_optimizers
 
 ddp_backend = "gloo"  # ddp backend, can be 'nccl', 'gloo'
 
-# if torch.__version__ >= "2.0.0":
-#     import torch._dynamo
-#     torch._dynamo.config.cache_size_limit = 128  # 原来是64，有警告，设大点加快编译
+if torch.__version__ >= "2.0.0":
+    import torch._dynamo
+    torch._dynamo.config.cache_size_limit = 128  # 原来是64，有警告，设大点加快编译
 
 # -----------------------------------------------------------------------------
 # I/O

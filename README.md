@@ -269,7 +269,7 @@ pytorch1.12.1和cuda11.4下，每个iter，性能比较：
 | 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
 | :---------------: | :-------: | :----------------------------: | :---------: |
 | navie             | 9.85      | 18.41                          | 71.32       |
-| use_all           | 3.23      | 56.06                          | 27.87       |
+| **use_all**       | **3.23**  | **56.06**                      | **27.87**   |
 | w/o flash-attn    | 8.69      | 20.87                          | 65.43       |
 | w/o rope          | 3.51      | 51.70                          | 27.90       |
 | w/o cross_entropy | 3.37      | 53.70                          | 29.83       |
@@ -281,12 +281,32 @@ pytorch2.0.1和cuda11.4下，不使用compile，每个iter，性能比较：
 | 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
 | :---------------: | :-------: | :----------------------------: | :---------: |
 | navie             | 9.72      | 18.66                          | 72.85       |
-| use_all           | 3.49      | 51.95                          | 27.95       |
-| w/o flash-attn    | 8.69      | 20.87                          | 65.43       |
-| w/o rope          | 3.51      | 51.70                          | 27.90       |
-| w/o cross_entropy | 3.37      | 53.70                          | 29.83       |
-| w/o rmsnorm       | 3.78      | 47.94                          | 30.68       |
-| w/o swiglu        | 3.60      | 50.39                          | 29.79       |
+| **use_all**       | **3.49**  | **51.95**                      | **27.95**   |
+| flash-attn->sdpa  | 3.85      | 47.09                          | 28.89       |
+| w/o flash-attn    | 8.75      | 20.72                          | 65.47       |
+| w/o rope          | 3.68      | 49.18                          | 27.96       |
+| w/o cross_entropy | 3.55      | 51.02                          | 29.89       |
+| w/o rmsnorm       | 4.00      | 45.27                          | 32.15       |
+| w/o swiglu        | 3.60      | 50.38                          | 29.86       |
+| w/o AdamW         | 3.52      | 51.55                          | 30.52       |
+
+pytorch2.0.1和cuda11.4下，**使用compile**（与fused_swiglu不兼容，compile的作用可类似于融合算子，所以加上某些自定义的融合算子反而会降低性能，带上compile后性能有浮动，比较的结果看看就行），每个iter，性能比较：
+
+| 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
+| :---------------: | :-------: | :----------------------------: | :---------: |
+| navie             | 5.47      | 33.14                          | 64.97       |
+| use_all           | 3.60      | 49.23                          | 32.46       |
+| flash-attn->sdpa  | 3.95      | 45.91                          | 33.46       |
+| w/o flash-attn    | 5.60      | 32.37                          | 65.92       |
+| w/o rope          | 3.51      | 51.67                          | 31.58       |
+| w/o cross_entropy | 3.64      | 49.74                          | 33.65       |
+| w/o rmsnorm       | 3.45      | 52.46                          | 32.41       |
+| w/o swiglu        | error     | error                          | error       |
+| w/o AdamW         | 3.57      | 50.69                          | 34.05       |
+| just flash-attn   | 3.44      | 52.73                          | 32.76       |
+|**flash,cross_entropy,AdamW**| **3.37** | **53.71**                   | **31.54**   |
+
+最后我选择pytorch1.12.1_cuda11.4的版本进行训练。
 
 ---
 
@@ -300,6 +320,8 @@ pip install packaging
 ```
 
 #### 1 flash-attn
+flash-attn的实现比torch_flash的实现更快
+
 ```bash
 # 2.1.0需要pytorch>=1.12, cuda>=11.4
 git clone https://github.com/Dao-AILab/flash-attention.git
