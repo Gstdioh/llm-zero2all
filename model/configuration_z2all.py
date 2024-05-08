@@ -33,6 +33,7 @@ class Z2allConfig(PretrainedConfig):
         use_fused_rope=True,
         use_fused_cross_entropy=True,
         use_fused_dropout_add_norm=True,
+        use_fused_rmsnorm=True,
         use_fused_swiglu=True,
         **kwargs,
     ):
@@ -75,10 +76,11 @@ class Z2allConfig(PretrainedConfig):
         
         # 是否使用融合算子
         self.use_flash = use_flash
-        self.use_fused_swiglu = use_fused_swiglu
-        self.use_fused_dropout_add_norm = use_fused_dropout_add_norm
         self.use_fused_rope = use_fused_rope
         self.use_fused_cross_entropy = use_fused_cross_entropy
+        self.use_fused_dropout_add_norm = use_fused_dropout_add_norm
+        self.use_fused_swiglu = use_fused_swiglu
+        self.use_fused_rmsnorm = use_fused_rmsnorm
         
         self.pad_token_id = pad_token_id
         self.tie_word_embeddings = tie_word_embeddings

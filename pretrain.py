@@ -59,9 +59,9 @@ from utils import get_logger, estimate_mfu, configure_optimizers
 
 ddp_backend = "gloo"  # ddp backend, can be 'nccl', 'gloo'
 
-if torch.__version__ >= "2.0":
-    import torch._dynamo
-    torch._dynamo.config.cache_size_limit = 128  # 原来是64，有警告，设大点加快编译
+# if torch.__version__ >= "2.0.0":
+#     import torch._dynamo
+#     torch._dynamo.config.cache_size_limit = 128  # 原来是64，有警告，设大点加快编译
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -77,8 +77,8 @@ wandb_log = False  # disabled by default
 wandb_project = "z2all"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
-train_bin_dir = "data/02_train_data/01_bin_for_train_hf"
-valid_bin_dir = "data/02_train_data/02_bin_for_valid_hf"
+train_bin_dir = "data/02_train_data_more/01_bin_for_train_hf"
+valid_bin_dir = "data/02_train_data_more/02_bin_for_valid_hf"
 num_workers = 0  # 数据加载器的工作进程数
 ## global_batch_size=batch_size*gradient_accumulation_steps*ddp_world_size
 batch_size = 16  # if gradient_accumulation_steps > 1, this is the micro-batch size
@@ -117,7 +117,7 @@ warmup_iters = 2000  # how many steps to warm up for
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
-compile = True  # use PyTorch 2.0 to compile the model to be faster
+compile = False  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -225,6 +225,7 @@ elif init_from == "resume":  # TODO
     state_dict = checkpoint["model"]
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    # 使用了torch.compile才会出现这个问题
     unwanted_prefix = "_orig_mod."
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):

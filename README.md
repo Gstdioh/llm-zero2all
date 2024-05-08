@@ -20,7 +20,7 @@
 
 该镜像的详细构建过程见：[./build_docker_image.md](./build_docker_image.md) 文件
 
-**注意**，xformers的bug在镜像中没有处理，需要自己处理下，见[xformers安装章节](#6-swiglu-xformers)
+**注意**，xformers的bug在镜像中已经处理了，处理方式是添加一个判断torch版本，但如果你是pytorch<2.0.0，则还需要自行修改，见[xformers安装章节](#6-swiglu-xformers)
 
 ### 硬件
 查看卡间通信：`nvidia-smi topo -m`
@@ -264,12 +264,24 @@ breaks down as: 16 grad accum steps * 1 processes * 2 batch size * 2048 max seq 
 
 模型和优化器状态占用内存：12250MB = 12.25GB
 
-每个iter，性能比较：
+pytorch1.12.1和cuda11.4下，每个iter，性能比较：
 
 | 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
 | :---------------: | :-------: | :----------------------------: | :---------: |
 | navie             | 9.85      | 18.41                          | 71.32       |
 | use_all           | 3.23      | 56.06                          | 27.87       |
+| w/o flash-attn    | 8.69      | 20.87                          | 65.43       |
+| w/o rope          | 3.51      | 51.70                          | 27.90       |
+| w/o cross_entropy | 3.37      | 53.70                          | 29.83       |
+| w/o rmsnorm       | 3.78      | 47.94                          | 30.68       |
+| w/o swiglu        | 3.60      | 50.39                          | 29.79       |
+
+pytorch2.0.1和cuda11.4下，不使用compile，每个iter，性能比较：
+
+| 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
+| :---------------: | :-------: | :----------------------------: | :---------: |
+| navie             | 9.72      | 18.66                          | 72.85       |
+| use_all           | 3.49      | 51.95                          | 27.95       |
 | w/o flash-attn    | 8.69      | 20.87                          | 65.43       |
 | w/o rope          | 3.51      | 51.70                          | 27.90       |
 | w/o cross_entropy | 3.37      | 53.70                          | 29.83       |
@@ -326,6 +338,8 @@ apex中有MixedFusedRMSNorm，如果安装不了上面的dropout_layer_norm，�
 
 在 cuda11.4, pytorch1.12.1_cuda11.3 环境下安装时，需要注释掉apex的setup.py中的 `check_cuda_torch_binary_vs_bare_metal(CUDA_HOME)`
 
+**注意**，pytorch1.12.1下安装apex 22.04-dev，pytorch2.0.1下安装apex tags/23.05
+
 安装见：https://zhuanlan.zhihu.com/p/672284687
 ```bash
 # 获取apex, 注意这里一定要通过git clone 不要自己下载zip包，不然就会碰到错误4
@@ -333,7 +347,8 @@ git clone https://github.com/NVIDIA/apex.git
 
 cd apex
 git branch -a
-git checkout -b 22.04-dev  origin/22.04-dev #切换分支，当前的主分支有问题，你会碰到错误5
+# git checkout -b 22.04-dev  origin/22.04-dev #切换分支，当前的主分支有问题，你会碰到错误5
+git checkout tags/23.05  # 22.04-dev和pytorch2.0.1又有冲突了。。。，这个23.05可以用
 
 pip uninstall apex  #卸载之前的apex
 
@@ -382,6 +397,11 @@ if op.dtype_autocast_gpu == torch.bfloat16 and torch.__version__ < "2.0.0":
 3. 我提供了修改完的代码，将`new_autocast_mode.py`的内容复制到你的pytorch的`autocast.mode.py`中即可。（推荐）
 
 注意，通过ctrl+左键点击`@torch.cuda.amp.custom_fwd`的custom_fwd即可跳转到你的pytorch的`autocast.mode.py`中。
+
+**总结**，注释xformers中的代码，修复pytorch<2.0.0时的bug。
+
+#### 7 fused AdamW
+需要pytorch>=2.0.0，使用代码见：[`./utils/train.py`](./utils/train.py)
 
 ## 04 训练
 

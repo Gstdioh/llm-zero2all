@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 from einops import rearrange, repeat
-
+from transformers import LlamaForCausalLM
 try:
     from flash_attn import flash_attn_func
 except ImportError:
@@ -79,9 +79,9 @@ except ImportError:
     dropout_add_rms_norm = None
     print("WARNING: can't use fused dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm which can be found from flash_attn")
     try:
-        from apex.normalization import MixedFusedRMSNorm as RMSNorm
+        from apex.normalization import MixedFusedRMSNorm
     except ImportError:
-        RMSNorm = RMSNormTorch
+        MixedFusedRMSNorm = None
         print("WARNING: can't use MixedFusedRMSNorm of apex. MixedFusedRMSNorm requires apex")
         
 from .configuration_z2all import Z2allConfig
@@ -133,9 +133,10 @@ class Z2allMLP(nn.Module):
         if self.use_fused_swiglu:
             self.swiglu = SwiGLU(self.hidden_dim, self.intermediate_size, bias=False, _pack_weights=True)
         else:
-            self.gate_proj = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
-            self.up_proj = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
-            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_dim, bias=False)
+            # 变量名和fused SwiGLU一致
+            self.w1 = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
+            self.w2 = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
+            self.w3 = nn.Linear(self.intermediate_size, self.hidden_dim, bias=False)
             self.act_fn = nn.SiLU()
             
     def forward(self, x):
@@ -152,7 +153,7 @@ class Z2allMLP(nn.Module):
             output = self.swiglu(x)
         else:
             # navie实现
-            output = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            output = self.w3(self.act_fn(self.w1(x)) * self.w2(x))
 
         return output
 
@@ -390,6 +391,14 @@ class Z2allDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.residual_in_fp32 = config.residual_in_fp32
 
+        self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
+        self.use_fused_rmsnorm = (MixedFusedRMSNorm is not None) and config.use_fused_rmsnorm
+        # 只有在不使用fused_dropout_add_norm，并且能使用fused_rmsnorm时，才使用fused_rmsnorm
+        if not self.use_fused_dropout_add_norm and config.use_fused_rmsnorm:
+            RMSNorm = MixedFusedRMSNorm
+        else:
+            RMSNorm = RMSNormTorch
+
         # Dropout -> Add -> LN
         self.dropout1 = nn.Dropout(config.dropout1)
         # 第一层不用drop_path1，因为没有残差连接，去掉batch中的一些数，后续就再也没有了
@@ -412,10 +421,6 @@ class Z2allDecoderLayer(nn.Module):
 
         # MLP
         self.mlp = Z2allMLP(config)
-
-        self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
-        # if not self.use_fused_dropout_add_norm:
-        #     print("WARNING: using slow dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm")
             
     def forward(
         self,
@@ -541,15 +546,15 @@ class Z2allPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, RMSNorm):
-            module.weight.data.fill_(1.0)
+        # elif isinstance(module, RMSNorm):  # RMSNorm中已经初始化过了
+        #     module.weight.data.fill_(1.0)
                 
     def post_init(self):
         # 初始化权重，应用到模型的所有子模块
         self.apply(self._init_weights)
         # 应用特殊的缩放初始化到残差投影，参考GPT-2论文，（见llama2.c项目）
         for pn, p in self.named_parameters():
-            if pn.endswith('o_proj.weight') or pn.endswith('down_proj.weight'):
+            if pn.endswith('o_proj.weight') or pn.endswith('w3.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=self.config.initializer_range/math.sqrt(2 * self.config.n_layers))
 
     # TODO
@@ -575,6 +580,14 @@ class Z2allModel(Z2allPreTrainedModel):
         self.rms_norm_eps = config.rms_norm_eps
         self.residual_in_fp32 = config.residual_in_fp32
 
+        self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
+        self.use_fused_rmsnorm = (MixedFusedRMSNorm is not None) and config.use_fused_rmsnorm
+        # 只有在不使用fused_dropout_add_norm，并且能使用fused_rmsnorm时，才使用fused_rmsnorm
+        if not self.use_fused_dropout_add_norm and config.use_fused_rmsnorm:
+            RMSNorm = MixedFusedRMSNorm
+        else:
+            RMSNorm = RMSNormTorch
+
         self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_dim, self.padding_idx)
         self.layers = nn.ModuleList(
             [Z2allDecoderLayer(config, layer_idx) for layer_idx in range(self.n_layers)]
@@ -589,10 +602,6 @@ class Z2allModel(Z2allPreTrainedModel):
             self.drop_path1 = DropPath(config.drop_path1)
         self.norm1 = RMSNorm(config.hidden_dim, config.rms_norm_eps)
 
-        self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
-        # if not self.use_fused_dropout_add_norm:
-        #     print("WARNING: using slow dropout_add_rms_norm. Fused dropout_add_rms_norm requires dropout_layer_norm")
-        
         # 预处理RoPE中用到的cos和sin
         cos, sin = self.precompute_cos_sin(
             dim=self.hidden_dim // self.n_heads,
