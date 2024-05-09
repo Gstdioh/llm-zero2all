@@ -322,6 +322,8 @@ pip install packaging
 #### 1 flash-attn
 flash-attn的实现比torch_flash的实现更快
 
+flash attention可用于训练和推理，训练减少显存占用的原理是重计算，虽然重计算会增加FLOPs，但是不需要从HBM中取中间结果了，即减少了IO，所以依然减少了运行时间。
+
 ```bash
 # 2.1.0需要pytorch>=1.12, cuda>=11.4
 git clone https://github.com/Dao-AILab/flash-attention.git
@@ -429,9 +431,57 @@ if op.dtype_autocast_gpu == torch.bfloat16 and torch.__version__ < "2.0.0":
 
 ## 04 训练
 
+参数设置可以参考，https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html，词汇量最好设置为16字节的倍数，若使用bfloat16，则设置为8的倍数
+
+CUDA cuBLAS版本参考：https://docs.nvidia.com/cuda/archive/11.4.3/cuda-toolkit-release-notes/index.html
+
+---
+**注意**，参数大小的影响很大！
+
+vocab_size=64320, 性能：3.28s, 55.21%, 27.89GB
+
+vocab_size=64321, 性能：3.72s, 48.74%, 27.90GB
+
 ### 使用pytorch进行DP训练
 
-#### 训练超参数设置
+#### 多节点训练
+我的训练环境：局域网内，多个节点代表多个docker镜像，其中主节点宿主机的地址：10.10.24.107，主节点docker与宿主机的端口映射是9527:30846
+
+因为节点是docker镜像，所以主节点设置master时，需要设置docker镜像内的地址和端口（如localhost:9527）；而其他节点设置master时，需要设置主节点宿主机的地址和端口（如10.10.24.107:30846）
+
+此时，使用pytorch进行多节点训练时就会出现问题了，通常使用torchrun运行，如命令：
+
+```bash
+# 主节点
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
+# 其他节点
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
+```
+
+这个命令会卡住，即表示无法正常通信，因为局域网内主节点下的docker镜像可能不知道10.10.24.107:30846表示自己，所以只能用localhost:9527来表示自己，如命令：
+
+```bash
+# 主节点
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
+# 其他节点
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
+```
+
+这个命令虽然使得节点之间可以通信了，但是进行第一次连接后开始训练时又会出现问题，因为torchrun的原理是在主节点上管理group内的信息，当其他节点会将主节点的master信息更新为自己的信息，但是主节点的master地址是localhost:9527，所以导致后续其他节点无法访问到主节点了。。。
+
+这里我的解决方法比较粗暴，我直接修改代码torch/distributed/elastic/agent/server/api.py中的_get_master_addr_port来获取真正的master地址（只在其他节点下的torch环境下修改），如下，直接设置为主节点宿主机的地址，后面再次运行命令即可正常通信训练了：
+
+```python
+@staticmethod
+def _get_master_addr_port(store: Store) -> Tuple[str, int]:
+    # master_addr = store.get("MASTER_ADDR").decode(encoding="UTF-8")
+    # master_port = int(store.get("MASTER_PORT").decode(encoding="UTF-8"))
+    master_addr = "10.10.24.107"
+    master_port = "30846"
+    return (master_addr, master_port)
+```
+
+#### gpu4，训练超参数设置
 
 训练命令：`OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py`
 
@@ -464,6 +514,13 @@ breaks down as: 8 grad accum steps * 4 processes * 16 batch size * 2048 max seq 
 性能：13.77s, 52.69%, 70.97GB
 
 ---
+
+#### gpu4, gpu4_2
+tokens per iteration will be: 1,048,576
+
+breaks down as: 4 grad accum steps * 8 processes * 16 batch size * 2048 max seq len
+
+计算7s，通信19s
 
 #### 注意
 
