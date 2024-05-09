@@ -1,3 +1,7 @@
+"""
+在远程服务器上使用
+"""
+
 import os
 import pickle
 

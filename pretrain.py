@@ -72,7 +72,7 @@ if torch.__version__ >= "2.0.0":
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 5  # 每eval_interval个step验证一次
+eval_interval = 100  # 每eval_interval个step验证一次
 log_interval = 1
 eval_iters = 100  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
@@ -82,7 +82,7 @@ init_from = "scratch"  # 'scratch' or 'resume'
 use_reslog = True  # wandb用起来有问题，改为自己的日志和画图工具
 reslog_dir = "reslog"
 reslog_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-reslog_save_interval = 1
+reslog_save_interval = 1  # 想快速看结果，用小点的数
 # data
 train_bin_dir = "data/02_train_data_more/01_bin_for_train_hf"
 valid_bin_dir = "data/02_train_data_more/02_bin_for_valid_hf"
@@ -335,7 +335,7 @@ while True:
         val_t0 = time.time()
         losses = estimate_loss()
         val_dt = time.time() - val_t0
-        logger.info(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, {val_dt}s")
+        logger.info(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, {val_dt:.4f}s")
         if use_reslog and master_process:
             reslog.log({
                 "iter": iter_num,

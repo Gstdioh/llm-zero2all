@@ -12,6 +12,7 @@ __pycache__
 *.rar
 *.bz2
 *.bin
+*.pkl
 /data/zhihu
 /data/Zhihu-KOL
 /data/ZZ_others_wikipedia

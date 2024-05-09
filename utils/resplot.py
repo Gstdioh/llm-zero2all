@@ -1,3 +1,7 @@
+"""
+在本地上使用，可视化实验结果
+"""
+
 import sys
 import time
 import pickle
@@ -45,18 +49,36 @@ class ResPlot(QWidget):
             row = len(data.values())
             col = max([len(value) - 1 for value in data.values()])
             
-            print(f"row: {row}, col: {col}")
-            
             idx = 0
             for key, value in data.items():
                 for k, v in value.items():
                     if k == "step":
                         continue
-                    plt.subplot(row, col, idx + 1)
-                    plt.plot(value['step'], v, label=f"{key}.{k}")
-                    plt.legend()
+                    ax = plt.subplot(row, col, idx + 1)
+                    label = f"{key}.{k}"
+                    ax.plot(value['step'], v, label=label)
+                    ax.legend()
+
+                    # 获取横坐标和纵坐标的最后一个值
+                    last_y = v[-1]
+
+                    # 如果last_y是浮点数，那么保留4位小数，除了学习率
+                    if isinstance(last_y, float):
+                        if k == "mfu":
+                            last_y = round(last_y, 2)
+                        elif k == "lr":
+                            last_y = round(last_y, 8)
+                        else:
+                            last_y = round(last_y, 4)
+                    
+                    # 在子图下面添加一个文本框，显示横坐标和纵坐标的最后一个值
+                    ax.text(0.5, -0.2, f'{k}={last_y:,}', size=12, ha="center", transform=ax.transAxes)
+
                     idx += 1
                 idx += idx % col
+
+            # 增大子图之间的间距
+            plt.subplots_adjust(hspace=0.5, wspace=0.5)
 
             self.myCanvas.draw()
         except:
@@ -65,7 +87,7 @@ class ResPlot(QWidget):
  
 class MyThread(QThread):
     update_data = pyqtSignal()
- 
+
     def __init__(self, hostname, port, username, password, remote_file_path, parent=None):
         super(MyThread, self).__init__(parent)
         self.hostname = hostname
@@ -73,44 +95,44 @@ class MyThread(QThread):
         self.username = username
         self.password = password
         self.remote_file_path = remote_file_path
-        
+
         self.data = None
-        
-    def get_remote_data(self, remote_file_path, local_file_path="reslog.pkl"):
-        # 通过ssh来获取远程服务器的文件，并返回其中的数据
-        
+
         # 创建SSH客户端
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
+        self.ssh = paramiko.SSHClient()
+        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         # 连接到远程服务器
-        ssh.connect(hostname=self.hostname, port=self.port, username=self.username, password=self.password)
-
+        self.ssh.connect(hostname=self.hostname, port=self.port, username=self.username, password=self.password)
         # 从Docker容器中获取文件
-        sftp = ssh.open_sftp()
-        sftp.get(remote_file_path, local_file_path)
+        self.sftp = self.ssh.open_sftp()
 
-        # 关闭连接
-        sftp.close()
-        ssh.close()
+    def get_remote_data(self, remote_file_path, local_file_path="reslog.pkl"):
+        # 如果读取文件时发生异常，那么程序会等待1秒再尝试读取文件
+        while True:
+            try:
+                self.sftp.get(remote_file_path, local_file_path)
 
-        # 在本地读取文件
-        with open(local_file_path, 'rb') as f:
-            data = pickle.load(f)
-        
+                # 在本地读取文件
+                with open(local_file_path, 'rb') as f:
+                    data = pickle.load(f)
+
+                # 成功读取，则退出
+                break
+            except:
+                time.sleep(1)  # 等待1秒再尝试读取文件
+
         return data
 
     def run(self):
-        i = 0
-        while True:
-            # self.reslog.log({
-            #     "loss": 1 / (i + 1),
-            #     "epoch": i,
-            # })
-            self.data = self.get_remote_data(self.remote_file_path)
-            self.update_data.emit()  # 发送更新信号
-            time.sleep(1)  # 线程暂停1秒
-            i += 1
+        try:
+            while True:
+                self.data = self.get_remote_data(self.remote_file_path)
+                self.update_data.emit()  # 发送更新信号
+                time.sleep(3)  # 线程暂停3秒
+        finally:
+            # 保证关闭连接
+            self.sftp.close()
+            self.ssh.close()
  
  
 if __name__ == '__main__':
@@ -119,10 +141,15 @@ if __name__ == '__main__':
     parser.add_argument("--port", type=int, default=30792)
     parser.add_argument("--username", type=str, default="root")
     parser.add_argument("--password", type=str, default=r"32myp3M5fNwMXr^v5%7ubdLezPH2T0NE")
-    parser.add_argument("--remote_file_path", type=str, default="/202232803052/axk/gly/llm-zero2all/utils/reslog.pkl")
+    parser.add_argument("--remote_file_path", type=str, default="/202232803052/axk/gly/llm-zero2all/reslog/run2024_05_09_20_38_12.pkl")
     args = parser.parse_args()
     
+    args.remote_file_path = "/202232803052/axk/gly/llm-zero2all/reslog/run2024_05_09_20_52_33.pkl"
+    
+    log_basename = args.remote_file_path.split("/")[-1]
+    
     app = QApplication(sys.argv)
+    app.setApplicationDisplayName(log_basename)
     
     resplot = ResPlot(hostname=args.hostname, port=args.port, username=args.username, password=args.password,
                       remote_file_path=args.remote_file_path)

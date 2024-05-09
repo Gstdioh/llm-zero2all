@@ -1,9 +1,6 @@
-import torch
-
-import apex
-import apex.normalization
+import pickle
 
 
-rms = apex.normalization.MixedFusedRMSNorm
+data = pickle.load(open("reslog/run2024_05_09_19_13_25.pkl", "rb"))
 
-print(rms)
+print(1)
