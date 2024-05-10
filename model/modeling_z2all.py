@@ -205,10 +205,13 @@ class Z2allAttention(nn.Module):
                 f"hidden_dim 必须能被 n_heads 整除，但是 `hidden_dim`:{self.hidden_dim} 和 `n_heads`:{self.n_heads}"
             )
 
-        self.q_proj = nn.Linear(self.hidden_dim, self.n_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_dim, self.n_kv_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_dim, self.n_kv_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=config.attention_bias)
+        self.q_hidden_dim = self.n_heads * self.head_dim
+        self.kv_hidden_dim = self.n_kv_heads * self.head_dim
+        self.qkv_proj = nn.Linear(self.hidden_dim, self.q_hidden_dim + 2 * self.kv_hidden_dim, bias=config.attention_bias)
+        # self.q_proj = nn.Linear(self.hidden_dim, self.n_heads * self.head_dim, bias=config.attention_bias)
+        # self.k_proj = nn.Linear(self.hidden_dim, self.n_kv_heads * self.head_dim, bias=config.attention_bias)
+        # self.v_proj = nn.Linear(self.hidden_dim, self.n_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         
         # 使用flash attention或者手动实现（见llama.c项目）
         self.use_flash = (flash_attn_func is not None) and config.use_flash
@@ -301,9 +304,11 @@ class Z2allAttention(nn.Module):
         # hidden_states: (q_len, bsz, hidden_dim)
         q_len, bsz, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        qkv_states = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = qkv_states.split([self.q_hidden_dim, self.kv_hidden_dim, self.kv_hidden_dim], dim=-1)
+        # query_states = self.q_proj(hidden_states)
+        # key_states = self.k_proj(hidden_states)
+        # value_states = self.v_proj(hidden_states)
 
         # (q_len, bsz, hidden_dim) -> (q_len, bsz, n_heads, head_dim)
         query_states = query_states.view(q_len, bsz, self.n_heads, self.head_dim)
@@ -788,8 +793,9 @@ class Z2allModel(Z2allPreTrainedModel):
             )
             
         # hidden_states (seq_len, bsz, hidden_dim) -> (bsz, seq_len, hidden_dim)
-        hidden_states = hidden_states.transpose(0, 1)
+        # hidden_states = hidden_states.transpose(0, 1)
         
+        # hidden_states (seq_len, bsz, hidden_dim)
         return {
             "last_hidden_state": hidden_states,
             "past_key_values": past_key_values,
@@ -854,14 +860,18 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
         model_output = self.model(input_ids, use_cache, past_key_values)
         last_hidden_state, past_key_values = model_output["last_hidden_state"], model_output["past_key_values"]
         
-        # last_hidden_state (bsz, seq_len, hidden_dim) -> (bsz, hidden_dim)
+        # last_hidden_state (seq_len, bsz, hidden_dim) -> (1, bsz, hidden_dim)
         # 推理时，只需要最后一个位置的输出，loss为None
         if labels is None:
-            last_hidden_state = last_hidden_state[:, [-1], :]
+            last_hidden_state = last_hidden_state[[-1], :, :]
         
-        # labels is None，    logits (bsz, 1, vocab_size)
-        # labels is not None，logits (bsz, seq_len, vocab_size)
+        # labels is None，    logits (1, bsz, vocab_size)
+        # labels is not None，logits (seq_len, bsz, vocab_size)
         logits = self.lm_head(last_hidden_state)
+        
+        # logits (1, bsz, vocab_size) -> (bsz, 1, vocab_size)
+        # logits (seq_len, bsz, vocab_size) -> (bsz, seq_len, vocab_size)
+        logits = logits.transpose(0, 1).contiguous()
         
         loss = None
         if labels is not None:

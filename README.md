@@ -261,7 +261,7 @@ hidden_states (bsz, seq_len, hidden_dim) -> (seq_len, bsz, hidden_dim)
 这是Megatron-LLM的做法，在这里我还是有疑问，虽然说将s放在第一维对seq并行有好处，但是将s放在第一维是Megatron在第二篇论文提到的，seq并行却是第三篇论文提到的。。。所以还是不清楚为什么要将数值大的放在第一维度
 
 ### 融合算子
-包括flash-attn, rope, cross_entropy, rmsnorm, swiglu
+包括flash-attn, rope, cross_entropy, rmsnorm, swiglu, AdamW
 训练设置：1个A800-80G，每个迭代训练的token数：
 
 tokens per iteration will be: 262,144
@@ -270,9 +270,38 @@ breaks down as: 16 grad accum steps * 1 processes * 2 batch size * 2048 max seq 
 
 训练命令：`python pretrain.py --batch_size=2 --gradient_accumulation_steps=16`
 
+模型超参数：
+
+```python
+max_seq_len = 2048
+batch_size = 2
+gradient_accumulation_steps = 16
+
+vocab_size = 64320  # 实际是64012个，写大点方便扩展，注意最好是8的倍数，见指导：https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html#tc-guidelines-padding
+hidden_dim = 2048
+intermediate_size = 5632
+n_layers = 22
+n_heads = 32
+n_kv_heads = 8  # 用于GQA
+max_seq_len = max_seq_len
+initializer_range = 0.02  # 参数初始化时的标准差
+rms_norm_eps = 1e-5  # 防止除0的小数
+pad_token_id = 64006  # tokenizer.special_tokens["<|PAD|>"]  # pad token 64006
+tie_word_embeddings = False  # 是否共享word embedding和word prediction的参数
+rope_theta = 10000.0
+rope_scaling = None  # 缩放方法，用于长度外推
+attention_bias = False  # attention中的project是否加bias，Qwen中加了
+attention_dropout = 0.0  # TODO: 或许不用设置dropout
+dropout1 = 0.0
+dropout2 = 0.0
+residual_in_fp32 = True  # 残差连接是否使用fp32
+```
+
 模型和优化器状态占用内存：12250MB = 12.25GB
 
-pytorch1.12.1和cuda11.4下，每个iter，性能比较：
+---
+
+pytorch1.12.1和cuda11.4下，第5个iter（从0开始）的性能比较：
 
 | 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
 | :---------------: | :-------: | :----------------------------: | :---------: |
@@ -284,7 +313,15 @@ pytorch1.12.1和cuda11.4下，每个iter，性能比较：
 | w/o rmsnorm       | 3.78      | 47.94                          | 30.68       |
 | w/o swiglu        | 3.60      | 50.39                          | 29.79       |
 
-pytorch2.0.1和cuda11.4下，不使用compile，每个iter，性能比较：
+在上面use_all基础上再加入额外的优化（主要不想再跑一遍上面的消融了haha。。。）：
+
+| 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
+| :---------------: | :-------: | :----------------------------: | :---------: |
+| **w apex_AdamW**  | **3.17**  | **57.47**                      | **27.89**   |
+
+---
+
+pytorch2.0.1和cuda11.4下，不使用compile，第5个iter（从0开始）的性能比较：
 
 | 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
 | :---------------: | :-------: | :----------------------------: | :---------: |
@@ -298,7 +335,9 @@ pytorch2.0.1和cuda11.4下，不使用compile，每个iter，性能比较：
 | w/o swiglu        | 3.60      | 50.38                          | 29.86       |
 | w/o AdamW         | 3.52      | 51.55                          | 30.52       |
 
-pytorch2.0.1和cuda11.4下，**使用compile**（与fused_swiglu不兼容，compile的作用可类似于融合算子，所以加上某些自定义的融合算子反而会降低性能，带上compile后性能有浮动，比较的结果看看就行），每个iter，性能比较：
+---
+
+pytorch2.0.1和cuda11.4下，**使用compile**（与fused_swiglu不兼容，compile的作用可类似于融合算子，所以加上某些自定义的融合算子反而会降低性能，带上compile后性能有浮动，比较的结果看看就行），第5个iter（从0开始）的性能比较：
 
 | 融合算子           | 速度比较/s | MFU (Model FLOPs Utilization)/% | 内存占用/GB |
 | :---------------: | :-------: | :----------------------------: | :---------: |
@@ -313,6 +352,8 @@ pytorch2.0.1和cuda11.4下，**使用compile**（与fused_swiglu不兼容，comp
 | w/o AdamW         | 3.57      | 50.69                          | 34.05       |
 | just flash-attn   | 3.44      | 52.73                          | 32.76       |
 |**flash,cross_entropy,AdamW**| **3.37** | **53.71**                   | **31.54**   |
+
+---
 
 最后我选择pytorch1.12.1_cuda11.4的版本进行训练。
 
@@ -435,7 +476,18 @@ if op.dtype_autocast_gpu == torch.bfloat16 and torch.__version__ < "2.0.0":
 **总结**，注释xformers中的代码，修复pytorch<2.0.0时的bug。
 
 #### 7 fused AdamW
-需要pytorch>=2.0.0，使用代码见：[`./utils/train.py`](./utils/train.py)
+两种方法，pytorch>=2.0.0使用pytorch官方的fuesd AdamW，pytorch<2.0.0使用apex0.1的FusedAdam
+
+1. 需要pytorch>=2.0.0，使用代码见：[`./utils/train.py`](./utils/train.py)
+
+2. 安装apex，调用`from apex.optimizers import FusedAdam`，注意optim.zero_grad()时和上者有区别，如下：
+
+```python
+if utils.FusedAdam is not None:
+    optimizer.zero_grad()  # apex fused adamw上已经设置了set_to_none了
+else:
+    optimizer.zero_grad(set_to_none=True)  # pytorch的需要在这设置为None，清空显存
+```
 
 ## 04 训练
 

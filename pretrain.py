@@ -19,7 +19,10 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 
 my_run
 # single
+# 看速度，不用flash可能会超显存，所以使用小的batch_size
 $ python pretrain.py --batch_size=2 --gradient_accumulation_steps=16
+# 看显存占用
+$ python pretrain.py --batch_size=16 --gradient_accumulation_steps=2
 
 # gpu4
 $ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py
@@ -54,12 +57,17 @@ from transformers import AutoConfig
 from dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 from transformers import AutoTokenizer
+import utils
 from utils import get_logger, estimate_mfu, configure_optimizers, ResLog
 
 
 # 用于找到pad的id
 # tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
 
+# 见：https://huggingface.co/docs/transformers/perf_train_gpu_many
+# 使用nccl时，如果没有nvlink，则需要设置NCCL_P2P_DISABLE=1
+# 没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练
+# 因为我的环境没有nvlink，所以我使用的是gloo后端
 ddp_backend = "gloo"  # ddp backend, can be 'nccl', 'gloo'
 
 # 用于torch.compile，需要PyTorch>=2.0
@@ -72,9 +80,9 @@ if torch.__version__ >= "2.0.0":
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 100  # 每eval_interval个step验证一次
+eval_interval = 100  # 每eval_interval:100个step验证一次
 log_interval = 1
-eval_iters = 100  # 每次验证的step数
+eval_iters = 100  # 每次验证的step:100数
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 init_from = "scratch"  # 'scratch' or 'resume'
@@ -94,7 +102,7 @@ max_seq_len = 2048
 vocab_size = 64320  # 实际是64012个，写大点方便扩展，注意最好是8的倍数，见指导：https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html#tc-guidelines-padding
 hidden_dim = 2048
 intermediate_size = 5632
-n_layers = 22
+n_layers = 24
 n_heads = 32
 n_kv_heads = 8  # 用于GQA
 max_seq_len = max_seq_len
@@ -104,7 +112,7 @@ pad_token_id = 64006  # tokenizer.special_tokens["<|PAD|>"]  # pad token 64006
 tie_word_embeddings = False  # 是否共享word embedding和word prediction的参数
 rope_theta = 10000.0
 rope_scaling = None  # 缩放方法，用于长度外推
-attention_bias = False  # attention中的project是否加bias
+attention_bias = True  # attention中的project是否加bias，Qwen中加了
 attention_dropout = 0.0  # TODO: 或许不用设置dropout
 dropout1 = 0.0
 dropout2 = 0.0
@@ -173,6 +181,7 @@ if master_process:
 # 运行日志
 # 创建logger，__name__表示运行文件名
 # 如果存在log文件就删除
+logger = None
 if master_process:
     log_path = os.path.join(out_dir, 'info.log')
     if os.path.exists(log_path):
@@ -262,7 +271,7 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 # optimizer
-optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type, logger, master_process)
 if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
@@ -390,8 +399,11 @@ while True:
     scaler.step(optimizer)  # 若没有unscale，进行unscale并且更新
     scaler.update()  # 更新scaler的缩放因子
     # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)  # 设置为None，清空显存
-
+    if utils.FusedAdam is not None:
+        optimizer.zero_grad()  # apex fused adamw上已经设置了set_to_none了
+    else:
+        optimizer.zero_grad(set_to_none=True)  # pytorch的需要在这设置为None，清空显存
+        
     # 输出结果
     # timing and logging
     t1 = time.time()
@@ -401,7 +413,7 @@ while True:
         # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
         # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 3:  # let the training loop settle a bit
+        if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
             # 前几个step不准，因为模型还没有稳定下来

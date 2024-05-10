@@ -1,9 +1,13 @@
 import torch
 import inspect
+try:
+    from apex.optimizers import FusedAdam
+except ImportError:
+    FusedAdam = None
 
 
 # 配置优化器 (见llama2.c项目)
-def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
+def configure_optimizers(model, weight_decay, learning_rate, betas, device_type, logger, master_process):
     # 所有的权重张量和嵌入张量都会被weight decay，所有的偏置和layernorm都不会被weight decay
     # start with all of the candidate parameters
     param_dict = {pn: p for pn, p in model.named_parameters()}
@@ -21,17 +25,21 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type)
     # 统计参数数量
     num_decay_params = sum(p.numel() for p in decay_params)
     num_nodecay_params = sum(p.numel() for p in nodecay_params)
-    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")  # 逗号用于分隔千位
-    print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+    _ = logger.info(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters") if master_process else None
+    _ = logger.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters") if master_process else None
     
-    # 是否使用fused版本的AdamW优化器
-    # Create AdamW optimizer and use the fused version if it is available
-    # 检查torch.optim.AdamW函数是否接受一个名为fused的参数，接受说明版本支持fused，速度更快
-    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    use_fused = fused_available and device_type == 'cuda'
-    extra_args = dict(fused=True) if use_fused else dict()
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-    print(f"using fused AdamW: {use_fused}")
+    if FusedAdam is None:
+        # 是否使用fused版本的AdamW优化器
+        # Create AdamW optimizer and use the fused version if it is available
+        # 检查torch.optim.AdamW函数是否接受一个名为fused的参数，接受说明版本支持fused，速度更快
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        _ = logger.info(f"using pytorch fused AdamW: {use_fused}") if master_process else None
+    else:
+        optimizer = FusedAdam(optim_groups, lr=learning_rate, betas=betas, set_grad_none=True)
+        _ = logger.info(f"using apex fused AdamW") if master_process else None
 
     return optimizer
 
