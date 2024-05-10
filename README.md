@@ -252,6 +252,14 @@ Qwen使用tiktoken，其自己管理特殊token，https://huggingface.co/Qwen/Qw
 
 ## 03 构建基础语言模型 Z2all (使用 llama2 结构)
 
+### 将数值大的放在第一维度，这样可以提高GPU的并行度?
+
+hidden_states (bsz, seq_len, hidden_dim) -> (seq_len, bsz, hidden_dim)
+
+见：https://arxiv.org/pdf/2104.04473.pdf，也有人问了这个问题：https://github.com/NVIDIA/Megatron-LM/issues/493，但是没得到确切的回答
+
+这是Megatron-LLM的做法，在这里我还是有疑问，虽然说将s放在第一维对seq并行有好处，但是将s放在第一维是Megatron在第二篇论文提到的，seq并行却是第三篇论文提到的。。。所以还是不清楚为什么要将数值大的放在第一维度
+
 ### 融合算子
 包括flash-attn, rope, cross_entropy, rmsnorm, swiglu
 训练设置：1个A800-80G，每个迭代训练的token数：
@@ -431,7 +439,7 @@ if op.dtype_autocast_gpu == torch.bfloat16 and torch.__version__ < "2.0.0":
 
 ## 04 训练
 
-参数设置可以参考，https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html，词汇量最好设置为16字节的倍数，若使用bfloat16，则设置为8的倍数
+参数设置可以参考，https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html，词汇量最好设置为16字节的倍数，若使用bfloat16，则设置为8的倍数，若为A100，则使用64的倍数，见https://huggingface.co/docs/transformers/perf_train_gpu_one
 
 CUDA cuBLAS版本参考：https://docs.nvidia.com/cuda/archive/11.4.3/cuda-toolkit-release-notes/index.html
 
@@ -441,6 +449,13 @@ CUDA cuBLAS版本参考：https://docs.nvidia.com/cuda/archive/11.4.3/cuda-toolk
 vocab_size=64320, 性能：3.28s, 55.21%, 27.89GB
 
 vocab_size=64321, 性能：3.72s, 48.74%, 27.90GB
+
+### 实验结果保存与可视化
+wandb用起来有点问题，5个iter后就报错：BrokenPipeError: [Errno 32] Broken pipe     sent = self._sock.send(data) BrokenPipeError: [Errno 32] Broken pipe
+
+于是我自己使用pyqt5, matplotlib, ssh实现了一个实验结果保存与可视化的两个代码文件，见：`utils/reslog.py`和`utils/resplot.py`
+
+主要功能是：远程服务器通过reslog来保存实验结果，本地使用resplot通过ssh连接获取远程服务器的实验结果，然后使用pyqt5和matplotlib对结果进行可视化，可视化是实时更新的。
 
 ### 使用pytorch进行DP训练
 

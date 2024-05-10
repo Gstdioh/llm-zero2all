@@ -738,7 +738,9 @@ class Z2allModel(Z2allPreTrainedModel):
         hidden_states = self.embed_tokens(input_ids)
         
         # hidden_states (bsz, seq_len, hidden_dim) -> (seq_len, bsz, hidden_dim)
-        # 将数值大的放在第一维度，这样可以提高GPU的并行度
+        # 将数值大的放在第一维度，这样可以提高GPU的并行度?
+        # 这是Megatron-LLM的做法，在这里我还是有疑问
+        # 虽然说将s放在第一维对seq并行有好处，但是将s放在第一维是Megatron在第二篇论文提到的，seq并行却是第三篇论文提到的。。。
         hidden_states = hidden_states.transpose(0, 1)
         
         residual = None

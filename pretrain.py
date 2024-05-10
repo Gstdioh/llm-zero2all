@@ -194,6 +194,7 @@ if master_process:
 # -----------------------------------------------------------------------------
 # 设置随机种子
 torch.manual_seed(1337 + seed_offset)
+
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 
