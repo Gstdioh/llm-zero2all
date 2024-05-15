@@ -411,6 +411,8 @@ pip install .
 #### 5 MixedFusedRMSNorm (apex)
 apex中有MixedFusedRMSNorm，如果安装不了上面的dropout_layer_norm，可以用这个来加速
 
+在apex的最新版本中，多了一个memory_efficient参数，这个开关可以在速度和精度无损的情况下节省网络训练的显存占用，见：https://zhuanlan.zhihu.com/p/677986216，但是安装最新版本有问题，我就没有使用。
+
 在 cuda11.4, pytorch1.12.1_cuda11.3 环境下安装时，需要注释掉apex的setup.py中的 `check_cuda_torch_binary_vs_bare_metal(CUDA_HOME)`
 
 **注意**，pytorch1.12.1下安装apex 22.04-dev，pytorch2.0.1下安装apex tags/23.05
