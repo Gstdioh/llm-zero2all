@@ -13,7 +13,7 @@ def get_logger(log_dir, name, log_filename='info.log', level=logging.INFO):
     logger.setLevel(level)  # 设置级别
 
     # Add file handler and stdout handler，输出到文件中
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')  # 特殊占位符，设置输出格式
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')  # 特殊占位符，设置输出格式
     formatter.converter = time.localtime  # 使用本地时间
     file_handler = logging.FileHandler(os.path.join(log_dir, log_filename))
     file_handler.setFormatter(formatter)

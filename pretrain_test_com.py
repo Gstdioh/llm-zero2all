@@ -54,7 +54,7 @@ import torch
 from torch.distributed import destroy_process_group, init_process_group
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook
+from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook, bf16_compress_wrapper
 from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
 
 from transformers import AutoConfig
@@ -401,11 +401,12 @@ while True:
     # model.register_comm_hook(process_group, bf16_compress_hook)
     
     state = PowerSGDState(process_group=process_group, matrix_approximation_rank=128,
-                          start_powerSGD_iter=2, min_compression_rate=0.5)
-    model.register_comm_hook(state, powerSGD_hook)  # 会取平均
+                          warm_start=False, use_error_feedback=True, start_powerSGD_iter=2, min_compression_rate=0.5)
+    # model.register_comm_hook(state, powerSGD_hook)  # 会取平均
+    model.register_comm_hook(state, bf16_compress_wrapper(powerSGD_hook))  # 会取平均
     
     # python pretrain.py --batch_size=16 --gradient_accumulation_steps=16
-    # OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain.py
+    # OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain_test_com.py --batch_size=8
     if master_process:
         print("grad为float32测试")
     # grad是float32

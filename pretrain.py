@@ -25,6 +25,8 @@ $ python pretrain.py --batch_size=2 --gradient_accumulation_steps=16
 # 看显存占用
 $ python pretrain.py --batch_size=16 --gradient_accumulation_steps=2
 
+OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain.py
+
 # gpu4
 $ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py
 # test
@@ -53,9 +55,9 @@ from functools import partial
 import torch
 from torch.distributed import destroy_process_group, init_process_group
 import torch.distributed as dist
+import torch.distributed
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook
-import torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook
+from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook, bf16_compress_wrapper
 from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
 
 from transformers import AutoConfig
@@ -74,6 +76,7 @@ from utils import get_logger, estimate_mfu, configure_optimizers, ResLog
 # 使用nccl时，如果没有nvlink，则需要设置NCCL_P2P_DISABLE=1
 # 没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练
 # 因为我的环境没有nvlink，所以我使用的是gloo后端
+# 但是gloo又与hook有问题，还是用nccl吧
 ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 
 # 用于torch.compile，需要PyTorch>=2.0
@@ -82,7 +85,9 @@ if torch.__version__ >= "2.0.0":
     torch._dynamo.config.cache_size_limit = 128  # 原来是64，有警告，设大点加快编译
 
 # -----------------------------------------------------------------------------
-# 实验设置
+# 梯度通信优化
+use_bf16_compress_hook = False
+use_powerSGD_hook = False
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
@@ -102,7 +107,7 @@ train_bin_dir = "data/02_train_data_more/01_bin_for_train_hf"
 valid_bin_dir = "data/02_train_data_more/02_bin_for_valid_hf"
 num_workers = 0  # 数据加载器的工作进程数
 ## global_batch_size=batch_size*gradient_accumulation_steps*ddp_world_size
-batch_size = 16  # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 2048
 # model
 vocab_size = 64320  # 实际是64012个，写大点方便扩展，注意最好是8的倍数，见指导：https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html#tc-guidelines-padding
@@ -119,9 +124,9 @@ tie_word_embeddings = False  # 是否共享word embedding和word prediction的�
 rope_theta = 10000.0
 rope_scaling = None  # 缩放方法，用于长度外推
 attention_bias = True  # attention中的project是否加bias，Qwen中加了
-attention_dropout = 0.0  # TODO: 或许不用设置dropout
-dropout1 = 0.0
-dropout2 = 0.0
+attention_dropout = 0.1  # TODO: 或许不用设置dropout
+dropout1 = 0.1
+dropout2 = 0.1
 residual_in_fp32 = True  # 残差连接是否使用fp32
 # adamw optimizer
 ## gradient_accumulation_steps=gradient_accumulation_steps*ddp_world_size
@@ -273,7 +278,7 @@ elif init_from == "resume":  # TODO
 model.to(device)
 
 # -----------------------------------------------------------------------------
-# 训练所需，梯度缩放器，优化器，学习率调度器
+# 训练所需，梯度缩放器，优化器，学习率调度器，测试函数
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 # optimizer
@@ -294,23 +299,6 @@ def get_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1 从1到0
     return min_lr + coeff * (learning_rate - min_lr)
-
-# -----------------------------------------------------------------------------
-# wrap模型
-# 编译模型，需要PyTorch>=2.0
-if compile and torch.__version__ >= "2.0":
-    if master_process:
-        logger.info("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model)  # requires PyTorch 2.0
-# 使用DDP包裹模型
-# wrap model into DDP container
-if ddp:
-    # model.bfloat16()
-    _ = logger.info(f"wrapping model into DDP container") if master_process else None
-    model = DDP(model, device_ids=[ddp_local_rank], gradient_as_bucket_view=True, static_graph=True)
-    # model = DDP(model, device_ids=[ddp_local_rank], gradient_as_bucket_view=True)
-
 # -----------------------------------------------------------------------------
 # 测试函数
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -332,126 +320,172 @@ def estimate_loss():
     return out
 
 # -----------------------------------------------------------------------------
-# 设置ddp com hook
-state = PowerSGDState(process_group=process_group, matrix_approximation_rank=128,
-                      start_powerSGD_iter=2, min_compression_rate=0.5)
-model.register_comm_hook(state, powerSGD_hook)  # 会取平均
+# wrap模型
+# 编译模型，需要PyTorch>=2.0
+if compile and torch.__version__ >= "2.0":
+    if master_process:
+        logger.info("compiling the model... (takes a ~minute)")
+    unoptimized_model = model
+    model = torch.compile(model)  # requires PyTorch 2.0
+# 使用DDP包裹模型
+# wrap model into DDP container
+if ddp:
+    # model.bfloat16()
+    _ = logger.info(f"wrapping model into DDP container") if master_process else None
+    model = DDP(model, device_ids=[ddp_local_rank],
+                gradient_as_bucket_view=True, static_graph=False)  # 有梯度累加时，static_graph=True有问题?
 
 # -----------------------------------------------------------------------------
-# 开始训练
+# 设置ddp com hook，还是会取world_size的平均值
+if use_powerSGD_hook:
+    state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
+                        warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
+                        min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
+    if use_bf16_compress_hook:
+        model.register_comm_hook(state, bf16_compress_wrapper(powerSGD_hook))
+    else:
+        model.register_comm_hook(state, powerSGD_hook)
+elif use_bf16_compress_hook:
+    model.register_comm_hook(process_group, bf16_compress_hook)
+
+# -----------------------------------------------------------------------------
+# 准备训练集
 train_batch_iter = iter_batches(split="train")
 X, Y = next(train_batch_iter)  # fetch the very first batch
+
+# 预热下
+# 在用torch的ZeroRedundancyOptimizer时，可能更需要预热，可能前几个iter不会更新参数
+# 若预热的话，要考虑下PowerSGDState的start_powerSGD_iter应该变化
+# warm_run_time = time.time()
+# for _ in range(3):
+#     with ctx:
+#         model_outputs = model(X, Y)
+#         loss = model_outputs["loss"]
+#         loss = loss / gradient_accumulation_steps
+#         scaler.scale(loss).backward()
+#     if utils.FusedAdam is not None:
+#         optimizer.zero_grad()
+#     else:
+#         optimizer.zero_grad(set_to_none=True)
+# torch.distributed.barrier()
+# _ = logger.info(f"warm_run_time: {time.time() - warm_run_time:.4f}s") if master_process else None
+
+# 开始训练
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
 _ = logger.info(f"start training loop") if master_process else None
-try:
-    while True:
-        # 根据iter，调整学习率
-        # determine and set the learning rate for this iteration
-        lr = get_lr(iter_num + 1) if decay_lr else learning_rate  # 从1开始，要不然第一个step的lr是0
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+while True:
+    # 根据iter，调整学习率
+    # determine and set the learning rate for this iteration
+    lr = get_lr(iter_num + 1) if decay_lr else learning_rate  # 从1开始，要不然第一个step的lr是0
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
 
-        # 测试
-        # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and master_process:
-            val_t0 = time.time()
-            losses = estimate_loss()
-            val_dt = time.time() - val_t0
-            logger.info(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, {val_dt:.4f}s")
-            if use_reslog and master_process:
+    # 测试
+    # evaluate the loss on train/val sets and write checkpoints
+    if iter_num % eval_interval == 110 and master_process:
+        val_t0 = time.time()
+        losses = estimate_loss()
+        val_dt = time.time() - val_t0
+        logger.info(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, {val_dt:.4f}s")
+        if use_reslog and master_process:
+            reslog.log({
+                "iter": iter_num,
+                "tokens": iter_num * tokens_per_iter,
+                "loss/train": losses["train"],
+                "loss/val": losses["val"],
+                "lr": lr,
+                "mfu": running_mfu * 100,  # convert to percentage
+            }, name="valid", step = iter_num)
+        if losses["val"] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses["val"]
+            if iter_num > 0:
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "iter_num": iter_num,
+                    "best_val_loss": best_val_loss,
+                    "config": config,
+                }
+                logger.info(f"saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+                model_config.save_pretrained(out_dir)  # 单独保存模型配置
+                reslog.save(os.path.join(out_dir, "reslog.pkl"))
+                # model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)  # TODO
+    if iter_num == 0 and eval_only:
+        break
+    
+    # 前向传播和反向传播，梯度更新
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
+    for micro_step in range(gradient_accumulation_steps):
+        if ddp:
+            # in DDP training we only need to sync gradients at the last micro step.
+            # the official way to do this is with model.no_sync() context manager, but
+            # I really dislike that this bloats the code and forces us to repeat code
+            # looking at the source of that context manager, it just toggles this variable
+            model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1  # 只在最后的forawrd-backward进行同步操作
+        with ctx:
+            model_outputs = model(X, Y)
+            loss = model_outputs["loss"]
+            loss = loss / gradient_accumulation_steps
+        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        X, Y = next(train_batch_iter)
+        # 最后一次backward和通信所耗费时间
+        backward_comm_time = time.time()
+        # backward pass, with gradient scaling if training in fp16
+        scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+    torch.distributed.barrier()
+    backward_comm_time = time.time() - backward_comm_time
+    
+    # clip the gradient
+    if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # step the optimizer and scaler if training in fp16
+    scaler.step(optimizer)  # 若没有unscale，进行unscale并且更新
+    scaler.update()  # 更新scaler的缩放因子
+    # flush the gradients as soon as we can, no need for this memory anymore
+    if utils.FusedAdam is not None:
+        optimizer.zero_grad()  # apex fused adamw上已经设置了set_to_none了
+    else:
+        optimizer.zero_grad(set_to_none=True)  # pytorch的需要在这设置为None，清空显存
+        
+    # 输出结果
+    # timing and logging
+    t1 = time.time()
+    dt = t1 - t0
+    t0 = t1
+    if iter_num % log_interval == 0 and master_process:
+        # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
+        # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。
+        lossf = loss.item() * gradient_accumulation_steps
+        if local_iter_num >= 5:  # let the training loop settle a bit
+            mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+            # 前几个step不准，因为模型还没有稳定下来
+            # 防止不准的数值对坐标轴的影响
+            # 同时不保存测试时训练的实验结果，因为时间计算的是测试+训练的时间
+            if use_reslog and master_process and iter_num % eval_interval != 0:
                 reslog.log({
                     "iter": iter_num,
                     "tokens": iter_num * tokens_per_iter,
-                    "loss/train": losses["train"],
-                    "loss/val": losses["val"],
+                    "loss": lossf,
+                    "dt": dt,
                     "lr": lr,
-                    "mfu": running_mfu * 100,  # convert to percentage
-                }, name="valid", step = iter_num)
-            if losses["val"] < best_val_loss or always_save_checkpoint:
-                best_val_loss = losses["val"]
-                if iter_num > 0:
-                    checkpoint = {
-                        "model": raw_model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "iter_num": iter_num,
-                        "best_val_loss": best_val_loss,
-                        "config": config,
-                    }
-                    logger.info(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-                    model_config.save_pretrained(out_dir)  # 单独保存模型配置
-                    reslog.save(os.path.join(out_dir, "reslog.pkl"))
-                    # model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)  # TODO
-        if iter_num == 0 and eval_only:
-            break
-        
-        # 前向传播和反向传播，梯度更新
-        # forward backward update, with optional gradient accumulation to simulate larger batch size
-        # and using the GradScaler if data type is float16
-        for micro_step in range(gradient_accumulation_steps):
-            if ddp:
-                # in DDP training we only need to sync gradients at the last micro step.
-                # the official way to do this is with model.no_sync() context manager, but
-                # I really dislike that this bloats the code and forces us to repeat code
-                # looking at the source of that context manager, it just toggles this variable
-                model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1  # 只在最后的forawrd-backward进行同步操作
-            with ctx:
-                model_outputs = model(X, Y)
-                loss = model_outputs["loss"]
-                loss = loss / gradient_accumulation_steps
-                # immediately async prefetch next batch while model is doing the forward pass on the GPU
-                X, Y = next(train_batch_iter)
-                # backward pass, with gradient scaling if training in fp16
-                scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
-        # clip the gradient
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        # step the optimizer and scaler if training in fp16
-        scaler.step(optimizer)  # 若没有unscale，进行unscale并且更新
-        scaler.update()  # 更新scaler的缩放因子
-        # flush the gradients as soon as we can, no need for this memory anymore
-        if utils.FusedAdam is not None:
-            optimizer.zero_grad()  # apex fused adamw上已经设置了set_to_none了
-        else:
-            optimizer.zero_grad(set_to_none=True)  # pytorch的需要在这设置为None，清空显存
-            
-        # 输出结果
-        # timing and logging
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
-        if iter_num % log_interval == 0 and master_process:
-            # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
-            # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。
-            lossf = loss.item() * gradient_accumulation_steps
-            if local_iter_num >= 5:  # let the training loop settle a bit
-                mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-                # 前几个step不准，因为模型还没有稳定下来
-                # 防止不准的数值对坐标轴的影响
-                # 同时不保存测试时训练的实验结果，因为时间计算的是测试+训练的时间
-                if use_reslog and master_process and iter_num % eval_interval != 0:
-                    reslog.log({
-                        "iter": iter_num,
-                        "tokens": iter_num * tokens_per_iter,
-                        "loss": lossf,
-                        "dt": dt,
-                        "lr": lr,
-                        "mfu": running_mfu * 100,
-                    }, name="train", step=iter_num)
-            logger.info(
-                f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}%"
-            )
-        iter_num += 1
-        local_iter_num += 1
+                    "mfu": running_mfu * 100,
+                }, name="train", step=iter_num)
+        logger.info(
+            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}% | backward_comm: {backward_comm_time:.4f}s"
+        )
+    iter_num += 1
+    local_iter_num += 1
 
-        # 中止条件
-        if iter_num > max_iters:
-            break
-finally:
-    if ddp:
-        destroy_process_group()  # gloo退出有问题，这行代码不会退出
+    # 中止条件
+    if iter_num > max_iters:
+        break
+
+if ddp:
+    destroy_process_group()  # gloo退出有问题，这行代码不会退出

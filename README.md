@@ -504,6 +504,9 @@ vocab_size=64320, 性能：3.28s, 55.21%, 27.89GB
 
 vocab_size=64321, 性能：3.72s, 48.74%, 27.90GB
 
+### 常用命令
+1. `watch -n 0.5 nvidia-smi`，用来实时查看GPU使用情况，watch -n 0.5表示每0.5秒运行下后面的命令（刷新并运行）
+
 ### 实验结果保存与可视化
 wandb用起来有点问题，5个iter后就报错：BrokenPipeError: [Errno 32] Broken pipe     sent = self._sock.send(data) BrokenPipeError: [Errno 32] Broken pipe
 
@@ -604,3 +607,38 @@ breaks down as: 4 grad accum steps * 8 processes * 16 batch size * 2048 max seq 
 见：https://github.com/pytorch/pytorch/issues/23074，但是会影响通信效率。或者可以改为gloo通信后端。
 
     GPU通信方式：https://zhuanlan.zhihu.com/p/74217534
+
+### 梯度通信优化
+
+使用DDP的`torch.distributed.algorithms.ddp_comm_hooks`
+
+1. `bf16_compress_hook`，压缩到bf16，allreduce通信，解压缩回来
+
+    ```python
+    from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook
+
+    process_group = init_process_group(backend=ddp_backend)
+
+    ddp_model.register_comm_hook(process_group, bf16_compress_hook)
+    ```
+
+2. `PowerSGDState, powerSGD_hook`，使用PowerSGD算法压缩梯度，压缩率更高，但可能误差大点；参数细节见源码。
+
+    ```python
+    from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
+
+    process_group = init_process_group(backend=ddp_backend)
+
+    state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
+                          warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
+                          min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
+    model.register_comm_hook(state, powerSGD_hook)  # 会取平均
+    # 或者两个通信优化叠加起来
+    # model.register_comm_hook(state, bf16_compress_wrapper(powerSGD_hook))  # 会取平均
+    ```
+
+参考：
+
+* https://medium.com/pytorch/accelerating-pytorch-ddp-by-10x-with-powersgd-585aef12881d
+* https://github.com/epfml/powersgd
+* https://pytorch.org/docs/stable/ddp_comm_hooks.html

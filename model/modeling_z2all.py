@@ -304,8 +304,7 @@ class Z2allAttention(nn.Module):
         # hidden_states: (q_len, bsz, hidden_dim)
         q_len, bsz, _ = hidden_states.size()
 
-        qkv_states = self.qkv_proj(hidden_states)
-        query_states, key_states, value_states = qkv_states.split([self.q_hidden_dim, self.kv_hidden_dim, self.kv_hidden_dim], dim=-1)
+        query_states, key_states, value_states = self.qkv_proj(hidden_states).split([self.q_hidden_dim, self.kv_hidden_dim, self.kv_hidden_dim], dim=-1)
         # query_states = self.q_proj(hidden_states)
         # key_states = self.k_proj(hidden_states)
         # value_states = self.v_proj(hidden_states)
