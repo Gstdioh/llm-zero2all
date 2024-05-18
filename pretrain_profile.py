@@ -115,7 +115,7 @@ max_seq_len = 2048
 vocab_size = 64320  # 实际是64012个，写大点方便扩展，注意最好是8的倍数，见指导：https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html#tc-guidelines-padding
 hidden_dim = 2048
 intermediate_size = 5632
-n_layers = 24
+n_layers = 24 // 4  # 设小一点，方便profiler渲染快点
 n_heads = 16
 n_kv_heads = 8  # 用于GQA
 max_seq_len = max_seq_len
@@ -412,8 +412,8 @@ if ddp:
         # 若没有resume，则初始化PowerSGDState
         if powerSGD_state is None:
             powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=5, 
-                                min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
+                                           warm_start=True, use_error_feedback=True, start_powerSGD_iter=3, 
+                                           min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
         if use_bf16_compress_hook:
             model.register_comm_hook(powerSGD_state, bf16_compress_wrapper(powerSGD_hook))
         else:
@@ -427,17 +427,17 @@ with torch.profiler.profile(
         torch.profiler.ProfilerActivity.CPU,
         torch.profiler.ProfilerActivity.CUDA],
     schedule=torch.profiler.schedule(
-        wait=1,
+        wait=0,
         warmup=1,
-        active=6,
+        active=4,
         repeat=1),
-    on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/grad_acc', worker_name=f'rank{ddp_rank}'),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/small_layers_6_2_MHA', worker_name=f'rank{ddp_rank}'),
     record_shapes=True,
     profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
     with_stack=True
 ) as p:
     
-    for i in range(9):
+    for i in range(6):
         for micro_step in range(gradient_accumulation_steps):
             if ddp:
                 model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
@@ -457,5 +457,7 @@ with torch.profiler.profile(
         else:
             optimizer.zero_grad(set_to_none=True)  # pytorch的需要在这设置为None，清空显存
         
-        print(f"step: {i}")
+        if master_process:
+            print(f"step: {i}")
+        torch.distributed.barrier()
         p.step()
