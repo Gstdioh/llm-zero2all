@@ -14,8 +14,14 @@ import torch.distributed as dist
 
 from utils import get_file_paths
 
-DATA_CACHE_DIR = "data"
 
+# 主进程才会输出信息
+ddp = int(os.environ.get("RANK", -1)) != -1
+master_process = True
+ddp_rank = 0
+if ddp:
+    ddp_rank = int(os.environ["RANK"])
+    master_process = ddp_rank == 0
 
 class PretokDataset(torch.utils.data.IterableDataset):
     """
@@ -40,7 +46,7 @@ class PretokDataset(torch.utils.data.IterableDataset):
         # combine the worker_id and worker_rank to create a unique seed for rng
         seed = 42 + worker_id + 1337 * rank
         rng = random.Random(seed)
-        print(f"Created a PretokDataset with rng seed {seed}")
+        print(f"rank {ddp_rank} created a PretokDataset with rng seed {seed}")
         
         # 训练集和验证集
         data_dir = self.train_bin_dir if self.split == "train" else self.valid_bin_dir

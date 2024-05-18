@@ -2,12 +2,14 @@ import os
 import sys
 import logging
 import time
+from datetime import datetime
 
 
 def get_logger(log_dir, name, log_filename='info.log', level=logging.INFO):
     """
     log_dir: 日志文件目录
     """
+    log_filename = f'info_{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}.log'
     
     logger = logging.getLogger(name)  # 创建logger实例
     logger.setLevel(level)  # 设置级别

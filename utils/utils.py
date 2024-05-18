@@ -147,3 +147,21 @@ def clean_text(s, type="zh"):
     s = s.strip()  # 4. 去除首尾空格
     
     return s
+
+
+def save_run_exp_config(exp_config, save_path):
+    '''
+    保存当前运行实验的配置信息，写入python文件中
+    找到下面间隔的代码
+    # -----------------------------------------------------------------------------
+    '''
+    exp_config_text = "# 最终的配置文件信息\n"
+    
+    for key, value in exp_config.items():
+        if isinstance(value, str):
+            exp_config_text += f"{key} = \"{value}\"\n"
+        else:
+            exp_config_text += f"{key} = {value}\n"
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write(exp_config_text)

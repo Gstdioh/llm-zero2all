@@ -47,6 +47,8 @@ $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_no
 
 import math
 import os
+import inspect
+import shutil
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -59,44 +61,43 @@ import torch.distributed
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook, bf16_compress_wrapper
 from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
-
 from transformers import AutoConfig
 
 from dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 from transformers import AutoTokenizer
 import utils
-from utils import get_logger, estimate_mfu, configure_optimizers, ResLog
+from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config
 
-
-# 用于找到pad的id
-# tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
-
-# 见：https://huggingface.co/docs/transformers/perf_train_gpu_many
-# 使用nccl时，如果没有nvlink，则需要设置NCCL_P2P_DISABLE=1
-# 没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练
-# 因为我的环境没有nvlink，所以我使用的是gloo后端
-# 但是gloo又与hook有问题，还是用nccl吧
-ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 
 # 用于torch.compile，需要PyTorch>=2.0
 if torch.__version__ >= "2.0.0":
     import torch._dynamo
     torch._dynamo.config.cache_size_limit = 128  # 原来是64，有警告，设大点加快编译
 
+# 用于找到pad的id
+# tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
+
 # -----------------------------------------------------------------------------
+# 通信后端
+# 见：https://huggingface.co/docs/transformers/perf_train_gpu_many
+# 使用nccl时，如果没有nvlink，则需要设置NCCL_P2P_DISABLE=1
+# 没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练
+# 因为我的环境没有nvlink，所以我使用的是gloo后端
+# 但是gloo又与hook有问题，还是用nccl吧
+ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 # 梯度通信优化
-use_bf16_compress_hook = False
-use_powerSGD_hook = False
+use_bf16_compress_hook = True
+use_powerSGD_hook = True
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 100  # 每eval_interval:100个step验证一次
+eval_interval = 5  # 每eval_interval个step验证一次
 log_interval = 1
-eval_iters = 100  # 每次验证的step:100数
+eval_iters = 2  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
-init_from = "scratch"  # 'scratch' or 'resume'
+resume = False  # if True, resume training from the last checkpoint
 # wandb logging
 use_reslog = True  # wandb用起来有问题，改为自己的日志和画图工具
 reslog_dir = "reslog"
@@ -131,7 +132,7 @@ residual_in_fp32 = True  # 残差连接是否使用fp32
 # adamw optimizer
 ## gradient_accumulation_steps=gradient_accumulation_steps*ddp_world_size
 gradient_accumulation_steps = 128  # used to simulate larger batch sizes
-learning_rate = 4e-4  # max learning rate
+learning_rate = 3e-4  # max learning rate，参考Qwen
 max_iters = 100000  # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -152,7 +153,7 @@ config_keys = [
 ]
 exec(open("configurator.py").read())  # 根据命令行或者配置文件来覆盖参数
 # 最终的配置文件
-config = {k: globals()[k] for k in config_keys}  # will be useful for logging
+exp_config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # 删除tokenizer，后面不会用到了
@@ -168,7 +169,7 @@ min_lr = learning_rate / 10  # 衰减到的最小学习率
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run? 使用torchrun才会自动设置环境变量，即正常运行python文件不会开启ddp
 if ddp:
-    process_group = init_process_group(backend=ddp_backend)
+    process_group = init_process_group(backend=ddp_backend)  # 或者通过dist.group.WORLD来获得初始化后的process_group
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
@@ -187,6 +188,8 @@ else:
     ddp_world_size = 1
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    # 保存最终的配置文件信息
+    save_run_exp_config(exp_config, os.path.join(out_dir, "exp_config.py"))
 
 # -----------------------------------------------------------------------------
 # 运行日志
@@ -201,7 +204,7 @@ if master_process:
 # 实验结果日志
 if use_reslog and master_process:
     # import wandb
-    # wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    # wandb.init(project=wandb_project, name=wandb_run_name, config=exp_config)
     # wandb用起来有问题，改为自己的日志和画图工具
     reslog = ResLog(reslog_run_name, reslog_dir, reslog_save_interval)
 
@@ -241,37 +244,67 @@ iter_batches = partial(
 )
 
 # -----------------------------------------------------------------------------
-# 模型初始化，配置初始化
-# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
+# 模型初始化，配置初始化，配置DDP
+# init these up here, can override if resume = True (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
 # model init
-if init_from == "scratch":
+powerSGD_state = None  # 看是否使用了PowerSGD
+if not resume:
     # init a new model from scratch
     _ = logger.info("Initializing a new model from scratch") if master_process else None  # 通过这种方式可以避免在非master进程中打印
-    model_config = Z2allConfig(**config)
+    model_config = Z2allConfig(**exp_config)
     model = Z2allForCausalLM(model_config)
-elif init_from == "resume":  # TODO
+    if master_process:
+        # 保存模型配置，和相应配置类的代码文件
+        model_config.save_pretrained(out_dir)  # 保存模型配置
+        # 获取Z2allConfig所在的文件路径
+        file_path = inspect.getfile(model_config.__class__)
+        # 复制Z2allConfig所在的文件到out_dir
+        shutil.copy(file_path, out_dir)
+else:  # resume
     _ = logger.info(f"Resuming training from {out_dir}") if master_process else None
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, "ckpt.pt")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    model_config = AutoConfig.from_pretrained(out_dir, trust_remote_code=True)
     
-    # create the model
+    best1_prefix = "best1_"
+    
+    # resume training from a checkpoint.
+    ckpt_path = os.path.join(out_dir, best1_prefix + "ckpt.pt")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    
+    # 获取模型配置
+    try:
+        model_config = AutoConfig.from_pretrained(out_dir, trust_remote_code=True)
+    except:
+        model_config = Z2allConfig(**exp_config)
+    # 构建模型
     model = Z2allForCausalLM(model_config)
-    state_dict = checkpoint["model"]
+    
+    # 加载模型状态，到特定的device
+    state_dict = torch.load(os.path.join(out_dir, best1_prefix + "model.pt"), map_location=device)
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    # 使用了torch.compile才会出现这个问题
+    # 使用了torch.compile才会出现这个问题，即前缀会有"_orig_mod."
+    wanted_prefix = ""
     unwanted_prefix = "_orig_mod."
+    full_prefix = wanted_prefix + unwanted_prefix
     for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)  # 修改键名
+        if k.startswith(full_prefix):
+            new_k = wanted_prefix + k[len(full_prefix) :]
+            state_dict[new_k] = state_dict.pop(k)  # 修改键名
+    # 加载模型状态
     model.load_state_dict(state_dict)
+    state_dict = None  # free up memory
     
-    reslog.load(os.path.join(out_dir, "reslog.pkl"))  # 读取中止的实验日志
+    # PowerSGD的状态，需要重新设置process_group，因为process_group不能被序列化
+    # pytorch2.0后已经实现了__getstate__和__setstate__方法，可以直接序列化，里面包含了去除process_group的操作
+    powerSGD_state = checkpoint.get("powerSGD_state", None)
+    if powerSGD_state is not None:
+        powerSGD_state.process_group = process_group
     
+    # 只有主进程需要加载实验过程日志
+    if master_process:
+        reslog.load(os.path.join(out_dir, best1_prefix + "reslog.pkl"))  # 读取中止的实验日志
+        
     # 训练时候的信息
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
@@ -283,7 +316,7 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 # optimizer
 optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type, logger, master_process)
-if init_from == "resume" and "optimizer" in checkpoint:
+if resume and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 # learning rate decay scheduler (cosine with warmup)
@@ -328,7 +361,7 @@ if compile and torch.__version__ >= "2.0":
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
 # 使用DDP包裹模型
-# wrap model into DDP container
+# wrap model into DDP container, 只有在从头开始训练时才会进行包裹
 if ddp:
     # model.bfloat16()
     _ = logger.info(f"wrapping model into DDP container") if master_process else None
@@ -336,42 +369,59 @@ if ddp:
                 gradient_as_bucket_view=True, static_graph=False)  # 有梯度累加时，static_graph=True有问题?
 
 # -----------------------------------------------------------------------------
-# 设置ddp com hook，还是会取world_size的平均值
-if use_powerSGD_hook:
-    state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-                        warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
-                        min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
-    if use_bf16_compress_hook:
-        model.register_comm_hook(state, bf16_compress_wrapper(powerSGD_hook))
-    else:
-        model.register_comm_hook(state, powerSGD_hook)
-elif use_bf16_compress_hook:
-    model.register_comm_hook(process_group, bf16_compress_hook)
-
-# -----------------------------------------------------------------------------
 # 准备训练集
 train_batch_iter = iter_batches(split="train")
 X, Y = next(train_batch_iter)  # fetch the very first batch
 
-# 预热下
-# 在用torch的ZeroRedundancyOptimizer时，可能更需要预热，可能前几个iter不会更新参数
-# 若预热的话，要考虑下PowerSGDState的start_powerSGD_iter应该变化
-# warm_run_time = time.time()
-# for _ in range(3):
-#     with ctx:
-#         model_outputs = model(X, Y)
-#         loss = model_outputs["loss"]
-#         loss = loss / gradient_accumulation_steps
-#         scaler.scale(loss).backward()
-#     if utils.FusedAdam is not None:
-#         optimizer.zero_grad()
-#     else:
-#         optimizer.zero_grad(set_to_none=True)
-# torch.distributed.barrier()
-# _ = logger.info(f"warm_run_time: {time.time() - warm_run_time:.4f}s") if master_process else None
+# 如果resume，需要跳过前面的iter
+if resume:
+    skip_data_time = time.time()
+    for _ in range(iter_num):
+        X, Y = next(train_batch_iter)
+    _ = logger.info(f"skip {iter_num} iters time: {time.time() - skip_data_time:.4f}s") if master_process else None
 
+# -----------------------------------------------------------------------------
+# 预热
+# 由于DDP下的bucket可能要重新构建，需要预热下，重建需要2个iter，情况:
+# 注意考虑PowerSGDState的start_powerSGD_iter应该变化，可能需要临时禁用powerSGD_hook
+# 预热时不使用powerSGD_hook，为了让模型的bucket构建好，因为第一个iter后bucket会被rebuilt
+# 1. 在用torch的ZeroRedundancyOptimizer时，可能更需要预热，可能前几个iter不会更新参数
+# 2. resume情况下，因为resume后，DDP又要重新开始构建bucket了
+# 见：powerSGD_hook.py的注释
+# 见：https://github.com/pytorch/pytorch/pull/73732
+if ddp:
+    warm_for_bucket_rebuilt_time = time.time()
+    for _ in range(2):
+        with ctx:
+            model_outputs = model(X, Y)
+            loss = model_outputs["loss"]
+            loss = loss / gradient_accumulation_steps
+        scaler.scale(loss).backward()
+        if utils.FusedAdam is not None:
+            optimizer.zero_grad()
+        else:
+            optimizer.zero_grad(set_to_none=True)
+    torch.distributed.barrier()
+    _ = logger.info(f"warm_for_bucket_rebuilt_time: {time.time() - warm_for_bucket_rebuilt_time:.4f}s") if master_process else None
+
+# -----------------------------------------------------------------------------
+# 预热后，设置ddp com hook，还是会取world_size的平均值
+if use_powerSGD_hook:
+    # 若没有resume，则初始化PowerSGDState
+    if powerSGD_state is None:
+        powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
+                            warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
+                            min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
+    if use_bf16_compress_hook:
+        model.register_comm_hook(powerSGD_state, bf16_compress_wrapper(powerSGD_hook))
+    else:
+        model.register_comm_hook(powerSGD_state, powerSGD_hook)
+elif use_bf16_compress_hook:
+    model.register_comm_hook(process_group, bf16_compress_hook)
+
+# -----------------------------------------------------------------------------
 # 开始训练
-t0 = time.time()
+train_time0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
@@ -383,9 +433,9 @@ while True:
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
 
-    # 测试
+    # 验证
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 110 and master_process:
+    if iter_num % eval_interval == 0 and master_process:
         val_t0 = time.time()
         losses = estimate_loss()
         val_dt = time.time() - val_t0
@@ -399,21 +449,56 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu * 100,  # convert to percentage
             }, name="valid", step = iter_num)
-        if losses["val"] < best_val_loss or always_save_checkpoint:
+            
+        # 保存checkpoint，resume后的第一个不需要保存，因为还是原来的
+        if (losses["val"] < best_val_loss or always_save_checkpoint) and not resume:
             best_val_loss = losses["val"]
             if iter_num > 0:
+                # 保存PowerSGD的状态
+                if use_powerSGD_hook:
+                    # 保存process_group有问题：https://discuss.pytorch.org/t/how-to-resume-with-powersgd-enabled-training/148747/2
+                    pg = powerSGD_state.process_group
+                    powerSGD_state.process_group = None
+                
+                # 为了防止保存最优时程序中断，即最优保存失败，需要保存一个次优版本
+                # 先将次优(best2)删除，然后将最优(best1)改名为次优
+                best1_prefix = "best1_"
+                best2_prefix = "best2_"
+                # 先将out_dir下的次优前缀文件删除
+                for file_basename in os.listdir(out_dir):
+                    if file_basename.startswith(best2_prefix):
+                        os.remove(os.path.join(out_dir, file_basename))
+                # 然后将最优(best1)改名为次优
+                for file_basename in os.listdir(out_dir):
+                    if file_basename.startswith(best1_prefix):
+                        new_file_basename = best2_prefix + file_basename[len(best1_prefix):]
+                        os.rename(os.path.join(out_dir, file_basename), os.path.join(out_dir, new_file_basename))
+                
+                # 保存完次优后，可以放心进行保存最优了
+                # 1. 单独保存模型权重文件
+                torch.save(raw_model.state_dict(), os.path.join(out_dir, best1_prefix + "model.pt"))
+                # 2. 保存训练状态
                 checkpoint = {
-                    "model": raw_model.state_dict(),
+                    # "model": model_save_method,
                     "optimizer": optimizer.state_dict(),
                     "iter_num": iter_num,
                     "best_val_loss": best_val_loss,
-                    "config": config,
+                    "powerSGD_state": powerSGD_state,
                 }
-                logger.info(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-                model_config.save_pretrained(out_dir)  # 单独保存模型配置
-                reslog.save(os.path.join(out_dir, "reslog.pkl"))
+                torch.save(checkpoint, os.path.join(out_dir, best1_prefix + "ckpt.pt"))
+                # 3. 保存实验过程日志，可用resplot来展示
+                reslog.save(os.path.join(out_dir, best1_prefix + "reslog.pkl"))
+                
                 # model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)  # TODO
+                
+                logger.info(f"save checkpoint to {out_dir}")
+                
+                # 记得还原PowerSGD的状态
+                if use_powerSGD_hook:
+                    # 保存process_group有问题：https://discuss.pytorch.org/t/how-to-resume-with-powersgd-enabled-training/148747/2
+                    powerSGD_state.process_group = pg
+        train_time0 = time.time()  # 因为经过了测试，所以训练的起始时间需要重新设置
+    resume = False  # resume后的第一个不需要保存，因为还是原来的
     if iter_num == 0 and eval_only:
         break
     
@@ -437,7 +522,7 @@ while True:
         backward_comm_time = time.time()
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
-    torch.distributed.barrier()
+    torch.distributed.barrier()  # 只在测试通信耗时的时候用
     backward_comm_time = time.time() - backward_comm_time
     
     # clip the gradient
@@ -455,9 +540,9 @@ while True:
         
     # 输出结果
     # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
+    train_time1 = time.time()
+    dt = train_time1 - train_time0
+    train_time0 = train_time1
     if iter_num % log_interval == 0 and master_process:
         # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
         # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。

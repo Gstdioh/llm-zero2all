@@ -637,8 +637,14 @@ breaks down as: 4 grad accum steps * 8 processes * 16 batch size * 2048 max seq 
     # model.register_comm_hook(state, bf16_compress_wrapper(powerSGD_hook))  # 会取平均
     ```
 
+    注意PowerSGDState的状态需要保存，用于resume
+
 参考：
 
 * https://medium.com/pytorch/accelerating-pytorch-ddp-by-10x-with-powersgd-585aef12881d
 * https://github.com/epfml/powersgd
 * https://pytorch.org/docs/stable/ddp_comm_hooks.html
+
+### resume
+
+使得训练可以从断点重新训练，保存的方式更加稳定（保存最优和次优的文件，防止保存失败导致文件损坏）

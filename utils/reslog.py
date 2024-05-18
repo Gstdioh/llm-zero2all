@@ -44,9 +44,9 @@ class ResLog:
         if step is None:
             self.log_data[name]["step"].append(len(self.log_data[name]["step"]))
         else:
-            # 新设置的step必须要是严格递增的
+            # 新设置的step必须要是严格递增的，如果不是，则此次不记录，退出
             if len(self.log_data[name]["step"]) > 0 and step <= self.log_data[name]["step"][-1]:
-                raise ValueError("新设置的step必须要是严格递增的")
+                return
             self.log_data[name]["step"].append(step)
             
         # 添加数据
