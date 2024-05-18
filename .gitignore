@@ -6,6 +6,7 @@ __pycache__
 /mytest
 /others
 /out*
+*.pt.trace.json
 *.parquet
 *.txt
 *.zip
