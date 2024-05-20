@@ -38,9 +38,12 @@ $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standa
 # gpu4, gpu4_2
 - gpu4
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
+
 $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
+
 - gpu4_2
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
+
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
 $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
 """
@@ -70,6 +73,13 @@ import utils
 from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config
 
 
+os.environ["NCCL_IB_DISABLE"] = "1"  # disable infiniband
+os.environ["NCCL_IBEXT_DISABLE"] = "1"  # 有用啦!
+os.environ["NCCL_P2P_DISABLE"] = "1"  # disable p2p
+os.environ["OMP_NUM_THREADS"] = "8"  # set the number of threads for OpenMP
+# os.environ["NCCL_DEBUG"] = "WARN"  # set NCCL debug level, ["WARN", "INFO"]，用于测试
+
+
 # 用于torch.compile，需要PyTorch>=2.0
 if torch.__version__ >= "2.0.0":
     import torch._dynamo
@@ -85,16 +95,18 @@ if torch.__version__ >= "2.0.0":
 # 没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练
 # 因为我的环境没有nvlink，所以我使用的是gloo后端
 # 但是gloo又与hook有问题，还是用nccl吧
+# 1. gloo，不支持bfloat16，使用PowerSGD时会卡住，强行退出时GPU不会立即释放
+# 2. nccl，需要设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1
 ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 # 梯度通信优化
-use_bf16_compress_hook = True
-use_powerSGD_hook = True
+use_bf16_compress_hook = False
+use_powerSGD_hook = False
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 5  # 每eval_interval个step验证一次
+eval_interval = 200  # 每eval_interval个step验证一次
 log_interval = 1
-eval_iters = 2  # 每次验证的step数
+eval_iters = 3  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 resume = False  # if True, resume training from the last checkpoint
@@ -114,7 +126,7 @@ max_seq_len = 2048
 vocab_size = 64320  # 实际是64012个，写大点方便扩展，注意最好是8的倍数，见指导：https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html#tc-guidelines-padding
 hidden_dim = 2048
 intermediate_size = 5632
-n_layers = 24
+n_layers = 28
 n_heads = 16
 n_kv_heads = 8  # 用于GQA
 max_seq_len = max_seq_len
@@ -411,7 +423,7 @@ if ddp:
         # 若没有resume，则初始化PowerSGDState
         if powerSGD_state is None:
             powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
+                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=50, 
                                 min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
         if use_bf16_compress_hook:
             model.register_comm_hook(powerSGD_state, bf16_compress_wrapper(powerSGD_hook))

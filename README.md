@@ -645,6 +645,16 @@ breaks down as: 4 grad accum steps * 8 processes * 16 batch size * 2048 max seq 
 * https://github.com/epfml/powersgd
 * https://pytorch.org/docs/stable/ddp_comm_hooks.html
 
+**注意**，
+
+要使用nccl后端通信
+1. gloo，不支持bfloat16，使用PowerSGD时会卡住，强行退出时GPU不会立即释放
+2. nccl，需要设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1
+
+使用nccl时，如果没有nvlink，则需要设置NCCL_P2P_DISABLE=1。没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练。
+
+最终我使用nccl后端，并且设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1，见：https://github.com/microsoft/DeepSpeedExamples/issues/542
+
 ### resume
 
 使得训练可以从断点重新训练，保存的方式更加稳定（保存最优和次优的文件，防止保存失败导致文件损坏）
