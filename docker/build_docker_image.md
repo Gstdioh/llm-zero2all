@@ -4,7 +4,7 @@
 
 环境：pytorch2.0.1, cuda11.4, flash-attn2.1.0, rotary-emb0.1, xentropy-cuda-lib0.1, apex0.1, xformers0.0.24等
 
-**注意**，xformers的bug在镜像中没有处理，需要自己处理下，见[xformers安装章节](./README.md#6-swiglu-xformers)
+**注意**，xformers的bug在镜像中处理过了，处理方法见：[xformers的bug处理方法](../model/README.md/#6-swiglu-xformers)
 
 ## 构建过程
 

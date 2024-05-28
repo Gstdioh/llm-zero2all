@@ -890,7 +890,7 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
                     loss_fn = fused_cross_entropy
                 else:
                     loss_fn = F.cross_entropy
-            loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100, reduction="mean")
 
         return {
             "loss": loss,

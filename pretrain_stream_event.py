@@ -37,12 +37,12 @@ $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standa
 
 # gpu4, gpu4_2
 - gpu4
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_stream_event.py
 
 $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
 
 - gpu4_2
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_stream_event.py
 
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
 $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
@@ -63,7 +63,8 @@ import torch.distributed as dist
 import torch.distributed
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook, bf16_compress_wrapper
-from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
+# from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
+from PowerSGD_hook_stream_event import PowerSGDState, powerSGD_hook
 from transformers import AutoConfig
 
 from dataset import Task
@@ -102,7 +103,7 @@ if torch.__version__ >= "2.0.0":
 ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 # 梯度通信优化
 use_bf16_compress_hook = False
-use_powerSGD_hook = False
+use_powerSGD_hook = True
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
@@ -420,17 +421,27 @@ if ddp:
 
 # -----------------------------------------------------------------------------
 # 预热后，设置ddp com hook，还是会取world_size的平均值
+def stream_wrapper(hook):
+    def wrapper(state, bucket):
+        event = torch.cuda.Event(enable_timing=False)
+        event.record(torch.cuda.current_stream())
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            event.wait(s)
+            return hook(state, bucket)
+    return wrapper
 if ddp:
     if use_powerSGD_hook:
         # 若没有resume，则初始化PowerSGDState
         if powerSGD_state is None:
             powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=50, 
+                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
                                 min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
         if use_bf16_compress_hook:
             model.register_comm_hook(powerSGD_state, bf16_compress_wrapper(powerSGD_hook))
         else:
-            model.register_comm_hook(powerSGD_state, powerSGD_hook)
+            # model.register_comm_hook(powerSGD_state, powerSGD_hook)
+            model.register_comm_hook(powerSGD_state, stream_wrapper(powerSGD_hook))
     elif use_bf16_compress_hook:
         model.register_comm_hook(process_group, bf16_compress_hook)
 
@@ -541,6 +552,7 @@ while True:
         torch.distributed.barrier()  # 只在测试通信耗时的时候用
     backward_comm_time = time.time() - backward_comm_time
     
+    torch.cuda.synchronize()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
