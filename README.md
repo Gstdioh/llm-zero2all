@@ -258,7 +258,9 @@ Qwen使用tiktoken，其自己管理特殊token，https://huggingface.co/Qwen/Qw
 
 ## 04 训练
 
-参数设置可以参考，https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html，词汇量最好设置为16字节的倍数，若使用bfloat16，则设置为8的倍数，若为A100，则使用64的倍数，见https://huggingface.co/docs/transformers/perf_train_gpu_one
+参数设置可以参考，https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html
+
+词汇量最好设置为16字节的倍数，若使用bfloat16，则设置为8的倍数，若为A100，则使用64的倍数，见：https://huggingface.co/docs/transformers/perf_train_gpu_one
 
 CUDA cuBLAS版本参考：https://docs.nvidia.com/cuda/archive/11.4.3/cuda-toolkit-release-notes/index.html
 
@@ -281,7 +283,7 @@ wandb用起来有点问题，5个iter后就报错：BrokenPipeError: [Errno 32] 
 
 ### 分布式训练
 
-分布式训练见：[分布式训练](./)
+分布式训练见：[分布式训练](./parallel/README.md)
 
 ### resume
 
