@@ -38,6 +38,8 @@ class OptimizerConfig:
     """
     If true, overlap grad reduce-scatter with backward compute in distributed optimizer.
     
+    与DDP对应，代码中没用到
+    
     同步：设置bucket_size=None，即所有参数在同一个bucket中，计算完成后进行通信
     
     重叠：设置相应的bucket_size大小，分为多个bucket，每进行完一部分param的计算就进行异步通信，计算和通信重叠
