@@ -11,7 +11,7 @@ import torch.profiler
 
 from parallel.distributed_data_parallel import DistributedDataParallelConfig
 from parallel.distributed_data_parallel import DistributedDataParallel as MyDDP
-from optimizer import FP32Optimizer, OptimizerConfig, Float16OptimizerWithFloat16Params
+from optimizer import OptimizerConfig, FP32Optimizer, Float16OptimizerWithFloat16Params
 from parallel.distributed_optimizer import DistributedOptimizer
 
 

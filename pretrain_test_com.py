@@ -59,7 +59,7 @@ from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDSt
 
 from transformers import AutoConfig
 
-from dataset import Task
+from my_dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 from transformers import AutoTokenizer
 import utils

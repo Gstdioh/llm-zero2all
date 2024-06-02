@@ -58,7 +58,7 @@ class DistributedDataParallel(nn.Module):
         # latency-bound.
         if ddp_config.bucket_size is None:
             dp_size = torch.distributed.get_world_size(self.data_parallel_group)
-            ddp_config.bucket_size = max(40000000, 1000000 * dp_size)
+            ddp_config.bucket_size = max(40_000_000, 1_000_000 * dp_size)
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
