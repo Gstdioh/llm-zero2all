@@ -461,12 +461,13 @@ class ParamAndGradBuffer:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
 
-    def reset(self):
+    def reset(self, zero_grad_data: bool = True):
         """
         Zero out the underlying grad_buffer and reset all buckets in preparation for the next
         iteration of training.
         """
-        self.grad_data.zero_()
+        if zero_grad_data:
+            self.grad_data.zero_()
         for bucket in self.buckets:
             bucket.reset()
         self.is_last_microbatch = True

@@ -207,6 +207,21 @@ z = x * y
 
 ## 02 分布式优化器（Distributed Optimizer, ZeRO1）
 
+### 实现overlap_optim_step
+
+1. `optimizer.bucket_to_optim_param_groups_map`, 用于optimizer.step()
+
+2. `optimizer.bucket_to_model_params_map`, `optimizer.bucket_to_main_params_map`, 两个目的：
+
+    * `main_param.grad = model_param.main_grad.float()`，复制梯度，用于optim参数更新
+    * `model_param.copy_(main_param)`，将更新后的optim参数复制回model
+
+3. 注意，DistributedOptimizer下是
+
+    * `optimizer.bucket_to_model_params_map`，用于复制梯度，因为main_grad（或grad）是跟着model_param的，不能直接取shard_model_param的main_grad
+    * `optimizer.bucket_to_shard_model_params_map`，用于复制参数回模型
+    * `optimizer.bucket_to_shard_main_params_map`
+
 ## 03 张量并行（Tensor Parallel）
 
 ### 计算和通信重叠

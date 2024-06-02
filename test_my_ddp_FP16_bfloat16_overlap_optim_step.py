@@ -37,13 +37,15 @@ ctx = (
     else torch.autocast(device_type=device_type, dtype=ptdtype)
 )
 
+torch.manual_seed(42)
+
 seq_len = 1024
 input_dim = 1024 * 4
 hidden_dim = 1024 * 4
 output_dim = 1024 * 4
 
 input_data = torch.randn(seq_len, input_dim).to(device).to(ptdtype)
-label_data = torch.randn(seq_len, output_dim).to(device).to(ptdtype)
+label_data = input_data * 2 + 1
 
 model = nn.Sequential(
     nn.Linear(input_dim, hidden_dim),
@@ -56,14 +58,14 @@ model = model.to(ptdtype)
 loss_fn = nn.MSELoss()
 
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
-grad_clip = 1.0
+grad_clip = 0.0
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
 
 # -------------------------------------------------------------------
 # 测试我的DDP
 # model = DDP(model, device_ids=[ddp_local_rank])
 ddp_config = DistributedDataParallelConfig(
-    grad_reduce_in_fp32=True,
+    grad_reduce_in_fp32=False,
     overlap_grad_reduce=True,
     use_distributed_optimizer=False,
     check_for_nan_in_grad=False,
@@ -73,8 +75,11 @@ model = MyDDP(model,
               data_parallel_group=process_group,
               disable_bucketing=False)
 
-optim_config = OptimizerConfig(precision_dtype=dtype, overlap_optim_step=True)
-optimizer = Float16OptimizerWithFloat16Params(optimizer, optim_config, scaler=scaler, grad_clip=grad_clip, model_chunks=model)
+optim_config = OptimizerConfig(
+    precision_dtype=dtype,
+    overlap_optim_step=True,
+    overlap_zero_grad_buffer=True)
+optimizer = Float16OptimizerWithFloat16Params(optimizer, optim_config, model, scaler=scaler, grad_clip=grad_clip)
 
 # profile
 with torch.profiler.profile(
@@ -86,7 +91,7 @@ with torch.profiler.profile(
         warmup=2,
         active=2,
         repeat=1),
-    on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_my_ddp/02_FP16Optim_bfloat16_overlap_optim_step_queue1',
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_my_ddp/02_FP16Optim_bfloat16_overlap_optim_step_question_1',
                                                             worker_name=f'rank{ddp_rank}'),
     record_shapes=True,
     profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
@@ -94,25 +99,18 @@ with torch.profiler.profile(
 ) as p:
     
     for i in range(6):
-        model.zero_grad_buffer()
-        optimizer.zero_grad(set_to_none=True)
-        
         with ctx:
             output = model(input_data)
             loss = loss_fn(output, label_data)
         scaler.scale(loss).backward()
         
-        # 等待梯度同步完成
-        # 如果有overlap_optim_step，则等待参数更新完成
-        model.finish_grad_sync()
-            
-        if not optim_config.overlap_optim_step:
-            # 更新参数，若需要则可以进行scale和grad_clip
-            optimizer.step()
+        optimizer.step()  # 内部自动根据overlap_optim_step来选择是否要更新参数
+        
+        optimizer.zero_grad(set_to_none=True)  # 内部自动根据overlap_optim_step来选择是否要清空梯度
+
+        torch.cuda.synchronize()
         
         if master_process:
             print(f"iter {i}, loss: {loss:.4f}, scale: {scaler.get_scale()}")
-        
-        torch.cuda.synchronize()
-        
+    
         p.step()

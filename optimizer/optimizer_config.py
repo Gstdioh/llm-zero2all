@@ -8,18 +8,39 @@ class OptimizerConfig:
     """Configuration for Optimizer."""
 
     ##############
-    # normal
+    # overlap_optim_step
     ##############
     overlap_optim_step: bool = False
     """
     反向传播时，梯度通信时，会与优化器更新参数重叠
     因为通常通信时间比计算时间长，所以（梯度通信）与（backward计算和优化器更新）可以重叠
     
-    optimizer需要构建self.bucket_to_optim_params_map
+    optimizer需要构建self.bucket_to_optim_param_groups_map, self.bucket_to_model_params_map, self.bucket_to_main_params_map
     
-    同步：TODO_MY
+    需要在optimizer中修改model中的comm_hook，添加一个overlap_optim_step_wrapper
     
-    重叠：
+    DistributedOptimize中需要构建：
+        self.bucket_to_optim_param_groups_map,
+        self.bucket_to_model_params_map, self.bucket_to_shard_model_params_map, self.bucket_to_shard_main_params_map
+    
+    注意，overlap_optim_step会改变grad_clip的语义
+        因为原grad_clip会对所有参数的梯度计算一个norm，但是overlap_optim_step下是对每个bucket的梯度计算一个norm
+        可能可以缓解参数原本的分布很不均匀，有的梯度大有的梯度小的问题？
+    
+    注意，float16下不能重叠，因为scaler中有cpu操作，会强制同步，同时会导致通信和backward计算也不重叠了，不推荐使用！
+        不使用scaler的话，则可以
+    
+    同步：将step放在iter的最后执行
+    
+    重叠：将step放在comm_hook中执行，每次只执行一个bucket的step，计算和通信重叠
+    """
+    
+    overlap_zero_grad_buffer: bool = False
+    """
+    是否在overlap_optim_step中将grad的清零也重叠起来
+    
+    若为False，则会对整个buffer进行清零（只启动一次kernel，可能更快）
+    若为True，则会对每个bucket的buffer一个一个进行清零
     """
 
     ##############
@@ -33,17 +54,6 @@ class OptimizerConfig:
     #######################
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
-
-    overlap_grad_reduce: bool = False
-    """
-    If true, overlap grad reduce-scatter with backward compute in distributed optimizer.
-    
-    与DDP对应，代码中没用到
-    
-    同步：设置bucket_size=None，即所有参数在同一个bucket中，计算完成后进行通信
-    
-    重叠：设置相应的bucket_size大小，分为多个bucket，每进行完一部分param的计算就进行异步通信，计算和通信重叠
-    """
 
     overlap_param_gather: bool = False
     """

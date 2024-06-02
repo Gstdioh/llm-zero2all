@@ -57,11 +57,21 @@ class Z2allOptimizer:
         self.scaler = scaler
         self.grad_clip = grad_clip
         
+        self.bucket_step_count = 0  # 对已经step的bucket进行计数，和DDP.bucket_count结合起来用，用来判断是否到了最后一个bucket
+        self.update_successful = True  # optim参数更新成功后，才会进行all-gather，scaler时才会用到
+        
+    def reset(self):
+        """
+        重置状态
+        """
+        self.bucket_step_count = 0
+        self.update_successful = True
+        
     def _post_init(self):
         # 收集所有需要unscale梯度的参数，用于grad_clip
         self.all_params_for_unscaling_grads = [
             param for group in self.optimizer.param_groups for param in group["params"] 
-            if param.requires_grad and param.grad is not None
+            if param.requires_grad
         ]
         
     def __getattr__(self, name):
@@ -71,6 +81,19 @@ class Z2allOptimizer:
         相当于将NavieOptimizer视为optimizer的一个包装，对外部代码无影响
         """
         return getattr(self.optimizer, name)
+
+    def _collect_main_params_for_unscaling_grads(self):
+        """
+        根据当前optim_param_groups收集需要unscale梯度的参数，即需要更新的参数，后续将其中的grads进行unscale
+
+        overlap_optim_step下，收集的是bucket对应的参数，因为optim_param_groups会被更新为对应bucket的参数
+        
+        Note: this should be equivalent to the float-16 optimizer's method,
+        but written differently, so the two should be combined.
+        """
+        return [
+            param for group in self.optimizer.param_groups for param in group["params"]
+        ]
 
 
 class MixedPrecisionOptimizer(Z2allOptimizer, ABC):
@@ -108,47 +131,70 @@ class MixedPrecisionOptimizer(Z2allOptimizer, ABC):
         pass
     
     @torch.no_grad()
-    def step(self):
+    def step(self, is_bucket_step=False, bucket=None):
         """
         更新参数，若需要则可以进行scale和grad_clip
+        
+        is_bucket_step, bucket用于overlap_optim_step
+        
+        1. 更新参数，包括复制梯度到优化器的梯度中，更新参数，将optim参数覆盖到模型参数。
+            非overlap_optim_step，直接更新所有参数
+            overlap_optim_step，只有当is_bucket_step=True时，才会触发更新（在overlap_optim_step_wrapper包裹的comm_hook中进行更新）
+            
+        2. 等待梯度同步完成，如果有overlap_optim_step，则等待参数更新完成
+            是全部参数，进行等待，即在comm_hook中不会等，只会所有触发后才会等
         
         Return:
         update_successful (bool): True if the update was successful.
             若梯度中包含Nan，则不进行更新，逻辑在scaler.step中
         """
-        # Copy gradients from model params to main params.
-        self._copy_model_grads_to_main_grads()
-        
-        update_successful = True
-        
-        if self.scaler is not None and self.scaler.is_enabled():
-            # unscale，并且裁剪梯度
-            if self.grad_clip != 0.0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.all_params_for_unscaling_grads, self.grad_clip)
-            # step the optimizer and scaler if training in fp16
-            self.scaler.step(self.optimizer)  # 若没有unscale，进行unscale并且更新
+        if (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step):
+            # Copy gradients from model params to main params.
+            self._copy_model_grads_to_main_grads(is_bucket_step, bucket)
             
-            # 判断是否更新成功
-            optimizer_state = self.scaler._per_optimizer_states[id(self.optimizer)]
-            if sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
-                # 有Nan或者inf
-                update_successful = False
-            
-            self.scaler.update()  # 更新scaler的缩放因子，为了进行下一个iter，会清空scale中optim的状态
-        else:
-            # 裁剪梯度
-            if self.grad_clip != 0.0:
-                torch.nn.utils.clip_grad_norm_(self.all_params_for_unscaling_grads, self.grad_clip)
-            self.optimizer.step()
+            if self.scaler is not None and self.scaler.is_enabled():
+                # unscale，并且裁剪梯度
+                if self.grad_clip != 0.0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self._collect_main_params_for_unscaling_grads(), self.grad_clip)
+                # step the optimizer and scaler if training in fp16
+                self.scaler.step(self.optimizer)  # 若没有unscale，进行unscale并且更新
+                
+                # 判断是否更新成功
+                optimizer_state = self.scaler._per_optimizer_states[id(self.optimizer)]
+                if sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+                    # 有Nan或者inf
+                    self.update_successful = False
+                
+                # 只有在overlap_optim_step下，才会进行bucket_step_count的计数
+                # 从而判断是否需要更改stage
+                if self.optim_config.overlap_optim_step:
+                    self.bucket_step_count += 1
+                    # 如果不是最后一个bucket，则需要更改stage为READY，即0，因为下次bucket又会用到scaler，防止报错
+                    if self.bucket_step_count < self.model_chunks[0].bucket_count:  # TODO_MY 多个model_chunk的情况没有考虑
+                        optimizer_state["stage"] = 0  # 0表示READY
+            else:
+                # 裁剪梯度
+                if self.grad_clip != 0.0:
+                    torch.nn.utils.clip_grad_norm_(self._collect_main_params_for_unscaling_grads(), self.grad_clip)
+                self.optimizer.step()
 
-        # Update params from optim params.
-        # 更新失败的话，就不用覆盖模型参数了
-        if update_successful:
-            self._copy_main_params_to_model_params()
+            # Update params from optim params.
+            # 更新失败的话，就不用覆盖模型参数了
+            if self.update_successful:
+                self._copy_main_params_to_model_params(is_bucket_step, bucket)
+        
+        if not is_bucket_step:
+            # 每个iter只会调用一次，在这里更新scaler
+            if self.scaler is not None and self.scaler.is_enabled():
+                # 更新scaler的缩放因子，需要放在最后面，每个bucket更新时不需要对scaler进行更新，只需要最后更新一次即可
+                # 为了进行下一个iter，会清空scale中optim的状态
+                self.scaler.update()
             
-        return update_successful
-
+            # 2. 等待梯度同步完成，如果有overlap_optim_step，则等待参数更新完成
+            for model_chunk in self.model_chunks:
+                model_chunk.finish_grad_sync()
+            
 
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     """Float16 optimizer for fp16 and bf16 data types.
@@ -165,15 +211,19 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     """
 
     def __init__(self, optimizer: torch.optim.Optimizer,
-                 optim_config: OptimizerConfig, scaler: torch.cuda.amp.GradScaler = None, grad_clip = 0.0,
-                 model_chunks: Optional[Union[DistributedDataParallel, List[DistributedDataParallel]]] = None):
+                 optim_config: OptimizerConfig,
+                 model_chunks: Optional[Union[DistributedDataParallel, List[DistributedDataParallel]]],
+                 scaler: torch.cuda.amp.GradScaler = None, grad_clip = 0.0):
+        
         super().__init__(optimizer, optim_config, scaler, grad_clip)
+        
+        assert model_chunks is not None, "model is required!"
+        if not isinstance(model_chunks, List):
+            model_chunks = [model_chunks]
+        self.model_chunks = model_chunks
 
-        # overlap_optim_step需要实现self.bucket_to_optim_params_map
+        # overlap_optim_step需要实现self.bucket_to_optim_param_groups_map
         if self.optim_config.overlap_optim_step:
-            assert model_chunks is not None, "model is required for overlap_optim_step"
-            if not isinstance(model_chunks, List):
-                model_chunks = [model_chunks]
             # 这个重叠必须要有overlap_grad_reduce，要不然没意义了
             for model_chunk in model_chunks:
                 assert model_chunk.ddp_config.overlap_grad_reduce, "ddp_config.overlap_grad_reduce is required for overlap_optim_step"
@@ -186,10 +236,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         for param in bucket.params:
                             self.model_param_to_bucket_map[param] = bucket
                             
-            # 2. 构建bucket_to_optim_params_map，遍历optim组
+            # 2. 构建bucket_to_optim_param_groups_map，遍历optim组
             # 代码逻辑与FP32的不太一样，因为optimizer的param_groups会重新构建，即将FP16 -> FP32保存下来
-            # 所以构建bucket_to_optim_params_map的过程与optimizer的param_groups重新构建放在一块
-            self.bucket_to_optim_params_map = {}
+            # 所以构建bucket_to_optim_param_groups_map的过程与optimizer的param_groups重新构建放在一块
+            self.bucket_to_optim_param_groups_map = {}
+            # 同时构建bucket_to_model_params_map，bucket_to_main_params_map
+            self.bucket_to_model_params_map = {}
+            self.bucket_to_main_params_map = {}
                 
             # overlap_optim_step需要使用wrapper包裹原hook
             # 基于记录好的cur_comm_hook, cur_comm_hook_args, cur_comm_hook_kwargs来重新构建hook
@@ -208,7 +261,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         self.fp32_from_fp32_groups = []
 
         # For all the groups in the original optimizer:
-        # 同时在overlap_optim_step下，构建bucket_to_optim_params_map
+        # 同时在overlap_optim_step下，构建bucket_to_optim_param_groups_map
         for group_idx, param_group in enumerate(self.optimizer.param_groups):
             float16_params_this_group = []
             fp32_params_this_group = []
@@ -250,15 +303,22 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             'Received {}'.format(model_param.type())
                         )
 
-                # overlap_optim_step下，才会构建bucket_to_optim_params_map
+                # overlap_optim_step下，才会构建bucket_to_optim_param_groups_map
                 if self.optim_config.overlap_optim_step:
                     # bucket和optim param_groups的映射关系
                     bucket = self.model_param_to_bucket_map[model_param]
-                    if bucket not in self.bucket_to_optim_params_map:
+                    if bucket not in self.bucket_to_optim_param_groups_map:
                         # 初始化映射
-                        self.bucket_to_optim_params_map[bucket] = [[] for _ in range(len(self.optimizer.param_groups))]
+                        self.bucket_to_optim_param_groups_map[bucket] = [[] for _ in range(len(self.optimizer.param_groups))]
                     # 将optim参数加入到bucket映射的对应的组中
-                    self.bucket_to_optim_params_map[bucket][group_idx].append(main_param)
+                    self.bucket_to_optim_param_groups_map[bucket][group_idx].append(main_param)
+                    
+                    # 同时构建bucket_to_model_params_map，bucket_to_main_params_map
+                    if bucket not in self.bucket_to_model_params_map:
+                        self.bucket_to_model_params_map[bucket] = []
+                        self.bucket_to_main_params_map[bucket] = []
+                    self.bucket_to_model_params_map[bucket].append(model_param)
+                    self.bucket_to_main_params_map[bucket].append(main_param)
 
             self.float16_groups.append(float16_params_this_group)
             self.fp32_from_float16_groups.append(fp32_from_float16_params_this_group)
@@ -279,61 +339,105 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         因为后续会把model中grads的值复制到optim相应参数的grad中。
         
         这里对optim的grad进行zero，是为了减少内存碎片，同时减少内存峰值
+        
+        1. 清零DDP中grad的buffer
+        2. 清空optim中所有参数的grad
         """
+        # overlap_optim_step下，会在comm_hook中清零对应的bucket的grad_buffer，尽量实现重叠
+        # 1. 清零DDP中grad的buffer
+        # 将model中的初始化放进来，方便用户像原PyTorch一样使用
+        # 作用：因为DDP中自己管理grad的buffer，需要在每次forward前清零
+        # self.optim_config.overlap_optim_step and self.optim_config.overlap_zero_grad_buffer下才会按照bucket进行zero_grad_buffer
+        for model_chunk in self.model_chunks:
+            model_chunk.zero_grad_buffer(zero_grad_data=not self.optim_config.overlap_optim_step or not self.optim_config.overlap_zero_grad_buffer)
+
+        # 2. 清空全部param的grad，这个不需要分bucket进行zero，因为只是设置为None，不需要启动kernel
         for group in self.float16_groups:
             zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_float16_groups:
             zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_fp32_groups:
             zero_grad_group_helper(group, set_to_none)
+            
+        self.reset()  # 记得清零，实现在Z2allOptimizer中
 
-    def _get_model_and_main_params_data_float16(self):
+    def _get_model_and_main_params_data_float16(self, is_bucket_step=False, bucket=None):
         """
         获取model和optim对应的fp16的参数
         """
         model_data = []
         main_data = []
-        for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
-            for model_param, main_param in zip(model_group, main_group):
-                model_data.append(model_param.data)
-                main_data.append(main_param.data)
+        
+        if not is_bucket_step:
+            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    model_data.append(model_param.data)
+                    main_data.append(main_param.data)
+        else:
+            for model_param, main_param in zip(self.bucket_to_model_params_map[bucket], self.bucket_to_main_params_map[bucket]):
+                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                    model_data.append(model_param.data)
+                    main_data.append(main_param.data)
+        
         return model_data, main_data
 
-    def _copy_model_grads_to_main_grads(self):
+    def _copy_model_grads_to_main_grads(self, is_bucket_step=False, bucket=None):
         """
         用于更新放在optim中的主参数，optim main params
         
         将模型的梯度拷贝到优化器的梯度中，优化器中的梯度保存的是fp32的梯度
+        
+        overlap_optim_step=True, is_bucket_step=True，只需要拷贝对应的bucket
         """
-        # This only needs to be done for the float16 group.
-        for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
-            for model_param, main_param in zip(model_group, main_group):
+        if not is_bucket_step:
+            # 外部有条件：
+            # (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step)
+            
+            # This only needs to be done for the float16 group.
+            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    if hasattr(model_param, 'main_grad'):
+                        main_param.grad = model_param.main_grad.float()
+                    else:
+                        if model_param.grad is not None:
+                            main_param.grad = model_param.grad.float()
+
+                    # Safe to deallocate model's grad/main_grad after copying.
+                    # (If using contiguous buffers, main_grad's memory should
+                    # persist and therefore should not be deallocated.)
+                    model_param.grad = None
+
+            # For fp32 grads, we need to reset the grads to main grad.
+            for model_group in self.fp32_from_fp32_groups:
+                for model_param in model_group:
+                    model_param.grad = model_param.main_grad
+        else:
+            # overlap_optim_step下，只对bucket对应的grad进行拷贝
+            # 对FP32和FP16都是一样的操作，如果是FP32，则float()也不会创建新的内存空间，所以可以这样做
+            for model_param, main_param in zip(self.bucket_to_model_params_map[bucket], self.bucket_to_main_params_map[bucket]):
                 if hasattr(model_param, 'main_grad'):
                     main_param.grad = model_param.main_grad.float()
                 else:
                     if model_param.grad is not None:
                         main_param.grad = model_param.grad.float()
-
-                # Safe to deallocate model's grad/main_grad after copying.
-                # (If using contiguous buffers, main_grad's memory should
-                # persist and therefore should not be deallocated.)
+                        
                 model_param.grad = None
-
-        # For fp32 grads, we need to reset the grads to main grad.
-        for model_group in self.fp32_from_fp32_groups:
-            for model_param in model_group:
-                model_param.grad = model_param.main_grad
     
-    def _copy_main_params_to_model_params(self):
+    def _copy_main_params_to_model_params(self, is_bucket_step=False, bucket=None):
         """
         用于模型forward和backward
         
         因为模型执行时用的是模型的参数，优化器的参数是单独存放的，fp32的参数是共享的
         
         将优化器的参数拷贝到模型的参数中，优化器中的参数保存的是fp32的参数
+        
+        overlap_optim_step=True, is_bucket_step=True，只需要拷贝对应的bucket
         """
+        # 外部有条件：
+        # (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step)
+            
         # Only needed for the float16 params.
-        model_data, main_data = self._get_model_and_main_params_data_float16()
+        model_data, main_data = self._get_model_and_main_params_data_float16(is_bucket_step, bucket)
         _multi_tensor_copy_this_to_that(
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
         )
@@ -378,63 +482,89 @@ class FP32Optimizer(Z2allOptimizer):
     """
     
     @classmethod
-    def _build_bucket_to_optim_params_map(cls, optimizer, model_chunks):
+    def _build_bucket_to_optim_param_groups_map(cls, optimizer, model_chunks):
         """
         构建bucket到optim_params的映射，用于overlap_optim_step
         """
-        # overlap_optim_step需要实现self.bucket_to_optim_params_map
-        bucket_to_optim_params_map = {}
+        # overlap_optim_step需要实现self.bucket_to_optim_param_groups_map
+        bucket_to_optim_param_groups_map = {}
+        bucket_to_model_params_map = {}
+        bucket_to_main_params_map = {}
             
         # 1. 首先构建原model param到bucket的映射
+        # 同时构建bucket_to_model_params_map，bucket_to_main_params_map
         model_param_to_bucket_map = {}
         for model_chunk in model_chunks:
             for buffer in model_chunk.buffers:
                 for bucket in buffer.buckets:
                     for param in bucket.params:
                         model_param_to_bucket_map[param] = bucket
+                        if bucket not in bucket_to_model_params_map:
+                            bucket_to_model_params_map[bucket] = []
+                        bucket_to_model_params_map[bucket].append(param)
+        bucket_to_main_params_map = bucket_to_model_params_map
         
-        # 2. 构建bucket_to_optim_params_map，遍历optim组
+        # 2. 构建bucket_to_optim_param_groups_map，遍历optim组
         for group_idx, param_group in enumerate(optimizer.param_groups):
             for param in param_group['params']:
                 bucket = model_param_to_bucket_map[param]
-                if bucket not in bucket_to_optim_params_map:
+                if bucket not in bucket_to_optim_param_groups_map:
                     # 初始化映射
-                    bucket_to_optim_params_map[bucket] = [[] for _ in range(len(optimizer.param_groups))]
+                    bucket_to_optim_param_groups_map[bucket] = [[] for _ in range(len(optimizer.param_groups))]
                 # 将shard的参数加入到对应的组中
-                bucket_to_optim_params_map[bucket][group_idx].append(param)
+                bucket_to_optim_param_groups_map[bucket][group_idx].append(param)
                 
-        return model_param_to_bucket_map, bucket_to_optim_params_map
+        return bucket_to_optim_param_groups_map, bucket_to_model_params_map, bucket_to_main_params_map
 
     def __init__(self, optimizer: torch.optim.Optimizer,
-                 optim_config: OptimizerConfig, scaler: torch.cuda.amp.GradScaler = None, grad_clip = 0.0,
-                 model_chunks: Optional[Union[DistributedDataParallel, List[DistributedDataParallel]]] = None):
+                 optim_config: OptimizerConfig,
+                 model_chunks: Optional[Union[DistributedDataParallel, List[DistributedDataParallel]]],
+                 scaler: torch.cuda.amp.GradScaler = None, grad_clip = 0.0):
         """
+        简单的Optimizer包裹，需要和MyDDP配合使用
+        
         model_chunks可能有多个model_chunk，虚拟流水线的情况下，每个model_chunk对应一个stage
+        
+        model_chunks必须传递进来，用于合并下面代码，方便用户像原PyTorch一样使用：
+        model.zero_grad_buffer()
+        optimizer.zero_grad(set_to_none=True)
+        
+
+        overlap_optim_step需要实现：
+        1. `optimizer.bucket_to_optim_param_groups_map`, 用于optimizer.step()
+
+        2. `optimizer.bucket_to_model_params_map`, `optimizer.bucket_to_main_params_map`, 两个目的：
+
+        * `main_param.grad = model_param.main_grad.float()`，复制梯度，用于optim参数更新
+        * `model_param.copy_(main_param)`，将更新后的optim参数复制回model
         """
         
         super().__init__(optimizer, optim_config, scaler, grad_clip)
         
+        assert model_chunks is not None, "model is required!"
+        if not isinstance(model_chunks, List):
+            model_chunks = [model_chunks]
+        self.model_chunks = model_chunks
+        
         # 梯度通信后，立即进行参数更新
         if self.optim_config.overlap_optim_step:
-            assert model_chunks is not None, "model is required for overlap_optim_step"
-            if not isinstance(model_chunks, List):
-                model_chunks = [model_chunks]
             # 这个重叠必须要有overlap_grad_reduce，要不然没意义了
-            for model_chunk in model_chunks:
+            for model_chunk in self.model_chunks:
                 assert model_chunk.ddp_config.overlap_grad_reduce, "ddp_config.overlap_grad_reduce is required for overlap_optim_step"
                 
-            # overlap_optim_step需要构建self.bucket_to_optim_params_map
+            # overlap_optim_step需要构建self.bucket_to_optim_param_groups_map
             # 同时使用overlap_optim_step_wrapper包裹原hook
-            # self.bucket_to_optim_params_map = {bucket: [group_params, ...]}
+            # self.bucket_to_optim_param_groups_map = {bucket: [group_params, ...]}
             (
-                self.model_param_to_bucket_map,
-                self.bucket_to_optim_params_map
-            ) = self._build_bucket_to_optim_params_map(optimizer, model_chunks)
+                self.bucket_to_optim_param_groups_map,
+                self.bucket_to_model_params_map,
+                self.bucket_to_main_params_map
+            ) = self._build_bucket_to_optim_param_groups_map(optimizer, self.model_chunks)
                 
             # overlap_optim_step需要使用wrapper包裹原hook
             # 基于记录好的cur_comm_hook, cur_comm_hook_args, cur_comm_hook_kwargs来重新构建hook
             # 注意，这里传的是包裹后的optimizer，即self
-            for model_chunk in model_chunks:
+            for model_chunk in self.model_chunks:
                 model_chunk.register_comm_hook(overlap_optim_step_wrapper(model_chunk.cur_comm_hook, self),
                                                *model_chunk.cur_comm_hook_args, **model_chunk.cur_comm_hook_kwargs)
             
@@ -442,39 +572,73 @@ class FP32Optimizer(Z2allOptimizer):
         self._post_init()
 
     def zero_grad(self, set_to_none=True):
-        """Copied from torch.optim.optimizer"""
-        for group in self.optimizer.param_groups:
-            zero_grad_group_helper(group['params'], set_to_none)
+        """
+        1. 清零DDP中grad的buffer
+        2. 清空optim中所有参数的grad
+        """
+        # overlap_optim_step下，会在comm_hook中清零对应的bucket的grad_buffer，尽量实现重叠
+        # 1. 清零DDP中grad的buffer
+        # 将model中的初始化放进来，方便用户像原PyTorch一样使用
+        # 作用：因为DDP中自己管理grad的buffer，需要在每次forward前清零
+        # self.optim_config.overlap_optim_step and self.optim_config.overlap_zero_grad_buffer下才会按照bucket进行zero_grad_buffer
+        for model_chunk in self.model_chunks:
+            model_chunk.zero_grad_buffer(zero_grad_data=not (self.optim_config.overlap_optim_step and self.optim_config.overlap_zero_grad_buffer))
+
+        # 2. 清空全部param的grad，这个不需要分bucket进行zero，因为只是设置为None，不需要启动kernel
+        # 注意不能对self.optimizer.param_groups中的参数进行zero_grad，因为这里面的参数已经改为bucket了
+        zero_grad_group_helper(self.all_params_for_unscaling_grads, set_to_none)
+        
+        self.reset()  # 记得清零，实现在Z2allOptimizer中
     
-    def _copy_model_main_grads_to_grads(self):
+    def _copy_model_main_grads_to_grads(self, is_bucket_step=False, bucket=None):
         """
         Copy model main_grad to grad.
         1. 因为累加时是对main_grad进行的，所以这里需要将main_grad拷贝到grad
         2. 为什么要对main_grad累加，而不是直接对grad
           因为对grad进行了内存管理（放在main_grad中），来减少内存碎片
+          
+        这里会有两种行为：
+        1. overlap_optim_step=False，拷贝全部参数
+        2. overlap_optim_step=True, is_bucket_step=True，只需要拷贝对应的bucket
         """
-        for param_group in self.optimizer.param_groups:
-            for param in param_group['params']:
-                param.grad = param.main_grad
+        if not is_bucket_step:
+            # 外部有条件：
+            # (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step)
+            
+            for param_group in self.optimizer.param_groups:
+                for param in param_group['params']:
+                    param.grad = param.main_grad
+        else:
+            for param_idx in range(len(self.bucket_to_model_params_map[bucket])):
+                self.bucket_to_main_params_map[bucket][param_idx].grad = self.bucket_to_model_params_map[bucket][param_idx].main_grad
 
     @torch.no_grad()
-    def step(self):
-        # Copy model main_grad to grad.
-        self._copy_model_main_grads_to_grads()
+    def step(self, is_bucket_step=False, bucket=None):
+        """
+        is_bucket_step, bucket用于overlap_optim_step
         
-        if self.scaler is not None:
-            # unscale，并且裁剪梯度
+        1. 更新参数，包括复制梯度到优化器的梯度中，更新参数。
+            非overlap_optim_step，直接更新所有参数
+            overlap_optim_step，只有当is_bucket_step=True时，才会触发更新（在overlap_optim_step_wrapper包裹的comm_hook中进行更新）
+            
+        2. 等待梯度同步完成，如果有overlap_optim_step，则等待参数更新完成
+            是全部参数，进行等待，即在comm_hook中不会等，只会所有触发后才会等
+        """
+        if (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step):
+            # Copy model main_grad to grad.
+            self._copy_model_main_grads_to_grads(is_bucket_step, bucket)
+            
+            # FP32不需要scaler
+            # 1. 裁剪梯度，更新参数
             if self.grad_clip != 0.0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.all_params_for_unscaling_grads, self.grad_clip)
-            # step the optimizer and scaler if training in fp16
-            self.scaler.step(self.optimizer)  # 若没有unscale，进行unscale并且更新
-            self.scaler.update()  # 更新scaler的缩放因子
-        else:
-            # 裁剪梯度
-            if self.grad_clip != 0.0:
-                torch.nn.utils.clip_grad_norm_(self.all_params_for_unscaling_grads, self.grad_clip)
+                torch.nn.utils.clip_grad_norm_(self._collect_main_params_for_unscaling_grads(), self.grad_clip)
             self.optimizer.step()
+        
+        if not is_bucket_step:
+            # 每个iter只会调用一次
+            # 2. 等待梯度同步完成，如果有overlap_optim_step，则等待参数更新完成
+            for model_chunk in self.model_chunks:
+                model_chunk.finish_grad_sync()
 
     def state_dict(self):
         return self.optimizer.state_dict()

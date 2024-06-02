@@ -37,13 +37,15 @@ ctx = (
     else torch.autocast(device_type=device_type, dtype=ptdtype)
 )
 
+torch.manual_seed(42)
+
 seq_len = 1024
 input_dim = 1024 * 4
 hidden_dim = 1024 * 4
 output_dim = 1024 * 4
 
 input_data = torch.randn(seq_len, input_dim).to(device).to(ptdtype)
-label_data = torch.randn(seq_len, output_dim).to(device).to(ptdtype)
+label_data = input_data * 2 + 1
 
 model = nn.Sequential(
     nn.Linear(input_dim, hidden_dim),
@@ -73,46 +75,41 @@ model = MyDDP(model,
               data_parallel_group=process_group,
               disable_bucketing=False)
 
-optim_config = OptimizerConfig(overlap_optim_step=True)
-optimizer = FP32Optimizer(optimizer, optim_config, scaler=scaler, grad_clip=grad_clip, model_chunks=model)
+optim_config = OptimizerConfig(
+    overlap_optim_step=True,
+    overlap_zero_grad_buffer=True)
+optimizer = FP32Optimizer(optimizer, optim_config, model, scaler=scaler, grad_clip=grad_clip)
 
 # profile
-with torch.profiler.profile(
-    activities=[
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA],
-    schedule=torch.profiler.schedule(
-        wait=0,
-        warmup=2,
-        active=2,
-        repeat=1),
-    on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_my_ddp/01_FP32Optim_overlap_optim_step',
-                                                            worker_name=f'rank{ddp_rank}'),
-    record_shapes=True,
-    profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
-    with_stack=True
-) as p:
+# with torch.profiler.profile(
+#     activities=[
+#         torch.profiler.ProfilerActivity.CPU,
+#         torch.profiler.ProfilerActivity.CUDA],
+#     schedule=torch.profiler.schedule(
+#         wait=0,
+#         warmup=2,
+#         active=2,
+#         repeat=1),
+#     on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_my_ddp/01_FP32Optim_overlap_optim_step_fix_7',
+#                                                             worker_name=f'rank{ddp_rank}'),
+#     record_shapes=True,
+#     profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
+#     with_stack=True
+# ) as p:
     
-    for i in range(6):
-        model.zero_grad_buffer()
-        optimizer.zero_grad(set_to_none=True)
-        
-        with ctx:
-            output = model(input_data)
-            loss = loss_fn(output, label_data)
-        scaler.scale(loss).backward()
-        
-        # 等待梯度同步完成
-        # 如果有overlap_optim_step，则等待参数更新完成
-        model.finish_grad_sync()
-        
-        if not optim_config.overlap_optim_step:
-            # 更新参数，若需要则可以进行scale和grad_clip
-            optimizer.step()
-        
-        if master_process:
-            print(f"iter {i}, loss: {loss:.4f}, scale: {scaler.get_scale()}")
-        
-        torch.cuda.synchronize()
-        
-        p.step()
+for i in range(20):
+    with ctx:
+        output = model(input_data)
+        loss = loss_fn(output, label_data)
+    scaler.scale(loss).backward()
+    
+    optimizer.step()  # 内部自动根据overlap_optim_step来选择是否要更新参数
+    
+    optimizer.zero_grad(set_to_none=True)  # 内部自动根据overlap_optim_step来选择是否要清空梯度
+
+    torch.cuda.synchronize()
+    
+    if master_process:
+        print(f"iter {i}, loss: {loss:.4f}, scale: {scaler.get_scale()}")
+    
+        # p.step()

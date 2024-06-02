@@ -429,6 +429,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
         opt_group_ranges: List,
         model_param_to_bucket_map: Dict[torch.nn.Parameter, Bucket],
+        optim_config: OptimizerConfig,
     ):
         """
         Create main parameter groups needed for the optimizer step.
@@ -459,7 +460,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_fp32_from_float16_groups = []
         
         # bucket和shard optim param_groups的映射关系
-        bucket_to_optim_params_map = {}
+        bucket_to_optim_param_groups_map = {}
+        # 同时构建bucket_to_shard_model_params_map，bucket_to_shard_main_params_map
+        bucket_to_model_params_map = {}
+        bucket_to_shard_model_params_map = {}
+        bucket_to_shard_main_params_map = {}
 
         # Allocate (or slice) each group's param shard.
         # opt_group_ranges, 某个dp rank所包含的参数组，其中的参数还没有进行shard
@@ -531,13 +536,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         'Received {}'.format(model_param.type())
                     )
 
-                # bucket和shard optim param_groups的映射关系
-                bucket = model_param_to_bucket_map[model_param]
-                if bucket not in bucket_to_optim_params_map:
-                    # 初始化映射
-                    bucket_to_optim_params_map[bucket] = [[] for _ in range(len(opt_group_ranges))]
-                # 将shard的参数加入到对应的组中
-                bucket_to_optim_params_map[bucket][group_idx].append(shard_main_param)
+                # overlap_optim_step下，才会构建bucket_to_optim_param_groups_map
+                if optim_config.overlap_optim_step:
+                    # bucket和shard optim param_groups的映射关系
+                    bucket = model_param_to_bucket_map[model_param]
+                    if bucket not in bucket_to_optim_param_groups_map:
+                        # 初始化映射
+                        bucket_to_optim_param_groups_map[bucket] = [[] for _ in range(len(opt_group_ranges))]
+                    # 将shard的参数加入到对应的组中
+                    bucket_to_optim_param_groups_map[bucket][group_idx].append(shard_main_param)
+                    
+                    # 同时构建bucket_to_shard_model_params_map，bucket_to_shard_main_params_map
+                    if bucket not in bucket_to_shard_model_params_map:
+                        bucket_to_model_params_map[bucket] = []
+                        bucket_to_shard_model_params_map[bucket] = []
+                        bucket_to_shard_main_params_map[bucket] = []
+                    bucket_to_model_params_map[bucket].append(model_param)
+                    bucket_to_shard_model_params_map[bucket].append(shard_model_param)
+                    bucket_to_shard_main_params_map[bucket].append(shard_main_param)
 
             # Update optimizer's params.
             group_range["orig_group"]["params"] = [
@@ -551,7 +567,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             shard_float16_groups,
             shard_fp32_groups,
             shard_fp32_from_float16_groups,
-            bucket_to_optim_params_map,
+            bucket_to_optim_param_groups_map,
+            bucket_to_model_params_map,
+            bucket_to_shard_model_params_map,
+            bucket_to_shard_main_params_map
         )
 
     def __init__(
@@ -604,20 +623,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #     optimizer, Adam
         # ), "Only Adam currently supported, due to checkpointing requirements."
         
+        assert model_chunks is not None, "model is required!"
         if not isinstance(model_chunks, List):
             model_chunks = [model_chunks]
+        self.model_chunks = model_chunks
         
         if self.optim_config.overlap_optim_step:
             # overlap_optim_step需要使用wrapper包裹原hook
             # 基于记录好的cur_comm_hook, cur_comm_hook_args, cur_comm_hook_kwargs来重新构建hook
             # 注意，这里传的是包裹后的optimizer，即self
-            for model_chunk in model_chunks:
+            for model_chunk in self.model_chunks:
                 model_chunk.register_comm_hook(overlap_optim_step_wrapper(model_chunk.cur_comm_hook, self),
                                                *model_chunk.cur_comm_hook_args, **model_chunk.cur_comm_hook_kwargs)
         
         # Model grad buffer ranges.
         self.per_model_buffers = {}
-        for model_idx, model_chunk in enumerate(model_chunks):
+        for model_idx, model_chunk in enumerate(self.model_chunks):
             if hasattr(model_chunk, 'buffers'):
                 self.per_model_buffers[model_idx] = model_chunk.buffers
         self.buffers = list(itertools.chain(*self.per_model_buffers.values()))
@@ -689,16 +710,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # 1. 原模型参数，没进行shard，在opt_group_ranges[group_id]["param"]中
         # 2. 转换为f32的参数，进行了shard，在opt_group_ranges[group_id]["orig_group"]["params"]中
         #* 同时构建bucket和shard optim param_groups的映射关系，用于overlap_optim_step
-        #* self.bucket_to_optim_params_map = {bucket: [group_params, ...]}
+        #* self.bucket_to_optim_param_groups_map = {bucket: [group_params, ...]}
+        #* self.bucket_to_model_params_map, 用于overlap_optim_step中找到对应model参数，然后取其中的shard_main_grad复制到main_param.grad中
+        #* self.bucket_to_shard_model_params_map, self.bucket_to_shard_main_params_map对应的是shard的参数
         (
             self.model_float16_groups,
             self.model_fp32_groups,
             self.shard_float16_groups,
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
-            self.bucket_to_optim_params_map,
+            self.bucket_to_optim_param_groups_map,
+            self.bucket_to_model_params_map,
+            self.bucket_to_shard_model_params_map,
+            self.bucket_to_shard_main_params_map,
         ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, self.model_param_to_bucket_map
+            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, self.model_param_to_bucket_map, self.optim_config
         )
 
         # Now construct data structures to manage all-gather handles.
@@ -738,9 +764,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.overlap_param_gather:
             self.enable_pre_hook()
 
-        # optim参数更新成功后，才会进行all-gather
-        self.update_successful = False
-
         # Update optimizer groups.
         # - Also, leverage state_dict() and load_state_dict() to
         #   recast preexisting per-param state tensors.
@@ -753,8 +776,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # TODO_MY 在optim的state非空时好像有问题，因为torch的otim的state_dcit()要求state和param_groups对应的参数一致
         # TODO_MY 但是这里的param_groups中的参数是shard的，而state中的参数是原始的，所以会有问题
         # self.optimizer.load_state_dict(self.optimizer.state_dict())  # 一开始，optim上param对应的优化器状态还是空的，所以应该不需要这一步
-        
-        
         
         # 收集所有需要unscale梯度的参数，用于grad_clip
         self._post_init()
@@ -1265,8 +1286,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             set_to_none (bool): if true, set grads to None.
         """
-        # TODO_MY 这里应该只需要对self.shard_fp32_from_float16_groups的grad进行zero?
-        # 因为其他四个的grad都是model的grad，并且前面已经对model grad进行了zero
+        # overlap_optim_step下，会在comm_hook中清零对应的bucket的grad_buffer，尽量实现重叠
+        # 1. 清零DDP中grad的buffer
+        # 将model中的初始化放进来，方便用户像原PyTorch一样使用
+        # 作用：因为DDP中自己管理grad的buffer，需要在每次forward前清零
+        # self.optim_config.overlap_optim_step and self.optim_config.overlap_zero_grad_buffer下才会按照bucket进行zero_grad_buffer
+        for model_chunk in self.model_chunks:
+            model_chunk.zero_grad_buffer(zero_grad_data=not self.optim_config.overlap_optim_step or not self.optim_config.overlap_zero_grad_buffer)
+            
+        # 2. 清空全部param的grad，这个不需要分bucket进行zero，因为只是设置为None，不需要启动kernel
+        #   和上面的不一样，这里是清空，即设置为None，不需要启动kernel，也需要清空model中的param.grad
         for groups in (
             self.model_float16_groups,
             self.model_fp32_groups,
@@ -1276,6 +1305,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ):
             for group in groups:
                 zero_grad_group_helper(group, set_to_none)
+            
+        self.reset()  # 记得清零，实现在Z2allOptimizer中
 
         # If overlapping param all-gather with forward compute, launch all-gather
         # for first accessed bucket here before forward compute is initiated.
@@ -1436,18 +1467,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if next_all_gather_handle_index < self.num_all_gather_handles:
                 self._dispatch_gather_model_params(next_all_gather_handle_index)
 
-    def _collect_main_params_for_unscaling_grads(self):
-        """
-        收集需要unscale梯度的参数，即需要更新的参数，后续将其中的grads进行unscale
-        """
-        """
-        Note: this should be equivalent to the float-16 optimizer's method,
-        but written differently, so the two should be combined.
-        """
-        return [
-            param.grad.data for group in self.optimizer.param_groups for param in group["params"]
-        ]
-
     def _get_model_and_main_params_data_float16(self):
         """
         Get aligned list of model and main params.
@@ -1462,63 +1481,94 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 main_data.append(main_param.data)
         return model_data, main_data
 
-    def _copy_model_grads_to_main_grads(self):
+    def _copy_model_grads_to_main_grads(self, is_bucket_step=False, bucket=None):
         """
         Copy model grads to main grads.
 
         Since this step follows a reduce-scatter through the DDP's grad
         buffer, this method is responsible for copying the updated grads
         from the grad buffer to the main shard's grad field.
+        
+        overlap_optim_step=True, is_bucket_step=True，只需要拷贝对应的bucket
         """
+        if not is_bucket_step:
+            # 外部有条件：
+            # (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step)
+            
+            # Utility method for copying group grads.
+            def copy_group_grads(model_groups, shard_main_groups):
+                for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                    for model_param, shard_main_param in zip(model_group, shard_main_group):
 
-        # Utility method for copying group grads.
-        def copy_group_grads(model_groups, shard_main_groups):
-            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
-                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                        param_range_map = self._get_model_param_range_map(model_param)
+                        param_range = param_range_map["param"]
+                        assert param_range.size == shard_main_param.nelement()
 
-                    param_range_map = self._get_model_param_range_map(model_param)
-                    param_range = param_range_map["param"]
-                    assert param_range.size == shard_main_param.nelement()
+                        model_grad = model_param.main_grad
+                        shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
+                        shard_main_param.grad = shard_model_grad.float()  # 不能复制后就直接设置model_param.grad=None，因为后面可能还会用到
 
+            # Copy model groups to shard groups.
+            copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)  # 不同param
+            copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)  # 同一个param，将同一个参数的main_grad复制到shard_grad中
+        else:
+            # overlap_optim_step下，只对bucket对应的grad进行拷贝
+            # 对FP32和FP16都是一样的操作，如果是FP32，则float()也不会创建新的内存空间，所以可以这样做
+            # 注意，这里要取model_param，然后将其中的main_grad进行分片，再复制给shard_main_param.grad，因为grad是跟着完整参数走的，shard_model_param中grad=None
+            for model_param, shard_main_param in zip(self.bucket_to_model_params_map[bucket], self.bucket_to_shard_main_params_map[bucket]):
+                param_range_map = self._get_model_param_range_map(model_param)
+                param_range = param_range_map["param"]
+                assert param_range.size == shard_main_param.nelement()
+
+                if hasattr(model_param, 'main_grad'):
                     model_grad = model_param.main_grad
-                    shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
-                    shard_main_param.grad = shard_model_grad.float()
+                else:
+                    if model_param.grad is not None:
+                        model_grad = model_param.grad
+                shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
+                shard_main_param.grad = shard_model_grad.float()
+            
 
-        # Copy model groups to shard groups.
-        copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)  # 不同param
-        copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)  # 同一个param，将同一个参数的main_grad复制到shard_grad中
-
-    def _copy_main_params_to_model_params(self):
+    def _copy_main_params_to_model_params(self, is_bucket_step=False, bucket=None):
         """
         Copy main params to model params.
 
         Since this step is followed by an all-gather through the DDP's grad
         buffer, this method is responsible for copying the updated params
         from the main shards into the correct position in the grad buffer.
+        
+        overlap_optim_step=True, is_bucket_step=True，只需要拷贝对应的bucket
         """
+        if not is_bucket_step:
+            # 外部有条件：
+            # (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step)
+            
+            # Utility method for copying group params.
+            def copy_group_params(shard_main_groups, model_groups):
+                for shard_main_group, model_group in zip(shard_main_groups, model_groups):
+                    for shard_main_param, model_param in zip(shard_main_group, model_group):
 
-        # Utility method for copying group params.
-        def copy_group_params(shard_main_groups, model_groups):
-            for shard_main_group, model_group in zip(shard_main_groups, model_groups):
-                for shard_main_param, model_param in zip(shard_main_group, model_group):
+                        param_range_map = self._get_model_param_range_map(model_param)
+                        world_range = param_range_map["gbuf_world_in_bucket"]
 
-                    param_range_map = self._get_model_param_range_map(model_param)
-                    world_range = param_range_map["gbuf_world_in_bucket"]
+                        assert world_range.size == shard_main_param.nelement()
 
-                    assert world_range.size == shard_main_param.nelement()
+                        gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                        model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
 
-                    gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
-                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+                        shard_model_param = model_param_buffer.view(-1)[
+                            world_range.start : world_range.end
+                        ]
 
-                    shard_model_param = model_param_buffer.view(-1)[
-                        world_range.start : world_range.end
-                    ]
+                        shard_model_param.data.copy_(shard_main_param.data)
 
-                    shard_model_param.data.copy_(shard_main_param)
-
-        # Copy shard groups to model groups.
-        copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
-        # copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)  # 空间共享，不需要复制
+            # Copy shard groups to model groups.
+            copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+            # copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)  # 空间共享，不需要复制
+        else:
+            # overlap_optim_step下，只对bucket对应的param进行拷贝
+            for shard_main_param, shard_model_param in zip(self.bucket_to_shard_main_params_map[bucket], self.bucket_to_shard_model_params_map[bucket]):
+                shard_model_param.data.copy_(shard_main_param.data)
 
     # TODO_MY 微调用
     # def _copy_model_params_to_main_params(self):
@@ -1561,13 +1611,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self._dispatch_gather_model_params(all_gather_handle_index, force_sync=force_sync)
 
     @torch.no_grad()
-    def step(self):
+    def step(self, is_bucket_step=False, bucket=None):
         """
         Step optimizer.
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
-        self.update_successful = super().step()  # 更新成功才会进行后续的all-gather
+        # 更新成功才会进行后续的all-gather，里面会更新self.update_successful
+        # 里面会进行optim_step的同步，确保所有的grad都已经更新，然后zero_grad中进行下一步的all-gather
+        super().step(is_bucket_step, bucket)
 
         # If not overlapping all-gather for parameters, launch synchronous all-gather
         # communication calls here. If overlapping all-gather for parameters, the following
@@ -1575,4 +1627,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # asynchronously in the next optimizer.zero_grad() call and subsequent all-gathers
         # are launched in the forward pre-hook.
         # 若没用overlap，则在这里发起同步的all-gather（在update_successful=True的情况下）
-        self._reset_metadata_and_sync_gather_all_model_params(force_sync=False)
+        # 若使用overlap，则为no-op
+        # 同时第一次all-gather会在下一个optimizer.zero_grad()中发起，后续的all-gather会在forward pre-hook中发起
+        # is_bucket_step下，只在手动调用时触发
+        if not is_bucket_step:
+            self._reset_metadata_and_sync_gather_all_model_params(force_sync=False)

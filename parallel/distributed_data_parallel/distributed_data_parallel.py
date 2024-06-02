@@ -131,6 +131,13 @@ class DistributedDataParallel(nn.Module):
         self.buffers = allocate_buffers_for_parameters(
             dense_params, self.data_parallel_group,
         )
+        
+        # 总共的bucket数量
+        # 用于overlap_optim_step中，bucket完成的数量，从而判断是否到了最后一个bucket
+        # 只有在scaler时用到
+        self.bucket_count = 0
+        for buffer in self.buffers:
+            self.bucket_count += len(buffer.buckets)
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
@@ -257,16 +264,18 @@ class DistributedDataParallel(nn.Module):
         for buffer in self.buffers:
             buffer.finish_grad_sync()
 
-    def zero_grad_buffer(self):
+    def zero_grad_buffer(self, zero_grad_data: bool = True):
         """
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
+        
+        overlap_optim_step会用到zero_grad_data=False，因为overlap_optim_step会自动清空梯度
         """
         for param in self.module.parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
         for buffer in self.buffers:
-            buffer.reset()
+            buffer.reset(zero_grad_data)
 
     def broadcast_params(self):
         """
