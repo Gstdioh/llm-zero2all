@@ -137,17 +137,24 @@ class MixedPrecisionOptimizer(Z2allOptimizer, ABC):
         
         is_bucket_step, bucket用于overlap_optim_step
         
-        1. 更新参数，包括复制梯度到优化器的梯度中，更新参数，将optim参数覆盖到模型参数。
+        1. 若overlap_optim_step=False，等待梯度同步完成，然后才能进行更新
+        
+        2. 更新参数，包括复制梯度到优化器的梯度中，更新参数，将optim参数覆盖到模型参数。
             非overlap_optim_step，直接更新所有参数
             overlap_optim_step，只有当is_bucket_step=True时，才会触发更新（在overlap_optim_step_wrapper包裹的comm_hook中进行更新）
-            
-        2. 等待梯度同步完成，如果有overlap_optim_step，则等待参数更新完成
-            是全部参数，进行等待，即在comm_hook中不会等，只会所有触发后才会等
         
+        3. 若overlap_optim_step=True and not is_bucket_step，则等待参数更新完成
+            是全部参数，进行等待，即在comm_hook中不会等，只会所有触发后才会等
+            
         Return:
         update_successful (bool): True if the update was successful.
             若梯度中包含Nan，则不进行更新，逻辑在scaler.step中
         """
+        if not self.optim_config.overlap_optim_step:
+            # 1. 若overlap_optim_step=False，等待梯度同步完成
+            for model_chunk in self.model_chunks:
+                model_chunk.finish_grad_sync()
+                
         if (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step):
             # Copy gradients from model params to main params.
             self._copy_model_grads_to_main_grads(is_bucket_step, bucket)
@@ -190,10 +197,11 @@ class MixedPrecisionOptimizer(Z2allOptimizer, ABC):
                 # 更新scaler的缩放因子，需要放在最后面，每个bucket更新时不需要对scaler进行更新，只需要最后更新一次即可
                 # 为了进行下一个iter，会清空scale中optim的状态
                 self.scaler.update()
-            
-            # 2. 等待梯度同步完成，如果有overlap_optim_step，则等待参数更新完成
-            for model_chunk in self.model_chunks:
-                model_chunk.finish_grad_sync()
+        
+            if self.optim_config.overlap_optim_step:
+                # 等待参数更新完成
+                for model_chunk in self.model_chunks:
+                    model_chunk.finish_grad_sync()
             
 
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
@@ -617,26 +625,32 @@ class FP32Optimizer(Z2allOptimizer):
         """
         is_bucket_step, bucket用于overlap_optim_step
         
-        1. 更新参数，包括复制梯度到优化器的梯度中，更新参数。
+        1. 若overlap_optim_step=False，等待梯度同步完成，然后才能进行更新
+        
+        2. 更新参数，包括复制梯度到优化器的梯度中，更新参数。
             非overlap_optim_step，直接更新所有参数
             overlap_optim_step，只有当is_bucket_step=True时，才会触发更新（在overlap_optim_step_wrapper包裹的comm_hook中进行更新）
             
-        2. 等待梯度同步完成，如果有overlap_optim_step，则等待参数更新完成
+        3. 若overlap_optim_step=True and not is_bucket_step，则等待参数更新完成
             是全部参数，进行等待，即在comm_hook中不会等，只会所有触发后才会等
         """
+        if not self.optim_config.overlap_optim_step:
+            # 1. 若overlap_optim_step=False，等待梯度同步完成
+            for model_chunk in self.model_chunks:
+                model_chunk.finish_grad_sync()
+                
         if (not self.optim_config.overlap_optim_step) or (self.optim_config.overlap_optim_step and is_bucket_step):
             # Copy model main_grad to grad.
             self._copy_model_main_grads_to_grads(is_bucket_step, bucket)
             
             # FP32不需要scaler
-            # 1. 裁剪梯度，更新参数
+            # 2. 裁剪梯度，更新参数
             if self.grad_clip != 0.0:
                 torch.nn.utils.clip_grad_norm_(self._collect_main_params_for_unscaling_grads(), self.grad_clip)
             self.optimizer.step()
         
-        if not is_bucket_step:
-            # 每个iter只会调用一次
-            # 2. 等待梯度同步完成，如果有overlap_optim_step，则等待参数更新完成
+        if self.optim_config.overlap_optim_step and not is_bucket_step:
+            # 3. 等待参数更新完成
             for model_chunk in self.model_chunks:
                 model_chunk.finish_grad_sync()
 

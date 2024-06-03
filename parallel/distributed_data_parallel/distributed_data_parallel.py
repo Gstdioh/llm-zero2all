@@ -79,14 +79,14 @@ class DistributedDataParallel(nn.Module):
         self.param_to_buffer = {}
 
         # Group parameters by their gradient type.
-        param_to_name = {}
+        self.param_to_name = {}
         dense_params = []
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
                 continue
 
             param.grad_added_to_main_grad = False
-            param_to_name[param] = name
+            self.param_to_name[param] = name
 
             dense_params.append(param)
 
@@ -118,7 +118,7 @@ class DistributedDataParallel(nn.Module):
                         params,
                         data_parallel_group,
                         self.bucket_size,
-                        param_to_name,
+                        self.param_to_name,
                     )
                 )
                 for param in params:
