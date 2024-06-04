@@ -8,6 +8,7 @@ from apex.multi_tensor_apply import multi_tensor_applier
 
 from optimizer import OptimizerConfig
 from parallel.distributed_data_parallel import DistributedDataParallel
+from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import stream_wrapper
 from parallel.distributed_data_parallel.ddp_comm_hooks.overlap_optim_step_hooks import overlap_optim_step_wrapper
 from parallel import Bucket
 
@@ -257,7 +258,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             # 基于记录好的cur_comm_hook, cur_comm_hook_args, cur_comm_hook_kwargs来重新构建hook
             # 注意，这里传的是包裹后的optimizer，即self
             for model_chunk in model_chunks:
-                model_chunk.register_comm_hook(overlap_optim_step_wrapper(model_chunk.cur_comm_hook, self),
+                model_chunk.register_comm_hook(stream_wrapper(overlap_optim_step_wrapper(model_chunk.cur_comm_hook, self)),
                                                *model_chunk.cur_comm_hook_args, **model_chunk.cur_comm_hook_kwargs)
 
         # Handle main parameters.
@@ -410,6 +411,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     else:
                         if model_param.grad is not None:
                             main_param.grad = model_param.grad.float()
+                    if not self.optim_config.grad_scaling_before_comm:
+                        main_param.grad.mul_(self.optim_config.grad_scaling_factor)
 
                     # Safe to deallocate model's grad/main_grad after copying.
                     # (If using contiguous buffers, main_grad's memory should
@@ -429,6 +432,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 else:
                     if model_param.grad is not None:
                         main_param.grad = model_param.grad.float()
+                if not self.optim_config.grad_scaling_before_comm:
+                    main_param.grad.mul_(self.optim_config.grad_scaling_factor)
                         
                 model_param.grad = None
     
@@ -574,7 +579,7 @@ class FP32Optimizer(Z2allOptimizer):
             # 基于记录好的cur_comm_hook, cur_comm_hook_args, cur_comm_hook_kwargs来重新构建hook
             # 注意，这里传的是包裹后的optimizer，即self
             for model_chunk in self.model_chunks:
-                model_chunk.register_comm_hook(overlap_optim_step_wrapper(model_chunk.cur_comm_hook, self),
+                model_chunk.register_comm_hook(stream_wrapper(overlap_optim_step_wrapper(model_chunk.cur_comm_hook, self)),
                                                *model_chunk.cur_comm_hook_args, **model_chunk.cur_comm_hook_kwargs)
             
         # 收集所有需要unscale梯度的参数，用于grad_clip
@@ -617,9 +622,13 @@ class FP32Optimizer(Z2allOptimizer):
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
                     param.grad = param.main_grad
+                    if not self.optim_config.grad_scaling_before_comm:
+                        param.grad.mul_(self.optim_config.grad_scaling_factor)
         else:
             for param_idx in range(len(self.bucket_to_model_params_map[bucket])):
                 self.bucket_to_main_params_map[bucket][param_idx].grad = self.bucket_to_model_params_map[bucket][param_idx].main_grad
+                if not self.optim_config.grad_scaling_before_comm:
+                    self.bucket_to_main_params_map[bucket][param_idx].grad.mul_(self.optim_config.grad_scaling_factor)
 
     @torch.no_grad()
     def step(self, is_bucket_step=False, bucket: Bucket = None):

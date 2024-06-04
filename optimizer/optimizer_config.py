@@ -8,6 +8,30 @@ class OptimizerConfig:
     """Configuration for Optimizer."""
 
     ##############
+    # Precision
+    ##############
+    precision_dtype: str = "bfloat16"
+    """Train with precision_dtype mixed precision training. Defaults to False."""
+    
+    ###############
+    # grad scaling
+    ###############
+    grad_scaling_before_comm: bool = True
+    """
+    是否在通信前进行梯度缩放，建议bfloat16下设为False，在最后除以值，减少精度损失
+    
+    False时，grad comm时不会scale，会在optim.step()中的前一刻scale，减少精度损失
+    放在了复制梯度的操作中，_copy_model_grads_to_main_grads()
+    """
+    
+    grad_scaling_factor: float = 1.0
+    """
+    相应的梯度缩放因子，grad_scaling_before_comm=False 下通常为 1.0 / (tokens_per_iter * ddp_world_size)
+    
+    grad_scaling_before_comm=True时，不起作用
+    """
+
+    ##############
     # overlap_optim_step
     ##############
     overlap_optim_step: bool = False
@@ -42,12 +66,6 @@ class OptimizerConfig:
     若为False，则会对整个buffer进行清零（只启动一次kernel，可能更快）
     若为True，则会对每个bucket的buffer一个一个进行清零
     """
-
-    ##############
-    # Precision
-    ##############
-    precision_dtype: str = "bfloat16"
-    """Train with precision_dtype mixed precision training. Defaults to False."""
 
     #######################
     # Distributed optimizer

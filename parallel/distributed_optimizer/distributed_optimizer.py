@@ -12,6 +12,7 @@ import torch.distributed
 from apex.optimizers import FusedAdam as Adam
 
 from parallel.distributed_data_parallel import ParamAndGradBuffer, Bucket, DistributedDataParallel
+from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import stream_wrapper
 from parallel.distributed_data_parallel.ddp_comm_hooks.overlap_optim_step_hooks import overlap_optim_step_wrapper
 from optimizer import OptimizerConfig, MixedPrecisionOptimizer, zero_grad_group_helper
 
@@ -633,7 +634,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # 基于记录好的cur_comm_hook, cur_comm_hook_args, cur_comm_hook_kwargs来重新构建hook
             # 注意，这里传的是包裹后的optimizer，即self
             for model_chunk in self.model_chunks:
-                model_chunk.register_comm_hook(overlap_optim_step_wrapper(model_chunk.cur_comm_hook, self),
+                model_chunk.register_comm_hook(stream_wrapper(overlap_optim_step_wrapper(model_chunk.cur_comm_hook, self)),
                                                *model_chunk.cur_comm_hook_args, **model_chunk.cur_comm_hook_kwargs)
         
         # Model grad buffer ranges.
@@ -1506,7 +1507,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         model_grad = model_param.main_grad
                         shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
-                        shard_main_param.grad = shard_model_grad.float()  # 不能复制后就直接设置model_param.grad=None，因为后面可能还会用到
+                        shard_main_param.grad = shard_model_grad.float()  # 不能复制后就直接设置model_param.grad=None，因为model_param被多个bucket分割
+                        if not self.optim_config.grad_scaling_before_comm:
+                            shard_main_param.grad.mul_(self.optim_config.grad_scaling_factor)
 
             # Copy model groups to shard groups.
             copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)  # 不同param
@@ -1527,6 +1530,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         model_grad = model_param.grad
                 shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
                 shard_main_param.grad = shard_model_grad.float()
+                if not self.optim_config.grad_scaling_before_comm:
+                    shard_main_param.grad.mul_(self.optim_config.grad_scaling_factor)
             
 
     def _copy_main_params_to_model_params(self, is_bucket_step=False, bucket: Bucket = None):

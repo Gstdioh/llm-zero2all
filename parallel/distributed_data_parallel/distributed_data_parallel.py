@@ -11,7 +11,7 @@ import torch.nn as nn
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import ParamAndGradBuffer
 from distributed import get_global_rank
-from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import all_reduce_hook, reduce_scatter_hook
+from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import all_reduce_hook, reduce_scatter_hook, stream_wrapper
 
 
 logger = getLogger(__name__)
@@ -187,9 +187,9 @@ class DistributedDataParallel(nn.Module):
         # 初始化通信hook，其中会保存通信hook，和相应的状态
         # Use async_op only when overlap_grad_reduce is True.
         if self.ddp_config.use_distributed_optimizer:
-            self.register_comm_hook(reduce_scatter_hook, self.data_parallel_group, async_op=self.ddp_config.overlap_grad_reduce)
+            self.register_comm_hook(stream_wrapper(reduce_scatter_hook), self.data_parallel_group, async_op=self.ddp_config.overlap_grad_reduce)
         else:
-            self.register_comm_hook(all_reduce_hook, self.data_parallel_group, async_op=self.ddp_config.overlap_grad_reduce)
+            self.register_comm_hook(stream_wrapper(all_reduce_hook), self.data_parallel_group, async_op=self.ddp_config.overlap_grad_reduce)
 
     def forward(self, *inputs, **kwargs):
         """

@@ -108,8 +108,15 @@ class Bucket:
     
     def set_buffer(self, tensor: torch.Tensor) -> None:
         """
-        修改bucket的grad buffer的值，必须为1d的tensor
+        修改bucket的grad buffer的值，不会改变buffer的数据类型
+        
+        tensor和buffer的元素总数一样即可（不要求形状相同）
         """
+        if self.grad_data.dtype != tensor.dtype:
+            logger.warning("注意，Bucket.set_buffer(tensor)只能修改buffer的值（不会改变buffer的数据类型），\
+                            若要修改buffer的数据类型（如fp16_compress_wrapper_hook下），\
+                            请使用change_grad_buffer_dtype(new_grad_type)，记得要恢复")
+        
         self.grad_data.copy_(tensor)
     
     def param_buffer(self) -> torch.Tensor:
@@ -120,7 +127,9 @@ class Bucket:
     
     def set_param_buffer(self, tensor: torch.Tensor) -> None:
         """
-        修改bucket的param buffer的值，必须为1d的tensor
+        修改bucket的param buffer的值，不会改变buffer的数据类型
+        
+        tensor和buffer的元素总数一样即可（不要求形状相同）
         """
         self.param_data.copy_(tensor)
         
@@ -152,7 +161,7 @@ class Bucket:
     
     def change_grad_buffer_dtype(self, new_grad_dtype) -> None:
         """
-        修改grad buffer的数据类型，需要保存之前的数据
+        修改grad buffer的数据类型，需要保存之前的数据，后面必须使用restore_grad_buffer_dtype()恢复
         """
         self.raw_grad_data = self.grad_data
         self.grad_data = self.grad_data.to(new_grad_dtype)

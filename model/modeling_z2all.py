@@ -823,6 +823,8 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
         # 是否共享参数
         if config.tie_word_embeddings:
             self.model.embed_tokens.weight = self.lm_head.weight
+            
+        self.loss_reduction = config.loss_reduction
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -890,7 +892,7 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
                     loss_fn = fused_cross_entropy
                 else:
                     loss_fn = F.cross_entropy
-            loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100, reduction="mean")
+            loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100, reduction=self.loss_reduction)
 
         return {
             "loss": loss,

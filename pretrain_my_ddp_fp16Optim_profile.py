@@ -468,7 +468,7 @@ if ddp:
         # 若没有resume，则初始化PowerSGDState
         if powerSGD_state is None:
             powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=50, 
+                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
                                 min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
         if use_bf16_compress_hook:
             cur_comm_hook = bf16_compress_wrapper(powerSGD_hook)
@@ -487,54 +487,54 @@ if ddp:
         
 # -----------------------------------------------------------------------------
 # profile
-# with torch.profiler.profile(
-#     activities=[
-#         torch.profiler.ProfilerActivity.CPU,
-#         torch.profiler.ProfilerActivity.CUDA],
-#     schedule=torch.profiler.schedule(
-#         wait=0,
-#         warmup=2,
-#         active=2,
-#         repeat=1),
-#     on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_pretrain_my_ddp/09_my_ddp_from08_bucket10_bfloat16_compress', worker_name=f'rank{ddp_rank}'),
-#     record_shapes=True,
-#     profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
-#     with_stack=True
-# ) as p:
+with torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA],
+    schedule=torch.profiler.schedule(
+        wait=0,
+        warmup=4,
+        active=2,
+        repeat=1),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_pretrain_my_ddp/09_my_ddp_from08_bucket10_bfloat16_compress_no_stream', worker_name=f'rank{ddp_rank}'),
+    record_shapes=True,
+    profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
+    with_stack=True
+) as p:
     
-for i in range(5):
-    # 前向传播和反向传播，梯度更新
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    # 使用model.no_sync()来设置是否同步
-    with model.no_sync():
-        for micro_step in range(gradient_accumulation_steps - 1):
-            with ctx:
-                model_outputs = model(X, Y)
-                loss = model_outputs["loss"]
-                loss = loss / gradient_accumulation_steps
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
-    
-    # last_microbatch
-    with ctx:
-        model_outputs = model(X, Y)
-        loss = model_outputs["loss"]
-        loss = loss / gradient_accumulation_steps
-    # backward pass, with gradient scaling if training in fp16
-    scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
-    
-    optimizer.step()  # scaler和grad_clip放在了这里面
-    optimizer.zero_grad(set_to_none=True)
+    for i in range(7):
+        # 前向传播和反向传播，梯度更新
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        # 使用model.no_sync()来设置是否同步
+        with model.no_sync():
+            for micro_step in range(gradient_accumulation_steps - 1):
+                with ctx:
+                    model_outputs = model(X, Y)
+                    loss = model_outputs["loss"]
+                    loss = loss / gradient_accumulation_steps
+                # backward pass, with gradient scaling if training in fp16
+                scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+        
+        # last_microbatch
+        with ctx:
+            model_outputs = model(X, Y)
+            loss = model_outputs["loss"]
+            loss = loss / gradient_accumulation_steps
+        # backward pass, with gradient scaling if training in fp16
+        scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+        
+        optimizer.step()  # scaler和grad_clip放在了这里面
+        optimizer.zero_grad(set_to_none=True)
 
-    if ddp:
-        torch.cuda.synchronize()
-        torch.distributed.barrier()
-        
-    if master_process:
-        print(i)
-        
-        # p.step()
+        if ddp:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            
+        if master_process:
+            print(i)
+            
+        p.step()
 
 if ddp:
     destroy_process_group()  # gloo退出有问题，这行代码不会退出

@@ -39,13 +39,8 @@ $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standa
 - gpu4
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp.py
 
-$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
-
 - gpu4_2
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp.py
-
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
-$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
 """
 
 import math
@@ -61,9 +56,6 @@ import torch
 from torch.distributed import destroy_process_group, init_process_group
 import torch.distributed as dist
 import torch.distributed
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook, bf16_compress_wrapper
-from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
 from transformers import AutoConfig, AutoTokenizer
 
 from my_dataset import Task
@@ -75,6 +67,8 @@ from parallel.distributed_data_parallel import DistributedDataParallelConfig
 from parallel.distributed_data_parallel import DistributedDataParallel as MyDDP
 from optimizer import OptimizerConfig, FP32Optimizer, Float16OptimizerWithFloat16Params
 from parallel.distributed_optimizer import DistributedOptimizer
+from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import all_reduce_hook, reduce_scatter_hook, bf16_compress_wrapper, stream_wrapper
+from parallel.distributed_data_parallel.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
 
 
 os.environ["NCCL_IB_DISABLE"] = "1"  # disable infiniband
@@ -95,18 +89,6 @@ if torch.__version__ >= "2.0.0":
 # tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
 
 # -----------------------------------------------------------------------------
-# 通信后端
-# 见：https://huggingface.co/docs/transformers/perf_train_gpu_many
-# 使用nccl时，如果没有nvlink，则需要设置NCCL_P2P_DISABLE=1
-# 没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练
-# 因为我的环境没有nvlink，所以我使用的是gloo后端
-# 但是gloo又与hook有问题，还是用nccl吧
-# 1. gloo，不支持bfloat16，使用PowerSGD时会卡住，强行退出时GPU不会立即释放
-# 2. nccl，需要设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1
-ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
-# 梯度通信优化
-use_bf16_compress_hook = True
-use_powerSGD_hook = False
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
@@ -147,6 +129,7 @@ attention_dropout = 0.1  # TODO: 或许不用设置dropout
 dropout1 = 0.1
 dropout2 = 0.1
 residual_in_fp32 = True  # 残差连接是否使用fp32
+loss_reduction = None  # 损失函数的reduction方式，"mean" or "None"，使用None可以和grad_scaling_before_comm=False配合使用，减少精度损失
 # adamw optimizer
 ## gradient_accumulation_steps=gradient_accumulation_steps*ddp_world_size
 gradient_accumulation_steps = 128  # used to simulate larger batch sizes
@@ -163,6 +146,33 @@ warmup_iters = 2000  # how many steps to warm up for
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
 compile = False  # use PyTorch 2.0 to compile the model to be faster
+# 分布式配置
+# 通信后端
+# 见：https://huggingface.co/docs/transformers/perf_train_gpu_many
+# 使用nccl时，如果没有nvlink，则需要设置NCCL_P2P_DISABLE=1
+# 没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练
+# 因为我的环境没有nvlink，所以我使用的是gloo后端
+# 但是gloo又与hook有问题，还是用nccl吧
+# 1. gloo，不支持bfloat16，使用PowerSGD时会卡住，强行退出时GPU不会立即释放
+# 2. nccl，需要设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1
+ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
+# 梯度通信优化
+use_bf16_compress_hook = True
+use_powerSGD_hook = True
+# DistributedDataParallelConfig
+grad_reduce_in_fp32 = True
+overlap_grad_reduce = True
+use_distributed_optimizer = False
+check_for_nan_in_grad = False
+bucket_size = 10_000_000
+disable_bucketing = False
+# OptimizerConfig
+precision_dtype = dtype
+grad_scaling_before_comm = False  # 是否在通信前进行梯度缩放，建议bfloat16下设为False，在最后除以值，减少精度损失
+overlap_optim_step = True
+overlap_zero_grad_buffer = True
+use_distributed_optimizer = False
+overlap_param_gather = False
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -173,6 +183,12 @@ exec(open("configurator.py").read())  # 根据命令行或者配置文件来覆�
 # 最终的配置文件
 exp_config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
+
+assert (loss_reduction == "mean" and grad_scaling_before_comm) or (loss_reduction is None and not grad_scaling_before_comm),\
+    "损失函数的reduction方式设置为None，必须和grad_scaling_before_comm=False配合使用，减少精度损失"
+
+if dtype == "float16" and not grad_scaling_before_comm:
+    raise ValueError("float16下不能在最后才进行梯度的缩放(not grad_scaling_before_comm)，因为可能会上溢")
 
 # 删除tokenizer，后面不会用到了
 tokenizer = None
@@ -388,25 +404,31 @@ if ddp:
     
     # DDP
     ddp_config = DistributedDataParallelConfig(
-        grad_reduce_in_fp32=False,
-        overlap_grad_reduce=True,
-        use_distributed_optimizer=True,
-        check_for_nan_in_grad=False,
-        bucket_size=10_000_000 * ddp_world_size)  # 默认bucket_size
+        grad_reduce_in_fp32=grad_reduce_in_fp32,
+        overlap_grad_reduce=overlap_grad_reduce,
+        use_distributed_optimizer=use_distributed_optimizer,
+        check_for_nan_in_grad=check_for_nan_in_grad,
+        bucket_size=bucket_size)  # 默认bucket_size
     model = MyDDP(
         model,
         ddp_config,
         data_parallel_group=process_group,
-        disable_bucketing=False)
+        disable_bucketing=disable_bucketing)
 
-    # DistributedOptimizer
+    # Optimizer
+    # 是否在最后才进行grad_scaling，以减少精度损失（此时loss的损失函数的参数是None，而不是mean）
+    grad_scaling_factor = None
+    if not grad_scaling_before_comm:
+        grad_scaling_factor = 1.0 / (tokens_per_iter * ddp_world_size)
     optim_config = OptimizerConfig(
-        precision_dtype=dtype,
-        overlap_optim_step=True,
-        overlap_zero_grad_buffer=True,
-        use_distributed_optimizer=True,
-        overlap_param_gather=True)
-    optimizer = DistributedOptimizer(optimizer, optim_config, model, scaler=scaler, grad_clip=grad_clip)
+        precision_dtype=precision_dtype,
+        grad_scaling_before_comm=grad_scaling_before_comm,
+        grad_scaling_factor=grad_scaling_factor,
+        overlap_optim_step=overlap_optim_step,
+        overlap_zero_grad_buffer=overlap_zero_grad_buffer,
+        use_distributed_optimizer=use_distributed_optimizer,
+        overlap_param_gather=overlap_param_gather)
+    optimizer = Float16OptimizerWithFloat16Params(optimizer, optim_config, model, scaler=scaler, grad_clip=grad_clip)
 
 # -----------------------------------------------------------------------------
 # 准备训练集
@@ -447,19 +469,36 @@ if resume:
 # -----------------------------------------------------------------------------
 # 预热后，设置ddp com hook，还是会取world_size的平均值
 # MyDDP中也实现了register_comm_hook，不过参数的位置不太一样
-# if ddp:
-#     if use_powerSGD_hook:
-#         # 若没有resume，则初始化PowerSGDState
-#         if powerSGD_state is None:
-#             powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-#                                 warm_start=True, use_error_feedback=True, start_powerSGD_iter=50, 
-#                                 min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
-#         if use_bf16_compress_hook:
-#             model.register_comm_hook(powerSGD_state, bf16_compress_wrapper(powerSGD_hook))
-#         else:
-#             model.register_comm_hook(powerSGD_state, powerSGD_hook)
-#     elif use_bf16_compress_hook:
-#         model.register_comm_hook(process_group, bf16_compress_hook)
+# 基本的comm hook
+base_comm_hook = None
+if use_distributed_optimizer:
+    base_comm_hook = reduce_scatter_hook
+else:
+    base_comm_hook = all_reduce_hook
+cur_comm_hook = base_comm_hook
+comm_args = []  # 传入hook中的参数
+if ddp:
+    if use_powerSGD_hook:
+        # 若没有resume，则初始化PowerSGDState
+        if powerSGD_state is None:
+            powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
+                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
+                                min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
+        if use_bf16_compress_hook:
+            cur_comm_hook = bf16_compress_wrapper(powerSGD_hook)
+        else:
+            cur_comm_hook = powerSGD_hook
+        comm_args.append(powerSGD_state)
+    elif use_bf16_compress_hook:
+        comm_args.append(process_group)
+        cur_comm_hook = bf16_compress_wrapper(base_comm_hook)
+cur_comm_hook = stream_wrapper(cur_comm_hook)  # 添加stream，用于异步通信
+model.register_comm_hook(cur_comm_hook, *comm_args,
+                         grad_scaling_factor=grad_scaling_factor, grad_scaling_before_comm=grad_scaling_before_comm)
+
+if ddp:
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
 
 # -----------------------------------------------------------------------------
 # 开始训练

@@ -35,6 +35,7 @@ class Z2allConfig(PretrainedConfig):
         use_fused_dropout_add_norm=True,
         use_fused_rmsnorm=True,
         use_fused_swiglu=True,
+        loss_reduction="mean",  # 损失函数的reduction方式，"mean" or "None"，使用None可以和grad_scaling_before_comm=False配合使用，减少精度损失
         **kwargs,
     ):
         self.auto_map = {
@@ -81,6 +82,8 @@ class Z2allConfig(PretrainedConfig):
         self.use_fused_dropout_add_norm = use_fused_dropout_add_norm
         self.use_fused_swiglu = use_fused_swiglu
         self.use_fused_rmsnorm = use_fused_rmsnorm
+        
+        self.loss_reduction = loss_reduction
         
         self.pad_token_id = pad_token_id
         self.tie_word_embeddings = tie_word_embeddings

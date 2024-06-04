@@ -1,3 +1,16 @@
+"""
+Bucket定义见：parallel/distributed_data_parallel/param_and_grad_buffer.py
+
+可能用到的参数：
+self.param_data = param_data
+self.grad_data = grad_data
+
+建议hook使用下面代码进行同步，然后hook最后用stream_wrapper包裹一下，以避免阻塞
+event = torch.cuda.Event(enable_timing=False)
+event.record(torch.cuda.current_stream())
+return event
+"""
+
 import torch
 
 from ..param_and_grad_buffer import Bucket
@@ -25,41 +38,28 @@ def overlap_optim_step_wrapper(hook, optimizer):
     """
     为hook添加一个optimizer step，用于通信和参数更新的重叠
     
-    通过stream和event来同步通信和参数更新，最后返回event作为handle（有wait()方法）
+    返回event作为handle（有wait()方法）
     
     注意，需要CUDA_DEVICE_MAX_CONNECTIONS > 1，才能通信和参数更新重叠
+    
+    不需要使用stream考虑异步通信了，只需要最后再用stream_wrapper包裹一下即可
     """
     def wrapper(bucket: Bucket, *args, **kwargs):
-        communication_handle = hook(bucket, *args, **kwargs)
+        handle = hook(bucket, *args, **kwargs)
         
+        handle.wait()
+        
+        _copy_bucket_optim_params_to_optim_groups(bucket, optimizer)
+        
+        optimizer.step(is_bucket_step=True, bucket=bucket)  # 指定bucket的step
+        
+        if optimizer.optim_config.overlap_zero_grad_buffer:
+            bucket.grad_data.zero_()  # 清零bucket对应的model main_grads
+        
+        # 添加event，用于同步
         event = torch.cuda.Event(enable_timing=False)
-        s = torch.cuda.Stream()
-        with torch.cuda.stream(s):
-            communication_handle.wait()
-            
-            _copy_bucket_optim_params_to_optim_groups(bucket, optimizer)
-            
-            optimizer.step(is_bucket_step=True, bucket=bucket)  # 指定bucket的step
-            
-            if optimizer.optim_config.overlap_zero_grad_buffer:
-                bucket.grad_data.zero_()  # 清零bucket对应的model main_grads
-            
-            event.record(torch.cuda.current_stream())
+        event.record(torch.cuda.current_stream())
             
         return event
         
-    return wrapper
-
-
-def stream_wrapper(hook):
-    """
-    为hook添加一个stream，用于异步通信
-    """
-    def wrapper(*args, **kwargs):
-        event = torch.cuda.Event(enable_timing=False)
-        event.record(torch.cuda.current_stream())
-        s = torch.cuda.Stream()
-        with torch.cuda.stream(s):
-            event.wait(s)
-            return hook(*args, **kwargs)
     return wrapper
