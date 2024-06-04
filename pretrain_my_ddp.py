@@ -129,7 +129,7 @@ attention_dropout = 0.1  # TODO: 或许不用设置dropout
 dropout1 = 0.1
 dropout2 = 0.1
 residual_in_fp32 = True  # 残差连接是否使用fp32
-loss_reduction = None  # 损失函数的reduction方式，"mean" or "None"，使用None可以和grad_scaling_before_comm=False配合使用，减少精度损失
+loss_reduction = "none"  # 损失函数的reduction方式，"mean" or "none"，使用"none"可以和grad_scaling_before_comm=False配合使用，减少精度损失
 # adamw optimizer
 ## gradient_accumulation_steps=gradient_accumulation_steps*ddp_world_size
 gradient_accumulation_steps = 128  # used to simulate larger batch sizes
@@ -184,7 +184,7 @@ exec(open("configurator.py").read())  # 根据命令行或者配置文件来覆�
 exp_config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
-assert (loss_reduction == "mean" and grad_scaling_before_comm) or (loss_reduction is None and not grad_scaling_before_comm),\
+assert (loss_reduction == "mean" and grad_scaling_before_comm) or (loss_reduction == "none" and not grad_scaling_before_comm),\
     "损失函数的reduction方式设置为None，必须和grad_scaling_before_comm=False配合使用，减少精度损失"
 
 if dtype == "float16" and not grad_scaling_before_comm:
@@ -381,6 +381,8 @@ def estimate_loss():
             with ctx:
                 model_outputs = model(X, Y)
                 loss = model_outputs["loss"]
+            if loss_reduction == "none":
+                loss = torch.mean(loss.view(-1))
             losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
@@ -419,7 +421,7 @@ if ddp:
     # 是否在最后才进行grad_scaling，以减少精度损失（此时loss的损失函数的参数是None，而不是mean）
     grad_scaling_factor = None
     if not grad_scaling_before_comm:
-        grad_scaling_factor = 1.0 / (tokens_per_iter * ddp_world_size)
+        grad_scaling_factor = 1.0 / tokens_per_iter
     optim_config = OptimizerConfig(
         precision_dtype=precision_dtype,
         grad_scaling_before_comm=grad_scaling_before_comm,
@@ -589,6 +591,8 @@ while True:
     
     micro_times = []
     
+    train_loss = torch.tensor([0.0], device=device)
+    
     # 前向传播和反向传播，梯度更新
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -599,7 +603,12 @@ while True:
             with ctx:
                 model_outputs = model(X, Y)
                 loss = model_outputs["loss"]
-                loss = loss / gradient_accumulation_steps
+                if loss_reduction == "mean":
+                    loss = loss / gradient_accumulation_steps
+                else:
+                    # 否则为"none"，则grad在optim.step中进行scale，减少精度损失
+                    loss = torch.sum(loss.view(-1))
+            train_loss += loss.detach()
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = next(train_batch_iter)
             # backward pass, with gradient scaling if training in fp16
@@ -618,7 +627,12 @@ while True:
     with ctx:
         model_outputs = model(X, Y)
         loss = model_outputs["loss"]
-        loss = loss / gradient_accumulation_steps
+        if loss_reduction == "mean":
+            loss = loss / gradient_accumulation_steps
+        else:
+            # 否则为"none"，则grad在optim.step中进行scale，减少精度损失
+            loss = torch.sum(loss.view(-1))
+    train_loss += loss.detach()
     # immediately async prefetch next batch while model is doing the forward pass on the GPU
     X, Y = next(train_batch_iter)
     # backward pass, with gradient scaling if training in fp16
@@ -635,7 +649,9 @@ while True:
     last_micro_time = time.time() - last_micro_time  #! 2
     micro_times.append(last_micro_time)
     optim_step_time = time.time() - optim_step_time  #! 3
-        
+    
+    torch.distributed.all_reduce(train_loss, group=process_group, async_op=False)
+    
     # 输出结果
     # timing and logging
     train_time1 = time.time()
@@ -644,7 +660,11 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
         # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。
-        lossf = loss.item() * gradient_accumulation_steps
+        if loss_reduction == "mean":
+            train_loss = train_loss / ddp_world_size
+        else:
+            train_loss = train_loss / tokens_per_iter
+        lossf = train_loss.item()
         if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu

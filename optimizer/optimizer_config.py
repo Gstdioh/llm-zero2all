@@ -26,7 +26,7 @@ class OptimizerConfig:
     
     grad_scaling_factor: float = 1.0
     """
-    相应的梯度缩放因子，grad_scaling_before_comm=False 下通常为 1.0 / (tokens_per_iter * ddp_world_size)
+    相应的梯度缩放因子，grad_scaling_before_comm=False 下通常为 1.0 / tokens_per_iter
     
     grad_scaling_before_comm=True时，不起作用
     """

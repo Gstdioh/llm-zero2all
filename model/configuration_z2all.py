@@ -35,7 +35,7 @@ class Z2allConfig(PretrainedConfig):
         use_fused_dropout_add_norm=True,
         use_fused_rmsnorm=True,
         use_fused_swiglu=True,
-        loss_reduction="mean",  # 损失函数的reduction方式，"mean" or "None"，使用None可以和grad_scaling_before_comm=False配合使用，减少精度损失
+        loss_reduction="mean",  # 损失函数的reduction方式，"mean" or "none"，使用"none"可以和grad_scaling_before_comm=False配合使用，减少精度损失
         **kwargs,
     ):
         self.auto_map = {
