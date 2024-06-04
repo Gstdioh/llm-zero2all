@@ -11,8 +11,6 @@ import torch.distributed
 
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
-from .ddp_comm_hooks.default_hooks import all_reduce_hook, reduce_scatter_hook
-
 
 logger = getLogger(__name__)
 
@@ -47,6 +45,10 @@ class Bucket:
         grad_data: torch.Tensor,
         offset: int,
         numel_unpadded: int,
+        param_dtype: torch.dtype,
+        grad_dtype: torch.dtype,
+        gbuf_index: int,
+        local_bucket_id: int,
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_world_size: int,
     ):
@@ -57,8 +59,8 @@ class Bucket:
         # available. When overlap_grad_reduce is True, communication (all-reduce
         # or reduce-scatter) is issued when params_with_grad equals params.
         # 当这个bucker的所有参数都计算出了梯度，就会发起通信操作，计算和通信重叠
-        self.params_list = params
-        self.params = set(params)
+        self.params_list = params  # 有序
+        self.params = set(params)  # 无序，和params_with_grad结合使用判断param是否都准备好了
         self.params_with_grad = set()  # 记录准备好的参数，全部准备好后发起通信
         self.param_data = param_data
         self.grad_data = grad_data
@@ -66,6 +68,26 @@ class Bucket:
         # within the full grad_buffer.
         self.offset = offset
         self.numel_unpadded = numel_unpadded
+        
+        self.raw_grad_data = None  # 用于保存原始的梯度数据，用于恢复
+        
+        # 存储每个param的bucket下的数据范围，(start_index, end_index)
+        local_offset = 0
+        self.param_index_map = {}
+        for param in self.params_list:
+            start_index, end_index = local_offset, local_offset + param.data.nelement()
+            self.param_index_map[param] = (start_index, end_index)
+            local_offset += param.data.nelement()
+        
+        # 唯一标识
+        self.param_dtype = param_dtype
+        self.grad_dtype = grad_dtype
+        self.gbuf_index = gbuf_index  # buffer的全局id
+        self.global_bucket_id = None  # int, bucket的全局id，在DDP设置完buffer后，会设置该值，倒序
+        self.global_n_buckets = None  # int, DDP下所有bucket的数量，在DDP设置完buffer后，会设置该值
+        self.local_bucket_id = local_bucket_id  # bucket在buffer中的id，倒序
+        self.local_n_buckets = None  # int, buffer中bucket的数量，buffer设置完所有bucket后，会设置该值
+        
         self.data_parallel_group = data_parallel_group
         self.data_parallel_world_size = data_parallel_world_size
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
@@ -74,6 +96,75 @@ class Bucket:
         
         self.reset()
 
+    def index(self) -> int:
+        return self.global_bucket_id
+    
+    def buffer(self) -> torch.Tensor:
+        """
+        bucket grad buffer
+        为了和pytorch兼容，所以没有命名为grad_buffer
+        """
+        return self.grad_data
+    
+    def set_buffer(self, tensor: torch.Tensor) -> None:
+        """
+        修改bucket的grad buffer的值，必须为1d的tensor
+        """
+        self.grad_data.copy_(tensor)
+    
+    def param_buffer(self) -> torch.Tensor:
+        """
+        bucket param buffer
+        """
+        return self.param_data
+    
+    def set_param_buffer(self, tensor: torch.Tensor) -> None:
+        """
+        修改bucket的param buffer的值，必须为1d的tensor
+        """
+        self.param_data.copy_(tensor)
+        
+    def gradients(self) -> List[torch.Tensor]:
+        """
+        grad list
+        """
+        grad_list = []
+        
+        for param in self.params_list:
+            start_index, end_index = self.param_index_map[param]
+            grad_list.append(self.grad_data[start_index: end_index].view(param.shape))
+        
+        return grad_list
+        
+    def parameters(self) -> List[torch.Tensor]:
+        """
+        param list
+        """
+        return self.params_list
+        
+    def is_last(self) -> bool:
+        """
+        是否是全局bucket下的最后一个bucket
+        
+        因为buffer是按正序，bucket是按倒序，所以这样判断
+        """
+        return self.global_bucket_id == self.global_n_buckets - 1
+    
+    def change_grad_buffer_dtype(self, new_grad_dtype) -> None:
+        """
+        修改grad buffer的数据类型，需要保存之前的数据
+        """
+        self.raw_grad_data = self.grad_data
+        self.grad_data = self.grad_data.to(new_grad_dtype)
+        
+    def restore_grad_buffer_dtype(self) -> None:
+        """
+        恢复grad buffer的数据类型
+        """
+        self.raw_grad_data.copy_(self.grad_data)
+        self.grad_data = self.raw_grad_data
+        self.raw_grad_data = None
+
     def reset(self):
         """
         Reset metadata in bucket in preparation for the next iteration of training.
@@ -81,7 +172,7 @@ class Bucket:
         self.params_with_grad = set()
         self.communication_handle = None
         self.communication_issued = False
-
+        
     def start_grad_sync(self):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operation
@@ -176,6 +267,7 @@ class ParamAndGradBuffer:
     def __init__(
         self,
         ddp_config: DistributedDataParallelConfig,
+        gbuf_index: int,
         param_dtype: torch.dtype,
         grad_dtype: torch.dtype,
         params: List[torch.nn.Parameter],
@@ -184,6 +276,8 @@ class ParamAndGradBuffer:
         param_to_name: Dict[torch.nn.Parameter, str],
     ):
         self.ddp_config = ddp_config
+        
+        self.gbuf_index = gbuf_index
 
         # Check that params are unique.
         unique_params = set()
@@ -330,7 +424,7 @@ class ParamAndGradBuffer:
         )
 
         # Finally, map param.data and param.main_grad fields to buffers.
-        bucket_params = set()
+        bucket_params = []
         bucket_data_start_index = 0
         cur_bucket_id = 0
         for param in params[::-1]:
@@ -367,11 +461,11 @@ class ParamAndGradBuffer:
                     bucket_id=cur_bucket_id,
                 )
                 bucket_data_start_index = bucket_data_end_index
-                bucket_params = set()
+                bucket_params = []
                 assert cur_bucket_id + 1 == len(self.buckets)
                 assert bucket_id == cur_bucket_id + 1
                 cur_bucket_id = bucket_id
-            bucket_params.add(param)
+            bucket_params.append(param)
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
@@ -383,6 +477,10 @@ class ParamAndGradBuffer:
                 numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
                 bucket_id=cur_bucket_id,
             )
+            
+        # 设置完所有bucket后，通知所有bucket，当前buffer中所含bucket的数量
+        for bucket in self.buckets:
+            bucket.local_n_buckets = len(self.buckets)
 
         if torch.distributed.get_rank() == 0:
             logger.info(
@@ -453,6 +551,10 @@ class ParamAndGradBuffer:
             grad_data=bucketed_grad_data,
             offset=start_index,
             numel_unpadded=numel_unpadded,
+            param_dtype=self.param_dtype,
+            grad_dtype=self.grad_dtype,
+            gbuf_index=self.gbuf_index,
+            local_bucket_id=bucket_id,
             data_parallel_group=self.data_parallel_group,
             data_parallel_world_size=self.data_parallel_world_size,
         )

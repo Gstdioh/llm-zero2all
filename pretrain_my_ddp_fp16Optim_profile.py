@@ -25,7 +25,7 @@ $ python pretrain.py --batch_size=2 --gradient_accumulation_steps=16
 # 看显存占用
 $ python pretrain.py --batch_size=16 --gradient_accumulation_steps=2
 
-OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain_profile.py --batch_size=16 --gradient_accumulation_steps=12
+OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp_fp16Optim_profile.py --batch_size=16 --gradient_accumulation_steps=12
 
 # gpu4
 $ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py
@@ -37,15 +37,10 @@ $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standa
 
 # gpu4, gpu4_2
 - gpu4
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_profile.py --batch_size=16 --gradient_accumulation_steps=24
-
-$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp_fp16Optim_profile.py --batch_size=16 --gradient_accumulation_steps=24
 
 - gpu4_2
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_profile.py --batch_size=16 --gradient_accumulation_steps=24
-
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
-$ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp_fp16Optim_profile.py --batch_size=16 --gradient_accumulation_steps=24
 """
 
 import math
@@ -58,20 +53,22 @@ from datetime import datetime
 from functools import partial
 
 import torch
-import torch.profiler
 from torch.distributed import destroy_process_group, init_process_group
 import torch.distributed as dist
 import torch.distributed
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook, bf16_compress_wrapper
-from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 from my_dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
-from transformers import AutoTokenizer
 import utils
 from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config
+
+from parallel.distributed_data_parallel import DistributedDataParallelConfig
+from parallel.distributed_data_parallel import DistributedDataParallel as MyDDP
+from optimizer import OptimizerConfig, FP32Optimizer, Float16OptimizerWithFloat16Params
+from parallel.distributed_optimizer import DistributedOptimizer
+from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import all_reduce_hook, reduce_scatter_hook, bf16_compress_wrapper, stream_wrapper
+from parallel.distributed_data_parallel.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
 
 
 os.environ["NCCL_IB_DISABLE"] = "1"  # disable infiniband
@@ -98,6 +95,8 @@ if torch.__version__ >= "2.0.0":
 # 没有nvlink时，在单节点下DP比DDP更快，但是DP不支持多节点训练
 # 因为我的环境没有nvlink，所以我使用的是gloo后端
 # 但是gloo又与hook有问题，还是用nccl吧
+# 1. gloo，不支持bfloat16，使用PowerSGD时会卡住，强行退出时GPU不会立即释放
+# 2. nccl，需要设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1
 ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 # 梯度通信优化
 use_bf16_compress_hook = True
@@ -105,9 +104,9 @@ use_powerSGD_hook = False
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 5  # 每eval_interval个step验证一次
+eval_interval = 200000  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
 log_interval = 1
-eval_iters = 2  # 每次验证的step数
+eval_iters = 3  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 resume = False  # if True, resume training from the last checkpoint
@@ -127,7 +126,7 @@ max_seq_len = 2048
 vocab_size = 64320  # 实际是64012个，写大点方便扩展，注意最好是8的倍数，见指导：https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html#tc-guidelines-padding
 hidden_dim = 2048
 intermediate_size = 5632
-n_layers = 3  # 设小一点，方便profiler渲染快点
+n_layers = 3
 n_heads = 16
 n_kv_heads = 8  # 用于GQA
 max_seq_len = max_seq_len
@@ -373,13 +372,49 @@ if compile and torch.__version__ >= "2.0":
         logger.info("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
-# 使用DDP包裹模型
+# -----------------------------------------------------------------------------
+# 使用自己的DDP和DistributedOptimizer包裹模型和优化器
 # wrap model into DDP container, 只有在从头开始训练时才会进行包裹
+# DistributedDataParallelConfig
+grad_reduce_in_fp32 = True
+overlap_grad_reduce = True
+use_distributed_optimizer = False
+check_for_nan_in_grad = False
+bucket_size = 10_000_000
+disable_bucketing = False
+# OptimizerConfig
+precision_dtype = dtype
+overlap_optim_step = False
+overlap_zero_grad_buffer = False
+use_distributed_optimizer = False
+overlap_param_gather = False
+
 if ddp:
-    # model.bfloat16()
     _ = logger.info(f"wrapping model into DDP container") if master_process else None
-    model = DDP(model, device_ids=[ddp_local_rank],
-                gradient_as_bucket_view=True, static_graph=False)  # 有梯度累加时，static_graph=True有问题?
+    
+    model.bfloat16()  # 自己管理精度，这里可以设置为bfloat16
+    
+    # DDP
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=grad_reduce_in_fp32,
+        overlap_grad_reduce=overlap_grad_reduce,
+        use_distributed_optimizer=use_distributed_optimizer,
+        check_for_nan_in_grad=check_for_nan_in_grad,
+        bucket_size=bucket_size)  # 默认bucket_size
+    model = MyDDP(
+        model,
+        ddp_config,
+        data_parallel_group=process_group,
+        disable_bucketing=disable_bucketing)
+
+    # DistributedOptimizer
+    optim_config = OptimizerConfig(
+        precision_dtype=precision_dtype,
+        overlap_optim_step=overlap_optim_step,
+        overlap_zero_grad_buffer=overlap_zero_grad_buffer,
+        use_distributed_optimizer=use_distributed_optimizer,
+        overlap_param_gather=overlap_param_gather)
+    optimizer = Float16OptimizerWithFloat16Params(optimizer, optim_config, model, scaler=scaler, grad_clip=grad_clip)
 
 # -----------------------------------------------------------------------------
 # 准备训练集
@@ -402,78 +437,104 @@ if resume:
 # 2. resume情况下，因为resume后，DDP又要重新开始构建bucket了
 # 见：powerSGD_hook.py的注释
 # 见：https://github.com/pytorch/pytorch/pull/73732
-if ddp:
-    warm_for_bucket_rebuilt_time = time.time()
-    for _ in range(2):
-        with ctx:
-            model_outputs = model(X, Y)
-            loss = model_outputs["loss"]
-            loss = loss / gradient_accumulation_steps
-        scaler.scale(loss).backward()
-        if utils.FusedAdam is not None:
-            optimizer.zero_grad()
-        else:
-            optimizer.zero_grad(set_to_none=True)
-    torch.distributed.barrier()
-    _ = logger.info(f"warm_for_bucket_rebuilt_time: {time.time() - warm_for_bucket_rebuilt_time:.4f}s") if master_process else None
+#* 自己的DDP不需要预热，构建DDP的时候已经确定好bucket了
+#* overlap_optim_step时会在backward中进行更新，所以不能这样预热
+# if ddp:
+#     warm_for_bucket_rebuilt_time = time.time()
+#     for _ in range(1):
+#         with ctx:
+#             model_outputs = model(X, Y)
+#             loss = model_outputs["loss"]
+#             loss = loss / gradient_accumulation_steps
+#         scaler.scale(loss).backward()
+#         optimizer.zero_grad(set_to_none=True)
+#     torch.cuda.synchronize()
+#     torch.distributed.barrier()
+#     _ = logger.info(f"warm_for_bucket_rebuilt_time: {time.time() - warm_for_bucket_rebuilt_time:.4f}s") if master_process else None
 
 # -----------------------------------------------------------------------------
 # 预热后，设置ddp com hook，还是会取world_size的平均值
+# MyDDP中也实现了register_comm_hook，不过参数的位置不太一样
+# 基本的comm hook
+base_comm_hook = None
+if use_distributed_optimizer:
+    base_comm_hook = reduce_scatter_hook
+else:
+    base_comm_hook = all_reduce_hook
+cur_comm_hook = base_comm_hook
+comm_args = []  # 传入hook中的参数
 if ddp:
     if use_powerSGD_hook:
         # 若没有resume，则初始化PowerSGDState
         if powerSGD_state is None:
             powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-                                           warm_start=True, use_error_feedback=True, start_powerSGD_iter=3, 
-                                           min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
+                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=50, 
+                                min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
         if use_bf16_compress_hook:
-            model.register_comm_hook(powerSGD_state, bf16_compress_wrapper(powerSGD_hook))
+            cur_comm_hook = bf16_compress_wrapper(powerSGD_hook)
         else:
-            model.register_comm_hook(powerSGD_state, powerSGD_hook)
+            cur_comm_hook = powerSGD_hook
+        comm_args.append(powerSGD_state)
     elif use_bf16_compress_hook:
-        model.register_comm_hook(process_group, bf16_compress_hook)
+        comm_args.append(process_group)
+        cur_comm_hook = bf16_compress_wrapper(base_comm_hook)
+cur_comm_hook = stream_wrapper(cur_comm_hook)  # 添加stream，用于异步通信
+model.register_comm_hook(cur_comm_hook, *comm_args)
 
+if ddp:
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+        
+# -----------------------------------------------------------------------------
 # profile
-with torch.profiler.profile(
-    activities=[
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA],
-    schedule=torch.profiler.schedule(
-        wait=0,
-        warmup=2,
-        active=2,
-        repeat=1),
-    on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_pretrain_my_ddp/06_raw_ddp_batch16_gpu8', worker_name=f'rank{ddp_rank}'),
-    record_shapes=True,
-    profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
-    with_stack=True
-) as p:
+# with torch.profiler.profile(
+#     activities=[
+#         torch.profiler.ProfilerActivity.CPU,
+#         torch.profiler.ProfilerActivity.CUDA],
+#     schedule=torch.profiler.schedule(
+#         wait=0,
+#         warmup=2,
+#         active=2,
+#         repeat=1),
+#     on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_pretrain_my_ddp/09_my_ddp_from08_bucket10_bfloat16_compress', worker_name=f'rank{ddp_rank}'),
+#     record_shapes=True,
+#     profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
+#     with_stack=True
+# ) as p:
     
-    for i in range(5):
-        for micro_step in range(gradient_accumulation_steps):
-            if ddp:
-                model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
+for i in range(5):
+    # 前向传播和反向传播，梯度更新
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
+    # 使用model.no_sync()来设置是否同步
+    with model.no_sync():
+        for micro_step in range(gradient_accumulation_steps - 1):
             with ctx:
                 model_outputs = model(X, Y)
                 loss = model_outputs["loss"]
                 loss = loss / gradient_accumulation_steps
-            X, Y = next(train_batch_iter)
+            # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)  # 若没有unscale，进行unscale并且更新
-        scaler.update()  # 更新scaler的缩放因子
-        if utils.FusedAdam is not None:
-            optimizer.zero_grad()  # apex fused adamw上已经设置了set_to_none了
-        else:
-            optimizer.zero_grad(set_to_none=True)  # pytorch的需要在这设置为None，清空显存
-            
-        if ddp:
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-        
-        if master_process:
-            print(f"step: {i}")
+    
+    # last_microbatch
+    with ctx:
+        model_outputs = model(X, Y)
+        loss = model_outputs["loss"]
+        loss = loss / gradient_accumulation_steps
+    # backward pass, with gradient scaling if training in fp16
+    scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+    
+    optimizer.step()  # scaler和grad_clip放在了这里面
+    optimizer.zero_grad(set_to_none=True)
 
-        p.step()
+    if ddp:
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        
+    if master_process:
+        print(i)
+        
+        # p.step()
+
+if ddp:
+    destroy_process_group()  # gloo退出有问题，这行代码不会退出

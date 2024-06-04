@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Union
 from abc import ABC, abstractmethod
 
@@ -8,6 +9,7 @@ from apex.multi_tensor_apply import multi_tensor_applier
 from optimizer import OptimizerConfig
 from parallel.distributed_data_parallel import DistributedDataParallel
 from parallel.distributed_data_parallel.ddp_comm_hooks.overlap_optim_step_hooks import overlap_optim_step_wrapper
+from parallel import Bucket
 
 
 def zero_grad_group_helper(group: List[torch.nn.Parameter], set_to_none: bool):
@@ -57,14 +59,15 @@ class Z2allOptimizer:
         self.scaler = scaler
         self.grad_clip = grad_clip
         
-        self.bucket_step_count = 0  # 对已经step的bucket进行计数，和DDP.bucket_count结合起来用，用来判断是否到了最后一个bucket
         self.update_successful = True  # optim参数更新成功后，才会进行all-gather，scaler时才会用到
+        
+        if not self.optim_config.use_distributed_optimizer:
+            assert not self.optim_config.overlap_param_gather, "overlap_param_gather is only supported with distributed optimizer"
         
     def reset(self):
         """
         重置状态
         """
-        self.bucket_step_count = 0
         self.update_successful = True
         
     def _post_init(self):
@@ -131,7 +134,7 @@ class MixedPrecisionOptimizer(Z2allOptimizer, ABC):
         pass
     
     @torch.no_grad()
-    def step(self, is_bucket_step=False, bucket=None):
+    def step(self, is_bucket_step=False, bucket: Bucket = None):
         """
         更新参数，若需要则可以进行scale和grad_clip
         
@@ -173,12 +176,10 @@ class MixedPrecisionOptimizer(Z2allOptimizer, ABC):
                     # 有Nan或者inf
                     self.update_successful = False
                 
-                # 只有在overlap_optim_step下，才会进行bucket_step_count的计数
-                # 从而判断是否需要更改stage
+                # overlap_optim_step中需要判断是否更改stage
                 if self.optim_config.overlap_optim_step:
-                    self.bucket_step_count += 1
                     # 如果不是最后一个bucket，则需要更改stage为READY，即0，因为下次bucket又会用到scaler，防止报错
-                    if self.bucket_step_count < self.model_chunks[0].bucket_count:  # TODO_MY 多个model_chunk的情况没有考虑
+                    if not bucket.is_last():
                         optimizer_state["stage"] = 0  # 0表示READY
             else:
                 # 裁剪梯度
@@ -369,7 +370,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             
         self.reset()  # 记得清零，实现在Z2allOptimizer中
 
-    def _get_model_and_main_params_data_float16(self, is_bucket_step=False, bucket=None):
+    def _get_model_and_main_params_data_float16(self, is_bucket_step=False, bucket: Bucket = None):
         """
         获取model和optim对应的fp16的参数
         """
@@ -389,7 +390,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         
         return model_data, main_data
 
-    def _copy_model_grads_to_main_grads(self, is_bucket_step=False, bucket=None):
+    def _copy_model_grads_to_main_grads(self, is_bucket_step=False, bucket: Bucket = None):
         """
         用于更新放在optim中的主参数，optim main params
         
@@ -431,7 +432,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         
                 model_param.grad = None
     
-    def _copy_main_params_to_model_params(self, is_bucket_step=False, bucket=None):
+    def _copy_main_params_to_model_params(self, is_bucket_step=False, bucket: Bucket = None):
         """
         用于模型forward和backward
         
@@ -598,7 +599,7 @@ class FP32Optimizer(Z2allOptimizer):
         
         self.reset()  # 记得清零，实现在Z2allOptimizer中
     
-    def _copy_model_main_grads_to_grads(self, is_bucket_step=False, bucket=None):
+    def _copy_model_main_grads_to_grads(self, is_bucket_step=False, bucket: Bucket = None):
         """
         Copy model main_grad to grad.
         1. 因为累加时是对main_grad进行的，所以这里需要将main_grad拷贝到grad
@@ -621,7 +622,7 @@ class FP32Optimizer(Z2allOptimizer):
                 self.bucket_to_main_params_map[bucket][param_idx].grad = self.bucket_to_model_params_map[bucket][param_idx].main_grad
 
     @torch.no_grad()
-    def step(self, is_bucket_step=False, bucket=None):
+    def step(self, is_bucket_step=False, bucket: Bucket = None):
         """
         is_bucket_step, bucket用于overlap_optim_step
         

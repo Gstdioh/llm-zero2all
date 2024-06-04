@@ -1481,7 +1481,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 main_data.append(main_param.data)
         return model_data, main_data
 
-    def _copy_model_grads_to_main_grads(self, is_bucket_step=False, bucket=None):
+    def _copy_model_grads_to_main_grads(self, is_bucket_step=False, bucket: Bucket = None):
         """
         Copy model grads to main grads.
 
@@ -1529,7 +1529,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 shard_main_param.grad = shard_model_grad.float()
             
 
-    def _copy_main_params_to_model_params(self, is_bucket_step=False, bucket=None):
+    def _copy_main_params_to_model_params(self, is_bucket_step=False, bucket: Bucket = None):
         """
         Copy main params to model params.
 
@@ -1611,7 +1611,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self._dispatch_gather_model_params(all_gather_handle_index, force_sync=force_sync)
 
     @torch.no_grad()
-    def step(self, is_bucket_step=False, bucket=None):
+    def step(self, is_bucket_step=False, bucket: Bucket = None):
         """
         Step optimizer.
         Under the hood, either launch synchronous param all-gathers or get ready to launch

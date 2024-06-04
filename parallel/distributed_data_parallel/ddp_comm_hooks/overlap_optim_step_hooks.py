@@ -1,7 +1,9 @@
 import torch
 
+from ..param_and_grad_buffer import Bucket
 
-def _copy_bucket_optim_params_to_optim_groups(bucket, optimizer):
+
+def _copy_bucket_optim_params_to_optim_groups(bucket: Bucket, optimizer):
     """
     将bucket中的参数对应的要更新的参数覆盖到optimizer的准备更新的groups中
     
@@ -27,7 +29,7 @@ def overlap_optim_step_wrapper(hook, optimizer):
     
     注意，需要CUDA_DEVICE_MAX_CONNECTIONS > 1，才能通信和参数更新重叠
     """
-    def wrapper(bucket, *args, **kwargs):
+    def wrapper(bucket: Bucket, *args, **kwargs):
         communication_handle = hook(bucket, *args, **kwargs)
         
         event = torch.cuda.Event(enable_timing=False)

@@ -113,6 +113,7 @@ class DistributedDataParallel(nn.Module):
                 buffers.append(
                     ParamAndGradBuffer(
                         self.ddp_config,
+                        len(buffers),
                         param_dtype,
                         grad_dtype,
                         params,
@@ -132,13 +133,20 @@ class DistributedDataParallel(nn.Module):
             dense_params, self.data_parallel_group,
         )
         
-        # 总共的bucket数量
-        # 用于overlap_optim_step中，bucket完成的数量，从而判断是否到了最后一个bucket
-        # 只有在scaler时用到
-        self.bucket_count = 0
+        cur_bucket_id = 0  # int, bucket的全局id，在DDP设置完buffer后，会设置该值，倒序
+        self.global_n_buckets = None  # int, DDP下所有bucket的数量，在DDP设置完buffer后，会设置该值
+        # 设置每个bucket的self.global_bucket_id值
+        # buffer是正序，bucket是倒序，所以需要这样计算，global bucket 按照倒序来
+        for buffer in self.buffers[::-1]:
+            for bucket in buffer.buckets:
+                bucket.global_bucket_id = cur_bucket_id
+                cur_bucket_id += 1
+        self.global_n_buckets = cur_bucket_id
+        # 设置所有bucket的self.global_n_buckets
         for buffer in self.buffers:
-            self.bucket_count += len(buffer.buckets)
-
+            for bucket in buffer.buckets:
+                bucket.global_n_buckets = self.global_n_buckets
+        
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
         # This is a temporary workaround around a TE bug that is fixed with

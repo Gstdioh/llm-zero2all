@@ -37,12 +37,12 @@ $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standa
 
 # gpu4, gpu4_2
 - gpu4
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp.py --batch_size=16 --gradient_accumulation_steps=24
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp_profile.py --batch_size=16 --gradient_accumulation_steps=24
 
 $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
 
 - gpu4_2
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp.py --batch_size=16 --gradient_accumulation_steps=24
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp_profile.py --batch_size=16 --gradient_accumulation_steps=24
 
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
 $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
@@ -161,7 +161,7 @@ decay_lr = True  # whether to decay the learning rate
 warmup_iters = 2000  # how many steps to warm up for
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = "bfloat16"  # float32|bfloat16|float16
+dtype = "float16"  # float32|bfloat16|float16
 compile = False  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
@@ -467,54 +467,54 @@ if ddp:
         
 # -----------------------------------------------------------------------------
 # profile
-with torch.profiler.profile(
-    activities=[
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA],
-    schedule=torch.profiler.schedule(
-        wait=0,
-        warmup=2,
-        active=2,
-        repeat=1),
-    on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_pretrain_my_ddp/03_use_all_overlap_batch16', worker_name=f'rank{ddp_rank}'),
-    record_shapes=True,
-    profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
-    with_stack=True
-) as p:
-    
-    for i in range(5):
-        # 前向传播和反向传播，梯度更新
-        # forward backward update, with optional gradient accumulation to simulate larger batch size
-        # and using the GradScaler if data type is float16
-        # 使用model.no_sync()来设置是否同步
-        with model.no_sync():
-            for micro_step in range(gradient_accumulation_steps - 1):
-                with ctx:
-                    model_outputs = model(X, Y)
-                    loss = model_outputs["loss"]
-                    loss = loss / gradient_accumulation_steps
-                # backward pass, with gradient scaling if training in fp16
-                scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
-        
-        # last_microbatch
-        with ctx:
-            model_outputs = model(X, Y)
-            loss = model_outputs["loss"]
-            loss = loss / gradient_accumulation_steps
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
-        
-        optimizer.step()  # scaler和grad_clip放在了这里面
-        optimizer.zero_grad(set_to_none=True)
+# with torch.profiler.profile(
+#     activities=[
+#         torch.profiler.ProfilerActivity.CPU,
+#         torch.profiler.ProfilerActivity.CUDA],
+#     schedule=torch.profiler.schedule(
+#         wait=0,
+#         warmup=2,
+#         active=2,
+#         repeat=1),
+#     on_trace_ready=torch.profiler.tensorboard_trace_handler('./res_profile/test_pretrain_my_ddp/05_use_all_overlap_batch16_gpu8', worker_name=f'rank{ddp_rank}'),
+#     record_shapes=True,
+#     profile_memory=True,  # This will take 1 to 2 minutes. Setting it to False could greatly speedup.
+#     with_stack=True
+# ) as p:
 
-        if ddp:
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-            
-        if master_process:
-            print(i)
+for i in range(5):
+    # 前向传播和反向传播，梯度更新
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
+    # 使用model.no_sync()来设置是否同步
+    with model.no_sync():
+        for micro_step in range(gradient_accumulation_steps - 1):
+            with ctx:
+                model_outputs = model(X, Y)
+                loss = model_outputs["loss"]
+                loss = loss / gradient_accumulation_steps
+            # backward pass, with gradient scaling if training in fp16
+            scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+    
+    # last_microbatch
+    with ctx:
+        model_outputs = model(X, Y)
+        loss = model_outputs["loss"]
+        loss = loss / gradient_accumulation_steps
+    # backward pass, with gradient scaling if training in fp16
+    scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+    
+    optimizer.step()  # scaler和grad_clip放在了这里面
+    optimizer.zero_grad(set_to_none=True)
+
+    if ddp:
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         
-        p.step()
+    if master_process:
+        print(i)
+        
+        # p.step()
 
 if ddp:
     destroy_process_group()  # gloo退出有问题，这行代码不会退出

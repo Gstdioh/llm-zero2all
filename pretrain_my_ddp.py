@@ -25,7 +25,7 @@ $ python pretrain.py --batch_size=2 --gradient_accumulation_steps=16
 # 看显存占用
 $ python pretrain.py --batch_size=16 --gradient_accumulation_steps=2
 
-OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py
+OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --gradient_accumulation_steps=12
 
 # gpu4
 $ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py
@@ -37,12 +37,12 @@ $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standa
 
 # gpu4, gpu4_2
 - gpu4
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp.py
 
 $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
 
 - gpu4_2
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp.py
 
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=10.10.24.107 --master_port=30846 pretrain.py
 $ NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain.py
@@ -392,11 +392,12 @@ if ddp:
         overlap_grad_reduce=True,
         use_distributed_optimizer=True,
         check_for_nan_in_grad=False,
-        bucket_size=None)  # 默认bucket_size
-    model = MyDDP(model,
-                ddp_config,
-                data_parallel_group=process_group,
-                disable_bucketing=False)
+        bucket_size=10_000_000 * ddp_world_size)  # 默认bucket_size
+    model = MyDDP(
+        model,
+        ddp_config,
+        data_parallel_group=process_group,
+        disable_bucketing=False)
 
     # DistributedOptimizer
     optim_config = OptimizerConfig(
@@ -428,18 +429,20 @@ if resume:
 # 2. resume情况下，因为resume后，DDP又要重新开始构建bucket了
 # 见：powerSGD_hook.py的注释
 # 见：https://github.com/pytorch/pytorch/pull/73732
-#* 自己的DDP不需要预热，构建DDP的时候已经确定好bucket了，不过也可以预热下，防止后面速度有差异
-if ddp:
-    warm_for_bucket_rebuilt_time = time.time()
-    for _ in range(2):
-        with ctx:
-            model_outputs = model(X, Y)
-            loss = model_outputs["loss"]
-            loss = loss / gradient_accumulation_steps
-        scaler.scale(loss).backward()
-        optimizer.zero_grad(set_to_none=True)
-    torch.distributed.barrier()
-    _ = logger.info(f"warm_for_bucket_rebuilt_time: {time.time() - warm_for_bucket_rebuilt_time:.4f}s") if master_process else None
+#* 自己的DDP不需要预热，构建DDP的时候已经确定好bucket了
+#* overlap_optim_step时会在backward中进行更新，所以不能这样预热
+# if ddp:
+#     warm_for_bucket_rebuilt_time = time.time()
+#     for _ in range(1):
+#         with ctx:
+#             model_outputs = model(X, Y)
+#             loss = model_outputs["loss"]
+#             loss = loss / gradient_accumulation_steps
+#         scaler.scale(loss).backward()
+#         optimizer.zero_grad(set_to_none=True)
+#     torch.cuda.synchronize()
+#     torch.distributed.barrier()
+#     _ = logger.info(f"warm_for_bucket_rebuilt_time: {time.time() - warm_for_bucket_rebuilt_time:.4f}s") if master_process else None
 
 # -----------------------------------------------------------------------------
 # 预热后，设置ddp com hook，还是会取world_size的平均值
@@ -541,12 +544,19 @@ while True:
     if iter_num == 0 and eval_only:
         break
     
+    if ddp:
+        torch.cuda.synchronize()
+        torch.distributed.barrier()  # 只在测试通信耗时的时候用
+    
+    micro_times = []
+    
     # 前向传播和反向传播，梯度更新
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     # 使用model.no_sync()来设置是否同步
     with model.no_sync():
         for micro_step in range(gradient_accumulation_steps - 1):
+            micro_time = time.time()  #! 1
             with ctx:
                 model_outputs = model(X, Y)
                 loss = model_outputs["loss"]
@@ -556,6 +566,15 @@ while True:
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
     
+            if ddp:
+                torch.cuda.synchronize()
+                torch.distributed.barrier()  # 只在测试通信耗时的时候用
+                
+            micro_time = time.time() - micro_time  #! 1
+            micro_times.append(micro_time)
+    
+    last_micro_time = time.time()  #! 2
+    
     # last_microbatch
     with ctx:
         model_outputs = model(X, Y)
@@ -563,18 +582,20 @@ while True:
         loss = loss / gradient_accumulation_steps
     # immediately async prefetch next batch while model is doing the forward pass on the GPU
     X, Y = next(train_batch_iter)
-    # 最后一次backward和通信所耗费时间
-    backward_comm_time = time.time()
     # backward pass, with gradient scaling if training in fp16
     scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+    
+    optim_step_time = time.time()  #! 3
     
     optimizer.step()  # scaler和grad_clip放在了这里面
     optimizer.zero_grad(set_to_none=True)
     
     if ddp:
         torch.cuda.synchronize()
-        torch.distributed.barrier()  # 只在测试通信耗时的时候用
-    backward_comm_time = time.time() - backward_comm_time
+        torch.distributed.barrier()
+    last_micro_time = time.time() - last_micro_time  #! 2
+    micro_times.append(last_micro_time)
+    optim_step_time = time.time() - optim_step_time  #! 3
         
     # 输出结果
     # timing and logging
@@ -601,7 +622,7 @@ while True:
                     "mfu": running_mfu * 100,
                 }, name="train", step=iter_num)
         logger.info(
-            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}% | backward_comm: {backward_comm_time:.4f}s"
+            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}% | micro_time0: {micro_times[0]:.4f}s | micro_time1: {micro_times[1]:.4f}s | last_micro_time: {micro_times[-1]:.4f}s | optim_step_time: {optim_step_time:.4f}s"
         )
     iter_num += 1
     local_iter_num += 1
