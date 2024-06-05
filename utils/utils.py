@@ -149,7 +149,47 @@ def clean_text(s, type="zh"):
     return s
 
 
-def save_run_exp_config(exp_config, save_path):
+def save_run_exp_config_deprecated(save_path, exp_config=None, run_code_abspath=None):
+    '''
+    弃用，因为run_code_abspath获取的不一定是值，可能是类似下面这样的，有误
+    out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
+    
+    可以使用两种方式获取当前实验参数配置
+    
+    1. exp_config：传入当前实验的配置信息字典
+    2. run_code_abspath：传入当前运行的代码的绝对路径，会自动解析出当前实验的配置信息（推荐，因为会将注释也保存了）
+    
+    保存当前运行实验的配置信息，写入python文件中
+    找到下面间隔的代码
+    
+    # -----------------------------------------------------------------------------
+    '''
+    if exp_config is not None and run_code_abspath is not None:
+        raise ValueError("exp_config和run_code_abspath不能同时传入！")
+    if exp_config is None and run_code_abspath is None:
+        raise ValueError("exp_config和run_code_abspath不能同时为空！")
+    
+    exp_config_text = "# 最终的配置文件信息\n"
+    if exp_config is not None:
+        for key, value in exp_config.items():
+            if isinstance(value, str):
+                exp_config_text += f"{key} = \"{value}\"\n"
+            else:
+                exp_config_text += f"{key} = {value}\n"
+    elif run_code_abspath is not None:
+        with open(run_code_abspath, "r", encoding="utf-8") as f:
+            code_text = f.read()
+        split_str = "# -----------------------------------------------------------------------------"
+        code_text_list = code_text.split(split_str)
+        
+        # 将分割的第二段内容（即实验参数配置），保存到exp_config_text中
+        exp_config_text += code_text_list[1].strip()
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write(exp_config_text)
+
+
+def save_run_exp_config(save_path, exp_config):
     '''
     保存当前运行实验的配置信息，写入python文件中
     找到下面间隔的代码

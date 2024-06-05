@@ -1,6 +1,6 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Adapted from Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Megatron distributed optimizer."""
+"""distributed optimizer."""
 
 
 import itertools
@@ -780,6 +780,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         
         # 收集所有需要unscale梯度的参数，用于grad_clip
         self._post_init()
+        
+        # 保存optim的完整的params_group，用于恢复（overlap_optim_step下需要恢复）
+        self.all_optim_param_groups = [[param for param in group["params"]] for group in self.optimizer.param_groups]
 
     def enable_pre_hook(self):
         """

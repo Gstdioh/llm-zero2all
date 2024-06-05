@@ -25,7 +25,7 @@ $ python pretrain.py --batch_size=2 --gradient_accumulation_steps=16
 # 看显存占用
 $ python pretrain.py --batch_size=16 --gradient_accumulation_steps=2
 
-OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain.py
+OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain.py --gradient_accumulation_steps=12
 
 # gpu4
 $ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py
@@ -101,14 +101,14 @@ if torch.__version__ >= "2.0.0":
 # 2. nccl，需要设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1
 ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 # 梯度通信优化
-use_bf16_compress_hook = False
-use_powerSGD_hook = False
+use_bf16_compress_hook = True
+use_powerSGD_hook = True
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
 eval_interval = 200  # 每eval_interval个step验证一次
 log_interval = 1
-eval_iters = 3  # 每次验证的step数
+eval_iters = 100  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 resume = False  # if True, resume training from the last checkpoint
@@ -203,7 +203,7 @@ else:
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
     # 保存最终的配置文件信息
-    save_run_exp_config(exp_config, os.path.join(out_dir, "exp_config.py"))
+    save_run_exp_config(os.path.join(out_dir, "exp_config.py"), exp_config)
 
 # -----------------------------------------------------------------------------
 # 运行日志
@@ -425,7 +425,7 @@ if ddp:
         # 若没有resume，则初始化PowerSGDState
         if powerSGD_state is None:
             powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=50, 
+                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
                                 min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
         if use_bf16_compress_hook:
             model.register_comm_hook(powerSGD_state, bf16_compress_wrapper(powerSGD_hook))
@@ -517,6 +517,8 @@ while True:
     if iter_num == 0 and eval_only:
         break
     
+    train_loss = torch.tensor([0.0], device=device)
+    
     # 前向传播和反向传播，梯度更新
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -531,6 +533,7 @@ while True:
             model_outputs = model(X, Y)
             loss = model_outputs["loss"]
             loss = loss / gradient_accumulation_steps
+        train_loss += loss.clone().detach()
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = next(train_batch_iter)
         # 最后一次backward和通信所耗费时间
@@ -562,7 +565,8 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
         # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。
-        lossf = loss.item() * gradient_accumulation_steps
+        # lossf = loss.item() * gradient_accumulation_steps
+        lossf = train_loss.item()
         if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu

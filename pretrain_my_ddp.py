@@ -68,6 +68,7 @@ from parallel.distributed_data_parallel import DistributedDataParallel as MyDDP
 from optimizer import OptimizerConfig, FP32Optimizer, Float16OptimizerWithFloat16Params
 from parallel.distributed_optimizer import DistributedOptimizer
 from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import all_reduce_hook, reduce_scatter_hook, bf16_compress_wrapper, stream_wrapper
+from parallel.distributed_data_parallel.ddp_comm_hooks.overlap_optim_step_hooks import overlap_optim_step_wrapper
 from parallel.distributed_data_parallel.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
 
 
@@ -92,17 +93,18 @@ if torch.__version__ >= "2.0.0":
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 200000  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
+eval_interval = 200  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
 log_interval = 1
-eval_iters = 3  # 每次验证的step数
+eval_iters = 100  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 resume = False  # if True, resume training from the last checkpoint
-# wandb logging
+sync_for_true_micro_time = False  # 是否同步以获取micro真实耗费的时间，测试下可以用
+# my logging
 use_reslog = True  # wandb用起来有问题，改为自己的日志和画图工具
 reslog_dir = "reslog"
 reslog_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-reslog_save_interval = 1  # 想快速看结果，用小点的数
+reslog_save_interval = 10  # 想快速看结果，可以用小点的数
 # data
 train_bin_dir = "data/02_train_data_more/01_bin_for_train_hf"
 valid_bin_dir = "data/02_train_data_more/02_bin_for_valid_hf"
@@ -110,6 +112,7 @@ num_workers = 0  # 数据加载器的工作进程数
 ## global_batch_size=batch_size*gradient_accumulation_steps*ddp_world_size
 batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 2048
+grad_div_total_tokens = False  # 是否在计算梯度时除以总的token数，设置reduction="none" and grad_scaling_before_comm=False，使用PowerSGD时不能使用（loss不好，可能因为PowerSGD对数大的压缩不好，有正交化操作）
 # model
 vocab_size = 64320  # 实际是64012个，写大点方便扩展，注意最好是8的倍数，见指导：https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html#tc-guidelines-padding
 hidden_dim = 2048
@@ -129,7 +132,7 @@ attention_dropout = 0.1  # TODO: 或许不用设置dropout
 dropout1 = 0.1
 dropout2 = 0.1
 residual_in_fp32 = True  # 残差连接是否使用fp32
-loss_reduction = "none"  # 损失函数的reduction方式，"mean" or "none"，使用"none"可以和grad_scaling_before_comm=False配合使用，减少精度损失
+loss_reduction = "none" if grad_div_total_tokens else "mean"  # 损失函数的reduction方式，"mean" or "none"，使用"none"可以和grad_scaling_before_comm=False配合使用，减少精度损失
 # adamw optimizer
 ## gradient_accumulation_steps=gradient_accumulation_steps*ddp_world_size
 gradient_accumulation_steps = 128  # used to simulate larger batch sizes
@@ -157,10 +160,10 @@ compile = False  # use PyTorch 2.0 to compile the model to be faster
 # 2. nccl，需要设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1
 ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 # 梯度通信优化
-use_bf16_compress_hook = True
+use_bf16_compress_hook = False
 use_powerSGD_hook = True
 # DistributedDataParallelConfig
-grad_reduce_in_fp32 = True
+grad_reduce_in_fp32 = False
 overlap_grad_reduce = True
 use_distributed_optimizer = False
 check_for_nan_in_grad = False
@@ -168,7 +171,7 @@ bucket_size = 10_000_000
 disable_bucketing = False
 # OptimizerConfig
 precision_dtype = dtype
-grad_scaling_before_comm = False  # 是否在通信前进行梯度缩放，建议bfloat16下设为False，在最后除以值，减少精度损失
+grad_scaling_before_comm = False if grad_div_total_tokens else True  # 是否在通信前进行梯度缩放，建议bfloat16下设为False，在最后除以值，减少精度损失
 overlap_optim_step = True
 overlap_zero_grad_buffer = True
 use_distributed_optimizer = False
@@ -184,15 +187,21 @@ exec(open("configurator.py").read())  # 根据命令行或者配置文件来覆�
 exp_config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
+# 删除tokenizer，后面不会用到了
+tokenizer = None
+
+# -----------------------------------------------------------------------------
+# 不能一起使用的参数配置
 assert (loss_reduction == "mean" and grad_scaling_before_comm) or (loss_reduction == "none" and not grad_scaling_before_comm),\
     "损失函数的reduction方式设置为None，必须和grad_scaling_before_comm=False配合使用，减少精度损失"
 
 if dtype == "float16" and not grad_scaling_before_comm:
     raise ValueError("float16下不能在最后才进行梯度的缩放(not grad_scaling_before_comm)，因为可能会上溢")
 
-# 删除tokenizer，后面不会用到了
-tokenizer = None
+if grad_div_total_tokens and use_powerSGD_hook:
+    raise ValueError("PowerSGD和grad_div_total_tokens=True不能一起使用，")
 
+# -----------------------------------------------------------------------------
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla 开始停止学习率衰减的step
 # min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
@@ -223,7 +232,7 @@ else:
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
     # 保存最终的配置文件信息
-    save_run_exp_config(exp_config, os.path.join(out_dir, "exp_config.py"))
+    save_run_exp_config(os.path.join(out_dir, "exp_config.py"), exp_config)
 
 # -----------------------------------------------------------------------------
 # 运行日志
@@ -255,6 +264,8 @@ torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 
+# -----------------------------------------------------------------------------
+# 类型和上下文设置
 device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
@@ -266,6 +277,8 @@ ctx = (
     else torch.autocast(device_type=device_type, dtype=ptdtype)
 )
 
+# -----------------------------------------------------------------------------
+# 任务构造器，用于生成训练和验证数据
 # task-specific setup
 iter_batches = partial(
     Task.iter_batches,
@@ -345,14 +358,18 @@ else:  # resume
 model.to(device)
 
 # -----------------------------------------------------------------------------
-# 训练所需，梯度缩放器，优化器，学习率调度器，测试函数
+# 训练所需，梯度缩放器，优化器
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 # optimizer
 optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type, logger, master_process)
-if resume and "optimizer" in checkpoint:
+# 非ddp下，在这里载入优化器状态，否则在后面载入
+if resume and "optimizer" in checkpoint and not ddp:
     optimizer.load_state_dict(checkpoint["optimizer"])
-checkpoint = None  # free up memory
+    checkpoint = None  # free up memory
+
+# -----------------------------------------------------------------------------
+# 学习率衰减策略
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -366,6 +383,7 @@ def get_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1 从1到0
     return min_lr + coeff * (learning_rate - min_lr)
+
 # -----------------------------------------------------------------------------
 # 测试函数
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -418,9 +436,9 @@ if ddp:
         disable_bucketing=disable_bucketing)
 
     # Optimizer
-    # 是否在最后才进行grad_scaling，以减少精度损失（此时loss的损失函数的参数是None，而不是mean）
     grad_scaling_factor = None
     if not grad_scaling_before_comm:
+        # 是否在最后才进行grad_scaling，以减少精度损失（此时loss的损失函数的参数是None，而不是mean）
         grad_scaling_factor = 1.0 / tokens_per_iter
     optim_config = OptimizerConfig(
         precision_dtype=precision_dtype,
@@ -432,11 +450,15 @@ if ddp:
         overlap_param_gather=overlap_param_gather)
     optimizer = Float16OptimizerWithFloat16Params(optimizer, optim_config, model, scaler=scaler, grad_clip=grad_clip)
 
+    # resume，加载优化器状态
+    if resume and "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    checkpoint = None  # free up memory
+
 # -----------------------------------------------------------------------------
 # 准备训练集
 train_batch_iter = iter_batches(split="train")
 X, Y = next(train_batch_iter)  # fetch the very first batch
-
 # 如果resume，需要跳过前面的iter
 if resume:
     skip_data_time = time.time()
@@ -472,20 +494,22 @@ if resume:
 # 预热后，设置ddp com hook，还是会取world_size的平均值
 # MyDDP中也实现了register_comm_hook，不过参数的位置不太一样
 # 基本的comm hook
-base_comm_hook = None
-if use_distributed_optimizer:
-    base_comm_hook = reduce_scatter_hook
-else:
-    base_comm_hook = all_reduce_hook
-cur_comm_hook = base_comm_hook
-comm_args = []  # 传入hook中的参数
 if ddp:
+    base_comm_hook = None
+    if use_distributed_optimizer:
+        base_comm_hook = reduce_scatter_hook
+    else:
+        base_comm_hook = all_reduce_hook
+    cur_comm_hook = base_comm_hook
+    comm_args = []  # 传入hook中的参数
+    
+    # 是否使用特其他的hook
     if use_powerSGD_hook:
         # 若没有resume，则初始化PowerSGDState
         if powerSGD_state is None:
             powerSGD_state = PowerSGDState(process_group=process_group, matrix_approximation_rank=32,
-                                warm_start=True, use_error_feedback=True, start_powerSGD_iter=2, 
-                                min_compression_rate=0.5, orthogonalization_epsilon=1e-6)
+                                           warm_start=True, use_error_feedback=True, start_powerSGD_iter=2,
+                                           min_compression_rate=2, orthogonalization_epsilon=1e-6)
         if use_bf16_compress_hook:
             cur_comm_hook = bf16_compress_wrapper(powerSGD_hook)
         else:
@@ -494,10 +518,19 @@ if ddp:
     elif use_bf16_compress_hook:
         comm_args.append(process_group)
         cur_comm_hook = bf16_compress_wrapper(base_comm_hook)
-cur_comm_hook = stream_wrapper(cur_comm_hook)  # 添加stream，用于异步通信
-model.register_comm_hook(cur_comm_hook, *comm_args,
-                         grad_scaling_factor=grad_scaling_factor, grad_scaling_before_comm=grad_scaling_before_comm)
+        
+    # 是否overlap_optim_step
+    if overlap_optim_step:
+        cur_comm_hook = overlap_optim_step_wrapper(cur_comm_hook, optimizer)
+        
+    # 添加stream，用于异步通信
+    cur_comm_hook = stream_wrapper(cur_comm_hook)
+    
+    # 最后对hook进行注册
+    model.register_comm_hook(cur_comm_hook, *comm_args,
+                             grad_scaling_factor=grad_scaling_factor, grad_scaling_before_comm=grad_scaling_before_comm)
 
+# 同步下
 if ddp:
     torch.cuda.synchronize()
     torch.distributed.barrier()
@@ -585,12 +618,15 @@ while True:
     if iter_num == 0 and eval_only:
         break
     
-    if ddp:
+    # 同步以获取真实的耗时
+    if ddp and sync_for_true_micro_time:
         torch.cuda.synchronize()
-        torch.distributed.barrier()  # 只在测试通信耗时的时候用
+        torch.distributed.barrier()
     
+    # 记录每个micro所耗费的时间
     micro_times = []
     
+    # 保存loss，用于log
     train_loss = torch.tensor([0.0], device=device)
     
     # 前向传播和反向传播，梯度更新
@@ -608,22 +644,23 @@ while True:
                 else:
                     # 否则为"none"，则grad在optim.step中进行scale，减少精度损失
                     loss = torch.sum(loss.view(-1))
-            train_loss += loss.detach()
+            train_loss += loss.clone().detach()
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = next(train_batch_iter)
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
     
-            if ddp:
+            # 同步以获取真实的耗时
+            if ddp and sync_for_true_micro_time:
                 torch.cuda.synchronize()
-                torch.distributed.barrier()  # 只在测试通信耗时的时候用
+                torch.distributed.barrier()
                 
             micro_time = time.time() - micro_time  #! 1
             micro_times.append(micro_time)
     
     last_micro_time = time.time()  #! 2
     
-    # last_microbatch
+    # last_microbatch，需要同步了，backward中会进行梯度的通信（overlap_optim_step下还会进行optim.step()）
     with ctx:
         model_outputs = model(X, Y)
         loss = model_outputs["loss"]
@@ -632,7 +669,7 @@ while True:
         else:
             # 否则为"none"，则grad在optim.step中进行scale，减少精度损失
             loss = torch.sum(loss.view(-1))
-    train_loss += loss.detach()
+    train_loss += loss.clone().detach()
     # immediately async prefetch next batch while model is doing the forward pass on the GPU
     X, Y = next(train_batch_iter)
     # backward pass, with gradient scaling if training in fp16
@@ -643,14 +680,21 @@ while True:
     optimizer.step()  # scaler和grad_clip放在了这里面
     optimizer.zero_grad(set_to_none=True)
     
-    if ddp:
+    # 同步以获取真实的耗时
+    if ddp and sync_for_true_micro_time:
         torch.cuda.synchronize()
         torch.distributed.barrier()
+
     last_micro_time = time.time() - last_micro_time  #! 2
     micro_times.append(last_micro_time)
     optim_step_time = time.time() - optim_step_time  #! 3
     
     torch.distributed.all_reduce(train_loss, group=process_group, async_op=False)
+    # 需要取平均值
+    if loss_reduction == "mean":
+        train_loss = train_loss / ddp_world_size
+    else:
+        train_loss = train_loss / tokens_per_iter
     
     # 输出结果
     # timing and logging
@@ -660,10 +704,6 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
         # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。
-        if loss_reduction == "mean":
-            train_loss = train_loss / ddp_world_size
-        else:
-            train_loss = train_loss / tokens_per_iter
         lossf = train_loss.item()
         if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)

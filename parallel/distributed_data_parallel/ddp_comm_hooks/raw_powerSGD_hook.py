@@ -15,12 +15,6 @@ return event
 添加两个参数grad_scaling_factor=None, grad_scaling_before_comm=True
 默认，在comm前，进行grad的缩放
 其他可能的情况：想要在comm后对grad进行缩放，并且大小是所有token数和world_size，即尽可能减少精度的损失
-
-powerSGD_hook中，我进行了一些修改：
-1. 添加了些重叠，并且全程在一个流中，不使用future（then会创建新的流，使得结果需要torch.cuda.synchronize()同步）
-2. 添加对embedding层和unembedding层的过滤，不进行压缩
-3. loss结果和全pytoch的实现一致，速度快了些，mfu: 54.07% -> 55.04%（不过滤embedding和unembedding）
-    过滤embedding、unembedding、一维tensor情况下，mfu: 48.12%
 """
 
 from collections import defaultdict
@@ -36,7 +30,9 @@ from ..param_and_grad_buffer import Bucket
 from . import default_hooks as default
 from .default_hooks import stream_wrapper
 
-__all__ = ["PowerSGDState", "powerSGD_hook"]
+__all__ = [
+    "PowerSGDState", "powerSGD_hook", "batched_powerSGD_hook"
+]
 
 logger = logging.getLogger(__name__)
 
@@ -117,10 +113,10 @@ def _should_compress(
     
     # 其他条件
     flag = True
-    if num_rows > 60_000 or num_cols > 60_000:
-        # 维度大的，不压缩，特指：embedding层和unembedding层
-        flag = False
-    # 设置min_compression_rate = 2，即使得一维的参数不压缩
+    # if num_rows > 60_000 or num_cols > 60_000:
+    #     # 维度大的，不压缩，特指：embedding层和unembedding层
+    #     flag = False
+    # # 设置min_compression_rate = 2，即使得一维的参数不压缩
         
     return (
         compressed_size * min_compression_rate < uncompressed_size and flag,
@@ -532,7 +528,6 @@ def powerSGD_hook(
 
     # If warm-start is enabled, reuse Qs from the previous iteration if possible and skip filling random values.
     # The exception is the first iteration when PowerSGD is applied.
-    # 1. q的初始化和正交化，如果warm-start，可以跳过
     if not need_randomize_qs:
         for q in qs:
             _orthogonalize(q, state.orthogonalization_epsilon)
@@ -554,84 +549,341 @@ def powerSGD_hook(
                 )
                 _orthogonalize(q, state.orthogonalization_epsilon)
 
-    # 2. p的计算
+    # Compute Ps.
     for tensor, q, p in zip(tensors_to_compress, qs, ps):
         torch.bmm(tensor, q, out=p)
-    
-    # -----------------------------------------------------------------------------------------
-    # 改为同步，异步交给外面的stream_wrapper
-    
-    # Since these Ps will be orthogonalized later, no need to divide them by world size.
-    # 3. p的allreduce
-    dist.all_reduce(state.p_memory_dict[bucket_index], group=group_to_use, async_op=False)
 
-    # 发起uncompressed tensors的allreduce，可以与（p的正交化、q的计算）重叠
-    allreduce_contiguous_uncompressed_tensors_handle = dist.all_reduce(
+    # This allreduce is only applied to uncompressed tensors,
+    # so it should have been kicked off before the above computation on the compressed tensors to hide more communication costs.
+    # However, this somehow requires a separate future chain at this time.
+    allreduce_contiguous_uncompressed_tensors_fut = dist.all_reduce(
         uncompressed_tensors_memory, group=group_to_use, async_op=True
-    )
-    
-    # 4. p的正交化
-    for p in ps:
-        _orthogonalize(p, state.orthogonalization_epsilon)
+    ).get_future()
 
-    # 5. q的计算
-    for tensor, p, q in zip(tensors_to_compress, ps, qs):
-        torch.bmm(tensor.transpose(1, 2), p, out=q)
-        
-    allreduce_contiguous_uncompressed_tensors_handle.wait()
-    
-    # 6. q的allreduce，可以与uncompressed_tensors_memory的copy重叠
-    all_reduce_q_handle = dist.all_reduce(state.q_memory_dict[bucket_index], group=group_to_use, async_op=True)
-    
-    # uncompressed_tensors_memory的copy
-    if grad_scaling_before_comm:
-        uncompressed_tensors_memory.mul_(grad_scaling_factor)
-    idx = 0
-    for tensor in uncompressed_tensors:
-        tensor.copy_(
-            uncompressed_tensors_memory[idx : idx + tensor.numel()].view_as(tensor)
+    def unpack_uncompressed_tensors_and_allreduce_ps(fut):
+        #* 改
+        if grad_scaling_before_comm:
+            uncompressed_tensors_memory = fut.value()[0].mul_(grad_scaling_factor)
+        idx = 0
+        for tensor in uncompressed_tensors:
+            tensor.copy_(
+                uncompressed_tensors_memory[idx : idx + tensor.numel()].view_as(tensor)
+            )
+            idx += tensor.numel()
+
+        # Since these Ps will be orthogonalized later, no need to divide them by world size.
+        return (
+            dist.all_reduce(
+                state.p_memory_dict[bucket_index], group=group_to_use, async_op=True
+            )
+            .get_future()
+            .wait()[0]
         )
-        idx += tensor.numel()
 
-    # 7. 最终梯度的计算
-    all_reduce_q_handle.wait()
-    if grad_scaling_before_comm:
-        state.q_memory_dict[bucket_index].mul_(grad_scaling_factor)
-    for p, q, tensor in zip(ps, qs, tensors_to_compress):
-        torch.bmm(p, q.transpose(1, 2), out=tensor)
+    def compute_qs(fut):
+        state.p_memory_dict[bucket_index] = fut.value()
+        for p in ps:
+            _orthogonalize(p, state.orthogonalization_epsilon)
 
-    # Copy batched tensors back to original buffer.
-    if state.batch_tensors_with_same_shape:
-        for tensor in tensors_to_compress:
-            if tensor.shape[0] == 1:
-                # Skip tensor with batch_size == 1 since itself is the original tensor.
-                continue
-            original_tensors = shape_to_tensors[tensor.shape[1:]]
-            for i, original_tensor in enumerate(original_tensors):
-                original_tensor.copy_(tensor[i])
+        # Compute Qs.
+        for tensor, p, q in zip(tensors_to_compress, ps, qs):
+            torch.bmm(tensor.transpose(1, 2), p, out=q)
 
-    #* 删除，不阻塞
-    #* 但是删除后，会导致结果不准确，损失不怎么降，奇怪
-    # if torch.cuda.is_available():
-    #     torch.cuda.synchronize(device)
+        # TODO: The above procedure does two matmul+allreduce steps per iteration --
+        # one left multiplication and one right multiplication.
+        # For warm-start, can take one such step at a time, and alternate between them.
 
-    if state.use_error_feedback:
-        # Memorize the local errors.
-        state.error_dict[bucket_index] = input_tensor_cp - input_tensor
-    #* 不清空
-    if not state.warm_start:
-        # #* 可能阻塞需要加在这里？
-        # if torch.cuda.is_available():
-        #     torch.cuda.synchronize(device)
-        #* 或者改为在前面进行清空
-        #* 又或者不清空，因为后续也会覆盖
-        state.p_memory_dict.clear()
-        state.q_memory_dict.clear()
+        # Allreduce Qs.
+        return (
+            dist.all_reduce(
+                state.q_memory_dict[bucket_index], group=group_to_use, async_op=True
+            )
+            .get_future()
+            .wait()[0]
+        )
 
-    state.maybe_increase_iter(bucket)
+    def decompress(fut):
+        #* 改
+        if grad_scaling_before_comm:
+            state.q_memory_dict[bucket_index] = fut.value().mul_(grad_scaling_factor)
+        else:
+            state.q_memory_dict[bucket_index] = fut.value()
+
+        for p, q, tensor in zip(ps, qs, tensors_to_compress):
+            torch.bmm(p, q.transpose(1, 2), out=tensor)
+        
+            # 放到optim中实现，因为这里的grad可能还是fp16的，会导致精度损失
+            # if not grad_scaling_before_comm:
+            #     tensor.mul_(grad_scaling_factor)
+
+        # Copy batched tensors back to original buffer.
+        if state.batch_tensors_with_same_shape:
+            for tensor in tensors_to_compress:
+                if tensor.shape[0] == 1:
+                    # Skip tensor with batch_size == 1 since itself is the original tensor.
+                    continue
+                original_tensors = shape_to_tensors[tensor.shape[1:]]
+                for i, original_tensor in enumerate(original_tensors):
+                    original_tensor.copy_(tensor[i])
+
+        #* 删除，不阻塞
+        #* 但是删除后，会导致结果不准确，损失不怎么降，奇怪
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+        if state.use_error_feedback:
+            # Memorize the local errors.
+            state.error_dict[bucket_index] = input_tensor_cp - input_tensor
+        #* 不清空
+        if not state.warm_start:
+            # #* 可能阻塞需要加在这里？
+            # if torch.cuda.is_available():
+            #     torch.cuda.synchronize(device)
+            #* 或者改为在前面进行清空
+            #* 又或者不清空，因为后续也会覆盖
+            state.p_memory_dict.clear()
+            state.q_memory_dict.clear()
+
+        state.maybe_increase_iter(bucket)
+        
+    allreduce_contiguous_uncompressed_tensors_fut.then(
+        unpack_uncompressed_tensors_and_allreduce_ps
+    ).then(compute_qs).then(decompress)
         
     # 添加event，用于同步
     event = torch.cuda.Event(enable_timing=False)
     event.record(torch.cuda.current_stream())
 
     return event
+
+
+def batched_powerSGD_hook(
+    bucket: Bucket, state: PowerSGDState, grad_scaling_factor=None, grad_scaling_before_comm=True
+) -> torch.futures.Future[torch.Tensor]:
+    r"""
+    This DDP communication hook implements a simplified PowerSGD gradient compression
+    algorithm described in the `paper <https://arxiv.org/abs/1905.13727>`_.
+    This variant does not compress the gradients layer by layer,
+    but instead compresses the flattened input tensor that batches all the gradients.
+    Therefore, it is **faster** than :meth:`powerSGD_hook`,
+    but usually results in a **much lower accuracy**, unless ``matrix_approximation_rank`` is 1.
+
+    .. warning ::
+        Increasing ``matrix_approximation_rank`` here may not necessarily increase the accuracy,
+        because batching per-parameter tensors without column/row alignment can destroy low-rank structure.
+        Therefore, the user should always consider :meth:`powerSGD_hook` first,
+        and only consider this variant when a satisfactory accuracy can be achieved when ``matrix_approximation_rank`` is 1.
+
+    Once gradient tensors are aggregated across all workers, this hook applies
+    compression as follows:
+
+    1. Views the input flattened 1D gradient tensor as a square-shaped tensor M with 0 paddings;
+
+    2. Creates two low-rank tensors P and Q for decomposing M, such that M = PQ^T, where Q is initialized from a standard normal distribution and orthogonalized;
+
+    3. Computes P, which is equal to MQ;
+
+    4. Allreduces P;
+
+    5. Orthogonalizes P;
+
+    6. Computes Q, which is approximately equal to M^TP;
+
+    7. Allreduces Q;
+
+    8. Computes M, which is approximately equal to PQ^T.
+
+    9. Truncates the input tensor to the original length.
+
+    Note that this communication hook enforces vanilla allreduce for the first ``state.start_powerSGD_iter`` iterations.
+    This not only gives the user more control over the tradeoff between speedup and accuracy,
+    but also helps abstract away some complexity of the internal optimization of DDP for future communication hook developers.
+
+    Args:
+        state (PowerSGDState): State information to configure the compression rate and support error feedback, warm start, etc.
+            To tune the compression configs, mainly need to tune ``matrix_approximation_rank`` and ``start_powerSGD_iter``.
+        bucket (Bucket): Bucket that stores a 1D flattened gradient tensor that batches multiple per-variable tensors.
+            Note that since DDP comm hook only supports single process single device mode,
+            only exactly one tensor is stored in this bucket.
+
+    Returns:
+        Future handler of the communication, which updates the gradients in place.
+
+    Example::
+        >>> state = PowerSGDState(process_group=process_group, matrix_approximation_rank=1)
+        >>> ddp_model.register_comm_hook(state, batched_powerSGD_hook)
+    """  # noqa: B950
+    process_group = state.process_group
+    group_to_use = process_group if process_group is not None else dist.group.WORLD
+    world_size = group_to_use.size()
+    
+    if grad_scaling_factor is None:
+        grad_scaling_factor = 1.0 / world_size
+
+    # The input tensor is a flattened 1D tensor.
+    input_tensor = bucket.buffer()
+
+    # Run vanilla allreduce in the first `start_powerSGD_iter` iterations.
+    if state.iter < state.start_powerSGD_iter:
+        state.maybe_increase_iter(bucket)
+        return default.all_reduce_hook(bucket, process_group=group_to_use, async_op=True,\
+            grad_scaling_factor=grad_scaling_factor, grad_scaling_before_comm=grad_scaling_before_comm)  #* 改
+
+    # Apply PowerSGD after `start_powerSGD_iter` iterations.
+    device = input_tensor.device
+    total_length = input_tensor.shape[0]
+    state.total_numel_before_compression += total_length
+
+    # View the input tensor as a 2D square-shape tensor, and pad 0s if necessary.
+    square_side_length = math.ceil(math.sqrt(total_length))
+    state.total_numel_after_compression += (
+        square_side_length * state.matrix_approximation_rank * 2
+    )
+    padded_total_length = square_side_length ** 2
+    input_tensor.resize_(padded_total_length)
+    input_tensor[total_length:padded_total_length].fill_(0)
+
+    _report_compression_stats(bucket, state)
+
+    # Incorporate the error from the previous state into the gradients.
+    bucket_index = bucket.index()
+    input_tensor_cp = None
+    if state.use_error_feedback:
+        if bucket_index in state.error_dict:
+            input_tensor.add_(state.error_dict[bucket_index])
+        else:
+            logger.info(
+                "A zero tensor of length {} that represents local error is created.".format(
+                    padded_total_length
+                )
+            )
+            state.error_dict[bucket_index] = torch.zeros(
+                padded_total_length, device=device, dtype=input_tensor.dtype
+            )
+
+        # Keep a copy of the input tensor,
+        # so that we can compute the local error caused by compression later,
+        # by comparing this copy and the input tensor updated after decompression.
+        input_tensor_cp = torch.clone(input_tensor).detach()
+    matrix = input_tensor.view(square_side_length, square_side_length)
+
+    # Reuse P and Q from the previous iteration if possible.
+    # The memory spaces of P and Q need to be allocated in the first iteration when PowerSGD is applied.
+    if not state.warm_start or bucket_index not in state.p_memory_dict:
+        # If warm-start is disabled, low-rank tensors will be initialized at every step.
+        # Only log this if warm-start to avoid spamming.
+        if state.warm_start:
+            logger.info(
+                "Initializing low-rank tensors P and Q, each of which has a shape of {} x {}.".format(
+                    square_side_length, state.matrix_approximation_rank
+                )
+            )
+
+        def create_low_rank_tensor(fill_random_values, rng):
+            "Returns a low-rank 2D tensor of square_side_length * matrix_approximation_rank."
+            if fill_random_values:
+                with torch.random.fork_rng(devices=[input_tensor.device]):  #* 改为从GPU fork，原来可能CPU会阻塞？ 
+                    # Fork this RNG to avoid changing the seed globally and affecting the random sampling
+                    # anywhere else in the training.
+                    # The seed makes sure that the initial random values are the same across all the DDP replicas.
+                    # This seed should differ at every step.
+                    # Since it is very slow to fork RNG state across all the CUDA devices,
+                    # only fork on CPU and then move the generated tensor to the CUDA device.
+                    torch.manual_seed(rng.randint(1_000_000_000))
+                    return torch.randn(
+                        square_side_length,
+                        state.matrix_approximation_rank,
+                        device="cpu",
+                        dtype=input_tensor.dtype,
+                    ).to(device)
+            else:
+                return torch.empty(
+                    square_side_length,
+                    state.matrix_approximation_rank,
+                    device=device,
+                    dtype=input_tensor.dtype,
+                )
+
+        state.p_memory_dict[bucket_index] = create_low_rank_tensor(
+            fill_random_values=False, rng=state.rng
+        )
+        state.q_memory_dict[bucket_index] = create_low_rank_tensor(
+            fill_random_values=True, rng=state.rng
+        )
+    _orthogonalize(state.q_memory_dict[bucket_index])
+
+    torch.matmul(
+        matrix, state.q_memory_dict[bucket_index], out=state.p_memory_dict[bucket_index]
+    )
+    allreduce_p_fut = dist.all_reduce(
+        state.p_memory_dict[bucket_index], group=group_to_use, async_op=True
+    ).get_future()
+
+    def compute_q(fut):
+        state.p_memory_dict[bucket_index] = fut.value()[0]
+        _orthogonalize(state.p_memory_dict[bucket_index])
+
+        torch.matmul(
+            matrix.t(),
+            state.p_memory_dict[bucket_index],
+            out=state.q_memory_dict[bucket_index],
+        )
+
+        # TODO: The above procedure does two matmul+allreduce steps per iteration --
+        # one left multiplication and one right multiplication.
+        # For warm-start, can take one such step at a time, and alternate between them.
+
+        return (
+            dist.all_reduce(
+                state.q_memory_dict[bucket_index], group=group_to_use, async_op=True
+            )
+            .get_future()
+            .wait()[0]
+        )
+
+    def decompress(fut):
+        #* 改
+        if grad_scaling_before_comm:
+            state.q_memory_dict[bucket_index] = fut.value().mul_(grad_scaling_factor)
+        else:
+            state.q_memory_dict[bucket_index] = fut.value()
+        torch.matmul(
+            state.p_memory_dict[bucket_index],
+            state.q_memory_dict[bucket_index].t(),
+            out=matrix,
+        )
+        # 放到optim中实现，因为这里的grad可能还是fp16的，会导致精度损失
+        # if not grad_scaling_before_comm:
+        #     matrix.mul_(grad_scaling_factor)
+
+        if state.use_error_feedback:
+            # Memorize the local errors.
+            state.error_dict[bucket_index] = input_tensor_cp - input_tensor
+        # Removing this seemingly unnecessary sync somehow may cause faliures.
+        # See: https://github.com/pytorch/pytorch/pull/54838
+        #* 不懂，是否添加event来同步就行了，就不用阻塞了
+        # if torch.cuda.is_available():
+        #     torch.cuda.synchronize(device)
+        
+        #* 不清空
+        # if not state.warm_start:
+        #     #* 可能阻塞需要加在这里？
+        #     if torch.cuda.is_available():
+        #         torch.cuda.synchronize(device)
+        #     #* 或者改为在前面进行清空
+        #     #* 又或者不清空，因为后续也会覆盖
+        #     state.p_memory_dict.clear()
+        #     state.q_memory_dict.clear()
+        
+        #* 可能会阻塞，直接删除，因为MyDDP中不需要返回结果值，只需要返回handle就行（有wait()）
+        # ret = input_tensor.resize_(total_length)
+
+        state.maybe_increase_iter(bucket)
+        
+        # 添加event，用于同步
+        event = torch.cuda.Event(enable_timing=False)
+        event.record(torch.cuda.current_stream())
+
+        return event
+
+    return allreduce_p_fut.then(compute_q).then(decompress)

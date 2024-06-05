@@ -1,6 +1,35 @@
 # llm-zero2all
 
-从零开始编写与大语言模型有关的所有代码，用于学习
+从零开始编写与大语言模型有关的所有代码，用于学习，后续会完善相应的文档。
+
+1. [构建数据集](#01-数据集)，使用多个公开数据集，构建文本文件来训练分词器，通过分词器构建bin文件用于训练，能从多个文件中挑选出部分内容作为验证集。
+
+2. [分词器](#02-分词器tokenizer)，两个，huggingface的tokenizers，sentencepiece，最后构建出的类可以通过`save_pretrained(dir)`保存，通过`AutoTokenizer.from_pretrained(dir)`导入。
+
+3. [模型结构](#03-模型结构-z2all-使用-llama2-结构)，使用llama2结构，并且将多个模块更改为融合算子，加速计算。
+
+4. [训练](#04-训练)，使用自己实现的DDP和分布式优化器（基于Megatron-LM源码，简化了）来训练，代码实现更易懂
+
+    * PyTorch的DDP的脚本训练
+    * 自己实现的DDP和分布式优化器（基于Megatron-LM源码，简化了实现代码，添加了部分其他特性，如添加overlap_optim_step的支持等），还有混合精度优化器的实现，可以使用register_comm_hook来自定义梯度通信，包含三种通信和计算重叠（overlap_grad_reduce, overlap_param_gather, overlap_optim_step）
+    还包含PowerSGD的实现（基于PyTorch源码，不过源码中是阻塞的，我通过cuda的stream和event实现了powerSGD_hook的异步，能与grad_reduce并行）
+    * 构建了一个简单的实验过程可视化（通过ssh远程获取文件来可视化），主要是因为使用wandb时有错误，所以写了一个可视化。
+    * 训练可以从断点重新训练，保存的方式更加稳定（保存最优和次优的文件，防止保存失败导致文件损坏）
+
+5. 其他，提供[docker镜像](#10-docker镜像)，包含实验所需的所有环境
+
+**注意**，目前的代码可能比较乱（主要是根目录我添加了很多测试各种特性的代码，看文件名应该可以理解-.-），根目录下的非测试代码如下（按字母顺序）：
+
+```txt
+01. configurator.py, 解析命令行
+02. hfd.sh, 下载huggingface中的模型和数据集
+03. my_dataset.py, 数据集构建类
+04. pretokenize_data_more.py, 预处理数据集为bin文件，用于训练
+05. pretrain_my_ddp.py, 自己实现的DDP的预训练脚本
+06. pretrain.py, PyTorch的DDP的预训练脚本
+07. README.md, 说明文档
+08. train_tokenizer.py, 训练自己的分词器
+```
 
 ## 00 环境配置
 我的环境：cuda11.4, pytorch1.12.1
@@ -27,7 +56,7 @@
 
 GPU通信方式：https://zhuanlan.zhihu.com/p/74217534
 
-## 01 数据集构建
+## 01 数据集
 ### 包含的数据集
 | 类别  | 文件名                     | raw大小 | 存储格式                 | json大小 | txt大小 | train |
 | ----- | ------------------------- | ------- | ----------------------- | -------- | ------- | ----- |
@@ -250,13 +279,21 @@ Qwen使用tiktoken，其自己管理特殊token，https://huggingface.co/Qwen/Qw
         }
         ```
 
-## 03 构建基础语言模型 Z2all (使用 llama2 结构)
+## 03 模型结构 Z2all (使用 llama2 结构)
 
 包括flash-attn, rope, cross_entropy, rmsnorm, swiglu, AdamW的安装和使用
 
-见：[构建基础语言模型 Z2all (使用 llama2 结构)](./model/README.md)
+见：[模型结构 Z2all (使用 llama2 结构)](./model/README.md)
 
 ## 04 训练
+
+有两个训练脚本：
+
+1. `pretrain.py`，使用PyTorch版本的DDP
+
+2. `pretrain_my_ddp.py`，使用自己的DDP，支持分布式优化器，支持自定义comm_hook，目前这个版本最新
+
+### 参数设置
 
 参数设置可以参考，https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html
 
@@ -288,6 +325,18 @@ wandb用起来有点问题，5个iter后就报错：BrokenPipeError: [Errno 32] 
 ### resume
 
 使得训练可以从断点重新训练，保存的方式更加稳定（保存最优和次优的文件，防止保存失败导致文件损坏）
+
+1. 训练会保存`exp_config.py`文件，表示上次训练的各种参数配置（也可以不指定）。
+
+2. `--resume`，表示继续某处的训练。
+
+3. `--out_dir="out/2024_06_05_20_27_58"`，指定上次训练保存的目录，会读取其中的模型权重等文件。
+
+例子：
+
+```bash
+torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py "out/2024_06_05_20_27_58/exp_config.py" --resume --out_dir="out/2024_06_05_20_27_58"
+```
 
 ## 10 Docker镜像
 

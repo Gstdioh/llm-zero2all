@@ -133,18 +133,16 @@ class MyThread(QThread):
             # 保证关闭连接
             self.sftp.close()
             self.ssh.close()
- 
- 
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hostname", type=str, default="10.10.24.107")
-    parser.add_argument("--port", type=int, default=30792)
+    parser.add_argument("--hostname", type=str, default="123.456.123.456")
+    parser.add_argument("--port", type=int, default=9527)
     parser.add_argument("--username", type=str, default="root")
-    parser.add_argument("--password", type=str, default=r"32myp3M5fNwMXr^v5%7ubdLezPH2T0NE")
-    parser.add_argument("--remote_file_path", type=str, default="/202232803052/axk/gly/llm-zero2all/reslog/run2024_05_09_20_38_12.pkl")
+    parser.add_argument("--password", type=str, default=r"123456")
+    parser.add_argument("--remote_file_path", type=str, default="llm-zero2all/reslog/run2024_05_09_20_38_12.pkl")
     args = parser.parse_args()
-    
-    args.remote_file_path = "/202232803052/axk/gly/llm-zero2all/reslog/run2024_05_09_20_52_33.pkl"
     
     log_basename = args.remote_file_path.split("/")[-1]
     

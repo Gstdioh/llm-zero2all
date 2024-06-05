@@ -55,6 +55,11 @@ def overlap_optim_step_wrapper(hook, optimizer):
         
         if optimizer.optim_config.overlap_zero_grad_buffer:
             bucket.grad_data.zero_()  # 清零bucket对应的model main_grads
+            
+        if bucket.is_last():
+            # 记得将optim的param_groups还原回来
+            for group_idx in range(len(optimizer.param_groups)):
+                optimizer.param_groups[group_idx]["params"] = optimizer.all_optim_param_groups[group_idx]
         
         # 添加event，用于同步
         event = torch.cuda.Event(enable_timing=False)

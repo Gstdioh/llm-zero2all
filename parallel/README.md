@@ -1,5 +1,7 @@
 # 分布式训练
 
+代码见：`llm-zero2all/parallel`
+
 ## 01 分布式数据并行（Distributed Data Parallel）
 
 ### 1 使用pytorch进行DDP训练
@@ -175,7 +177,9 @@ model.register_comm_hook(powerSGD_state, stream_wrapper(powerSGD_hook))
 
 后：16.9890s | mfu 54.00% | backward_comm: 2.6669s
 
-### 3 Megatron-LM的DDP实现
+### 3 我的DDP实现
+
+基于Megatron-LM源码，简化了实现代码，添加了部分其他特性。
 
 1. 使用hook，如下，当模型参数的梯度进行累加时触发
 
