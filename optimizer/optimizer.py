@@ -51,6 +51,12 @@ def _multi_tensor_copy_this_to_that(
 class Z2allOptimizer:
     """
     简单的包裹，使得访问Z2allOptimizer就像访问self.optimizer一样
+    
+    Args:
+        optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
+        optim_config (OptimizerConfig): configuration object for optimizer.
+        scaler: used for scaling gradients.
+        grad_clip: used for cliping gradients.
     """
     
     def __init__(self, optimizer: torch.optim.Optimizer, optim_config: OptimizerConfig,
@@ -105,6 +111,9 @@ class MixedPrecisionOptimizer(Z2allOptimizer, ABC):
 
     Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
+        optim_config (OptimizerConfig): configuration object for optimizer.
+        scaler: used for scaling gradients.
+        grad_clip: used for cliping gradients.
     """
 
     def __init__(self, optimizer: torch.optim.Optimizer, optim_config: OptimizerConfig,
@@ -211,13 +220,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
-        config (OptimizerConfig): configuration object for optimizer.
-        grad_scaler (MegatronGradScaler): used for scaling gradients. Note that
-            this can be None. This case happens when `bf16 = True` and we don't
-            use any loss scale. Note that for `bf16 = True`, we can have
-            a constant gradient scaler. Also for `bf16 = False`, we
-            always require a grad scaler.
-        init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        optim_config (OptimizerConfig): configuration object for optimizer.
+        model_chunks: ddp model list.
+        scaler: used for scaling gradients.
+        grad_clip: used for cliping gradients.
     """
 
     def __init__(self, optimizer: torch.optim.Optimizer,
@@ -496,6 +502,10 @@ class FP32Optimizer(Z2allOptimizer):
     
     Args:
         optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
+        optim_config (OptimizerConfig): configuration object for optimizer.
+        model_chunks: ddp model list.
+        scaler: used for scaling gradients.
+        grad_clip: used for cliping gradients.
     """
     
     @classmethod

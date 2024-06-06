@@ -597,18 +597,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Args:
             optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
-            config (OptimizerConfig): configuration object for optimizer.
-            grad_scaler (MegatronGradScaler): used for scaling gradients. Note that
-                this can be None. This case happens when `bf16 = True` and we don't
-                use any loss scale. Note that for `bf16 = True`, we can have
-                a constant gradient scaler. Also for `bf16 = False`, we
-                always require a grad scaler.
-            init_state_fn (Callable, optional): function to initialize state in the optimizer.
-            per_model_buffers (Dict[int, List[ParamAndGradBuffer]]): the implementation of the
-                distributed optimizer is centered on using a contiguous buffer for
-                communicating grads & params between the model state and the optimizer state.
-                You can find a more detailed description in
-                https://github.com/NVIDIA/Megatron-LM/blob/main/docs/source/distrib_optimizer.md.
+            optim_config (OptimizerConfig): configuration object for optimizer.
+            model_chunks: ddp model list.
+            scaler: used for scaling gradients.
+            grad_clip: used for cliping gradients.
             data_parallel_group (torch.distributed.ProcessGroup): data-parallel group to use to
                 all-gather params after optimizer.step().
             data_parallel_group_gloo (torch.distributed.ProcessGroup): gloo data-parallel group
@@ -844,10 +836,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param_group in state_dict["optimizer"]["param_groups"]:
             del param_group["params"]
 
-        # Grad scaler state.
-        if self.grad_scaler:
-            state_dict['grad_scaler'] = self.grad_scaler.state_dict()
-
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -924,22 +912,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.load_state_dict(
             {"state": state_dict_state, "param_groups": state_dict_param_groups,}
         )
-
-        # Grad scaler.
-        if 'grad_scaler' not in state_dict:
-            if self.config.fp16:
-                logger.info(
-                    '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
-                )
-        else:
-            if self.grad_scaler:
-                self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
-            else:
-                logger.info(
-                    '***WARNING*** fould the grad scaler in the '
-                    'checkpoint but it is None in the class. '
-                    'Skipping loading grad scaler ...'
-                )
 
         if 'param_state' in state_dict:
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
@@ -1037,7 +1009,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 offset_in_world_tensors = 0
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                     # 对每个bucket操作，获取rank各自的local_shards
-                    # 然后聚合到rank0上进行保存，是在cpui进行聚合的，需要使用gloo后端
+                    # 然后聚合到rank0上进行保存，是在cpu进行聚合的，需要使用gloo后端
 
                     # Compute local DP contiguous shard's size.
                     gbuf_world_numel = self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
@@ -1123,6 +1095,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             filename (str): path to save parameter state to.
         """
 
+        # TODO_MY 还没测试分布式优化器的保存与加载
         state_dict = self.get_parameter_state_dp_zero()
         if torch.distributed.get_rank(self.data_parallel_group) == 0:  # 每个dp组的第一个local rank
             torch.save(state_dict, filename)

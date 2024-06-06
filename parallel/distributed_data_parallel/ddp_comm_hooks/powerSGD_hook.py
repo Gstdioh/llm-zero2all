@@ -31,6 +31,7 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.distributed import distributed_c10d
 
 from ..param_and_grad_buffer import Bucket
 from . import default_hooks as default
@@ -297,6 +298,45 @@ class PowerSGDState(object):
         # Turn on if compression / decompression computation is a bottleneck.
         self.batch_tensors_with_same_shape = batch_tensors_with_same_shape
 
+    # def __getstate__(self):
+    #     r"""
+    #     Return a ``Dict[str, Any]`` which will be pickled and saved.
+
+    #     ``process_group`` is not serializable and excluded from
+    #     a returned state.
+    #     """
+    #     logger.warning(
+    #         "NOTE: Process group is not serializable and excluded from a saved state."
+    #     )
+    #     return {
+    #         slot: getattr(self, slot)
+    #         for slot in self.__slots__ if slot != "process_group"
+    #     }
+
+    # def __setstate__(self, state):
+    #     r"""
+    #     Take a provided ``state`` and set to this ``PowerSGDState`` instance.
+
+    #     ``process_group`` is set to default.
+    #     """
+    #     self.process_group = distributed_c10d._get_default_group()
+    #     logger.warning(
+    #         "NOTE: Process group will be set to a default group (i.e. the world size).\
+    #             If a different group is desired, please set `self.process_group` after PowerSGD state is loaded."
+    #     )
+    #     for slot, value in state.items():
+    #         setattr(self, slot, value)
+    
+    def copy_tensor_to_device(self, device):
+        """
+        将其中的tensor复制到指定的设备上
+        
+        需要用于utils/utils.py的copy_tensor_to_device_in_object
+        """
+        for dict_ in [self.error_dict, self.p_memory_dict, self.q_memory_dict]:
+            for key, value in dict_.items():
+                dict_[key] = value.to(device)
+          
     def maybe_increase_iter(self, bucket):
         # Since bucket 0 is the last bucket to allreduce in an iteration.
         # Only increase `iter` when bucket 0 is processed.

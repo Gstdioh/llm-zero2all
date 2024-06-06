@@ -38,9 +38,13 @@ $ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standa
 # gpu4, gpu4_2
 - gpu4
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp.py
+# resume
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp.py --resume --out_dir=out/2024_06_06_10_43_35
 
 - gpu4_2
 $ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp.py
+# resume
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp.py --resume --out_dir=out/2024_06_06_10_43_35
 """
 
 import math
@@ -61,7 +65,7 @@ from transformers import AutoConfig, AutoTokenizer
 from my_dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 import utils
-from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config
+from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config, copy_tensor_to_device_in_object
 
 from parallel.distributed_data_parallel import DistributedDataParallelConfig
 from parallel.distributed_data_parallel import DistributedDataParallel as MyDDP
@@ -80,12 +84,6 @@ os.environ["OMP_NUM_THREADS"] = "8"  # set the number of threads for OpenMP
 
 # os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"  # 设置每个 CUDA 设备的最大并行内核执行数，速度还快了？
 
-
-# 用于torch.compile，需要PyTorch>=2.0
-if torch.__version__ >= "2.0.0":
-    import torch._dynamo
-    torch._dynamo.config.cache_size_limit = 128  # 原来是64，有警告，设大点加快编译
-
 # 用于找到pad的id
 # tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
 
@@ -93,7 +91,7 @@ if torch.__version__ >= "2.0.0":
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 200  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
+eval_interval = 100  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
 log_interval = 1
 eval_iters = 100  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
@@ -209,7 +207,6 @@ min_lr = learning_rate / 10  # 衰减到的最小学习率
 
 # -----------------------------------------------------------------------------
 # 设置ddp，判断是否是主进程
-# various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run? 使用torchrun才会自动设置环境变量，即正常运行python文件不会开启ddp
 if ddp:
     process_group = init_process_group(backend=ddp_backend)  # 或者通过dist.group.WORLD来获得初始化后的process_group
@@ -229,6 +226,7 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
+# 创建out_dir，并保存最终的配置文件信息
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
     # 保存最终的配置文件信息
@@ -261,19 +259,19 @@ if master_process:
 # 设置随机种子
 torch.manual_seed(1337 + seed_offset)
 
+# 允许tf32计算，比float16精度高，比float32速度快
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 
 # -----------------------------------------------------------------------------
 # 类型和上下文设置
 device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
+# float16下会使用GradScaler
 ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
 # 设置自动混合精度的上下文
 ctx = (
     nullcontext()
     if device_type == "cpu"
-    # else torch.amp.autocast(device_type=device_type, dtype=ptdtype)  # 原来的代码
     else torch.autocast(device_type=device_type, dtype=ptdtype)
 )
 
@@ -291,132 +289,35 @@ iter_batches = partial(
 )
 
 # -----------------------------------------------------------------------------
-# 模型初始化，配置初始化，配置DDP
-# init these up here, can override if resume = True (i.e. from a checkpoint)
+# 初始化设置
+_ = logger.info("Initializing model and optimizer.") if master_process else None  # 通过这种方式可以避免在非master进程中打印
+# -----------------------------------------------------------------------------
+# 实验过程中的信息
 iter_num = 0
 best_val_loss = 1e9
-# model init
-powerSGD_state = None  # 看是否使用了PowerSGD
-if not resume:
-    # init a new model from scratch
-    _ = logger.info("Initializing a new model from scratch") if master_process else None  # 通过这种方式可以避免在非master进程中打印
-    model_config = Z2allConfig(**exp_config)
-    model = Z2allForCausalLM(model_config)
-    if master_process:
-        # 保存模型配置，和相应配置类的代码文件
-        model_config.save_pretrained(out_dir)  # 保存模型配置
-        # 获取Z2allConfig所在的文件路径
-        file_path = inspect.getfile(model_config.__class__)
-        # 复制Z2allConfig所在的文件到out_dir
-        shutil.copy(file_path, out_dir)
-else:  # resume
-    _ = logger.info(f"Resuming training from {out_dir}") if master_process else None
-    
-    best1_prefix = "best1_"
-    
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, best1_prefix + "ckpt.pt")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    
-    # 获取模型配置
-    try:
-        model_config = AutoConfig.from_pretrained(out_dir, trust_remote_code=True)
-    except:
-        model_config = Z2allConfig(**exp_config)
-    # 构建模型
-    model = Z2allForCausalLM(model_config)
-    
-    # 加载模型状态，到特定的device
-    state_dict = torch.load(os.path.join(out_dir, best1_prefix + "model.pt"), map_location=device)
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    # 使用了torch.compile才会出现这个问题，即前缀会有"_orig_mod."
-    wanted_prefix = ""
-    unwanted_prefix = "_orig_mod."
-    full_prefix = wanted_prefix + unwanted_prefix
-    for k, v in list(state_dict.items()):
-        if k.startswith(full_prefix):
-            new_k = wanted_prefix + k[len(full_prefix) :]
-            state_dict[new_k] = state_dict.pop(k)  # 修改键名
-    # 加载模型状态
-    model.load_state_dict(state_dict)
-    state_dict = None  # free up memory
-    
-    # PowerSGD的状态，需要重新设置process_group，因为process_group不能被序列化
-    # pytorch2.0后已经实现了__getstate__和__setstate__方法，可以直接序列化，里面包含了去除process_group的操作
-    powerSGD_state = checkpoint.get("powerSGD_state", None)
-    if powerSGD_state is not None:
-        powerSGD_state.process_group = process_group
-    
-    # 只有主进程需要加载实验过程日志
-    if master_process:
-        reslog.load(os.path.join(out_dir, best1_prefix + "reslog.pkl"))  # 读取中止的实验日志
-        
-    # 训练时候的信息
-    iter_num = checkpoint["iter_num"]
-    best_val_loss = checkpoint["best_val_loss"]
-model.to(device)
-
 # -----------------------------------------------------------------------------
-# 训练所需，梯度缩放器，优化器
-# initialize a GradScaler. If enabled=False scaler is a no-op
+# 模型初始化
+model_config = Z2allConfig(**exp_config)  # resume也是用这个配置，不然还要用broadcast同步，有点麻烦
+model = Z2allForCausalLM(model_config)
+model.to(device)  # 将模型放到device上
+# 保存模型配置和当前python文件
+if master_process:
+    # 保存模型配置，和相应配置类的代码文件
+    model_config.save_pretrained(out_dir)  # 保存模型配置
+    # 获取Z2allConfig所在的文件路径
+    file_path = inspect.getfile(model_config.__class__)
+    # 复制Z2allConfig所在的文件到out_dir
+    shutil.copy(file_path, out_dir)
+    # 将当前脚本文件复制到out_dir
+    shutil.copy(os.path.abspath(__file__), out_dir)
+# -----------------------------------------------------------------------------
+# 梯度缩放器，优化器
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 # optimizer
 optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type, logger, master_process)
-# 非ddp下，在这里载入优化器状态，否则在后面载入
-if resume and "optimizer" in checkpoint and not ddp:
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    checkpoint = None  # free up memory
-
-# -----------------------------------------------------------------------------
-# 学习率衰减策略
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * it / warmup_iters
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)  # 从0到1
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1 从1到0
-    return min_lr + coeff * (learning_rate - min_lr)
-
-# -----------------------------------------------------------------------------
-# 测试函数
-# helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ["train", "val"]:
-        batch_iter = iter_batches(split=split)
-        losses = torch.zeros(eval_iters)  # keep on CPU
-        for k in range(eval_iters):
-            X, Y = next(batch_iter)
-            with ctx:
-                model_outputs = model(X, Y)
-                loss = model_outputs["loss"]
-            if loss_reduction == "none":
-                loss = torch.mean(loss.view(-1))
-            losses[k] = loss.item()
-        out[split] = losses.mean().item()
-    model.train()
-    return out
-
-# -----------------------------------------------------------------------------
-# wrap模型
-# 编译模型，需要PyTorch>=2.0
-if compile and torch.__version__ >= "2.0":
-    if master_process:
-        logger.info("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model)  # requires PyTorch 2.0
 # -----------------------------------------------------------------------------
 # 使用自己的DDP和DistributedOptimizer包裹模型和优化器
-# wrap model into DDP container, 只有在从头开始训练时才会进行包裹
+# 只有在从头开始训练时才会进行包裹
 if ddp:
     _ = logger.info(f"wrapping model into DDP container") if master_process else None
     
@@ -450,49 +351,74 @@ if ddp:
         overlap_param_gather=overlap_param_gather)
     optimizer = Float16OptimizerWithFloat16Params(optimizer, optim_config, model, scaler=scaler, grad_clip=grad_clip)
 
-    # resume，加载优化器状态
-    if resume and "optimizer" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer"])
-    checkpoint = None  # free up memory
-
 # -----------------------------------------------------------------------------
-# 准备训练集
-train_batch_iter = iter_batches(split="train")
-X, Y = next(train_batch_iter)  # fetch the very first batch
-# 如果resume，需要跳过前面的iter
+# resume，加载模型参数和优化器状态等，先加载到rank0上，然后进行广播
+powerSGD_state = None  # 看是否使用了PowerSGD
 if resume:
-    skip_data_time = time.time()
-    for _ in range(iter_num):
-        X, Y = next(train_batch_iter)
-    _ = logger.info(f"skip {iter_num} iters time: {time.time() - skip_data_time:.4f}s") if master_process else None
+    _ = logger.info(f"Resuming training from {out_dir}") if master_process else None
+    # 最好结果的前缀
+    best1_prefix = "best1_"
+    
+    # -----------------------------------------------------------------------------
+    # 加载模型状态
+    # 待会广播给其他rank
+    object_list = [None]
+    if master_process:
+        # 加载模型状态，先放在cpu上
+        model_path = os.path.join(out_dir, best1_prefix + "model.pt")
+        model_state_dict = torch.load(model_path, map_location="cpu")
+        object_list = [model_state_dict]
+    # DDP下需要将状态广播到其他rank
+    if ddp:
+        torch.distributed.broadcast_object_list(object_list, src=0)  # 广播后放在cpu上
+    model_state_dict = object_list[0]
+    # 将对象中的所有张量复制到指定的设备上
+    model_state_dict = copy_tensor_to_device_in_object(model_state_dict, device)
+    # 加载状态到模型中
+    model.load_state_dict(model_state_dict)
+    # 即时释放内存
+    object_list = None
+    model_state_dict = None
+    
+    # -----------------------------------------------------------------------------
+    # 加载其他状态，包括optimizer, iter_num, best_val_loss, powerSGD_state
+    # 待会广播给其他rank
+    object_list = [None]
+    if master_process:
+        ckpt_path = os.path.join(out_dir, best1_prefix + "ckpt.pt")
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        object_list = [checkpoint]
+    # DDP下需要将状态广播到其他rank
+    if ddp:
+        torch.distributed.broadcast_object_list(object_list, src=0)  # 广播后放在cpu上
+    checkpoint = object_list[0]
+    # 将对象中的所有张量复制到指定的设备上
+    checkpoint = copy_tensor_to_device_in_object(checkpoint, device)
+    # 加载状态到optimizer中
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    
+    # 训练时候的信息
+    iter_num = checkpoint["iter_num"]
+    best_val_loss = checkpoint["best_val_loss"]
+    
+    # 获取PowerSGD的状态，需要重新设置process_group，因为process_group不能被序列化
+    # pytorch2.0后已经实现了__getstate__和__setstate__方法，可以直接序列化，里面包含了去除process_group的操作
+    # parallel/distributed_data_parallel/ddp_comm_hooks/powerSGD_hook.py中添加了__getstate__和__setstate__方法
+    powerSGD_state = checkpoint.get("powerSGD_state", None)
+    if powerSGD_state is not None:
+        powerSGD_state.process_group = process_group
+    
+    # 即时释放内存
+    object_list = None
+    checkpoint = None
+    
+    # 只有主进程需要加载实验过程日志
+    if master_process:
+        reslog.load(os.path.join(out_dir, best1_prefix + "reslog.pkl"))  # 读取中止的实验日志
 
 # -----------------------------------------------------------------------------
-# 预热
-# 由于DDP下的bucket可能要重新构建，需要预热下，重建需要2个iter，情况:
-# 注意考虑PowerSGDState的start_powerSGD_iter应该变化，可能需要临时禁用powerSGD_hook
-# 预热时不使用powerSGD_hook，为了让模型的bucket构建好，因为第一个iter后bucket会被rebuilt
-# 1. 在用torch的ZeroRedundancyOptimizer时，可能更需要预热，可能前几个iter不会更新参数
-# 2. resume情况下，因为resume后，DDP又要重新开始构建bucket了
-# 见：powerSGD_hook.py的注释
-# 见：https://github.com/pytorch/pytorch/pull/73732
-#* 自己的DDP不需要预热，构建DDP的时候已经确定好bucket了
-#* overlap_optim_step时会在backward中进行更新，所以不能这样预热
-# if ddp:
-#     warm_for_bucket_rebuilt_time = time.time()
-#     for _ in range(1):
-#         with ctx:
-#             model_outputs = model(X, Y)
-#             loss = model_outputs["loss"]
-#             loss = loss / gradient_accumulation_steps
-#         scaler.scale(loss).backward()
-#         optimizer.zero_grad(set_to_none=True)
-#     torch.cuda.synchronize()
-#     torch.distributed.barrier()
-#     _ = logger.info(f"warm_for_bucket_rebuilt_time: {time.time() - warm_for_bucket_rebuilt_time:.4f}s") if master_process else None
-
-# -----------------------------------------------------------------------------
-# 预热后，设置ddp com hook，还是会取world_size的平均值
-# MyDDP中也实现了register_comm_hook，不过参数的位置不太一样
+# 设置ddp com hook，看grad_scaling_before_comm设置来看是否要取world_size的平均值
+# MyDDP中也实现了register_comm_hook，参数的位置和PyTorch的不太一样
 # 基本的comm hook
 if ddp:
     base_comm_hook = None
@@ -530,7 +456,54 @@ if ddp:
     model.register_comm_hook(cur_comm_hook, *comm_args,
                              grad_scaling_factor=grad_scaling_factor, grad_scaling_before_comm=grad_scaling_before_comm)
 
-# 同步下
+# -----------------------------------------------------------------------------
+# 学习率衰减策略 (cosine with warmup)
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_iters:
+        return learning_rate * it / warmup_iters
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > lr_decay_iters:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)  # 从0到1
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1 从1到0
+    return min_lr + coeff * (learning_rate - min_lr)
+
+# -----------------------------------------------------------------------------
+# 测试函数，只在rank0上进行验证
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ["train", "val"]:
+        batch_iter = iter_batches(split=split)
+        losses = torch.zeros(eval_iters)  # keep on CPU
+        for k in range(eval_iters):
+            X, Y = next(batch_iter)
+            with ctx:
+                model_outputs = model(X, Y)
+                loss = model_outputs["loss"]
+            if loss_reduction == "none":
+                loss = torch.mean(loss.view(-1))
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
+
+# -----------------------------------------------------------------------------
+# 准备训练集
+train_batch_iter = iter_batches(split="train")
+X, Y = next(train_batch_iter)  # fetch the very first batch
+# 如果resume，需要跳过前面的iter
+if resume:
+    skip_data_time = time.time()
+    for _ in range(iter_num * gradient_accumulation_steps):  # 这里假设实验配置还是resume之前的
+        X, Y = next(train_batch_iter)
+    _ = logger.info(f"skip {iter_num} iters time: {time.time() - skip_data_time:.4f}s") if master_process else None
+
+# 同步一下
 if ddp:
     torch.cuda.synchronize()
     torch.distributed.barrier()
@@ -543,13 +516,15 @@ raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
 _ = logger.info(f"start training loop") if master_process else None
 while True:
+    # -----------------------------------------------------------------------------
     # 根据iter，调整学习率
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num + 1) if decay_lr else learning_rate  # 从1开始，要不然第一个step的lr是0
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
 
-    # 验证
+    # -----------------------------------------------------------------------------
+    # 验证，只在rank0上验证和保存
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         val_t0 = time.time()
@@ -565,7 +540,8 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu * 100,  # convert to percentage
             }, name="valid", step = iter_num)
-            
+        
+        # -----------------------------------------------------------------------------
         # 保存checkpoint，resume后的第一个不需要保存，因为还是原来的
         if (losses["val"] < best_val_loss or always_save_checkpoint) and not resume:
             best_val_loss = losses["val"]
@@ -595,7 +571,6 @@ while True:
                 torch.save(raw_model.state_dict(), os.path.join(out_dir, best1_prefix + "model.pt"))
                 # 2. 保存训练状态
                 checkpoint = {
-                    # "model": model_save_method,
                     "optimizer": optimizer.state_dict(),
                     "iter_num": iter_num,
                     "best_val_loss": best_val_loss,
@@ -604,8 +579,6 @@ while True:
                 torch.save(checkpoint, os.path.join(out_dir, best1_prefix + "ckpt.pt"))
                 # 3. 保存实验过程日志，可用resplot来展示
                 reslog.save(os.path.join(out_dir, best1_prefix + "reslog.pkl"))
-                
-                # model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)  # TODO
                 
                 logger.info(f"save checkpoint to {out_dir}")
                 
@@ -629,9 +602,8 @@ while True:
     # 保存loss，用于log
     train_loss = torch.tensor([0.0], device=device)
     
+    # -----------------------------------------------------------------------------
     # 前向传播和反向传播，梯度更新
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
     # 使用model.no_sync()来设置是否同步
     with model.no_sync():
         for micro_step in range(gradient_accumulation_steps - 1):
@@ -645,10 +617,11 @@ while True:
                     # 否则为"none"，则grad在optim.step中进行scale，减少精度损失
                     loss = torch.sum(loss.view(-1))
             train_loss += loss.clone().detach()
-            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            # 立刻异步预取下一个batch的数据，与forward并行
             X, Y = next(train_batch_iter)
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+            # scaler和反向传播
+            # overlap_grad_reduce时会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+            scaler.scale(loss).backward()
     
             # 同步以获取真实的耗时
             if ddp and sync_for_true_micro_time:
@@ -670,15 +643,16 @@ while True:
             # 否则为"none"，则grad在optim.step中进行scale，减少精度损失
             loss = torch.sum(loss.view(-1))
     train_loss += loss.clone().detach()
-    # immediately async prefetch next batch while model is doing the forward pass on the GPU
+    # 立刻异步预取下一个batch的数据，与forward并行
     X, Y = next(train_batch_iter)
-    # backward pass, with gradient scaling if training in fp16
-    scaler.scale(loss).backward()  # 同步的时候会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+    # scaler和反向传播
+    # overlap_grad_reduce时会自动进行梯度的all-reduce，并且取所有的word_size的平均值
+    scaler.scale(loss).backward()
     
     optim_step_time = time.time()  #! 3
     
-    optimizer.step()  # scaler和grad_clip放在了这里面
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.step()  # scaler和grad_clip放在了这里面，里面会进行参数更新的同步
+    optimizer.zero_grad(set_to_none=True)  # overlap_param_gather时会在这里发起all-gather同步
     
     # 同步以获取真实的耗时
     if ddp and sync_for_true_micro_time:
@@ -689,6 +663,7 @@ while True:
     micro_times.append(last_micro_time)
     optim_step_time = time.time() - optim_step_time  #! 3
     
+    # 获取所有rank下的loss
     torch.distributed.all_reduce(train_loss, group=process_group, async_op=False)
     # 需要取平均值
     if loss_reduction == "mean":
@@ -696,13 +671,13 @@ while True:
     else:
         train_loss = train_loss / tokens_per_iter
     
+    # -----------------------------------------------------------------------------
     # 输出结果
     # timing and logging
     train_time1 = time.time()
     dt = train_time1 - train_time0
     train_time0 = train_time1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
         # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。
         lossf = train_loss.item()
         if local_iter_num >= 5:  # let the training loop settle a bit
