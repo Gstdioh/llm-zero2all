@@ -22,8 +22,8 @@
 
 ```txt
 01. configurator.py, 解析命令行
-02. hfd.sh, 下载huggingface中的模型和数据集
-03. my_dataset.py, 数据集构建类
+02. hfd.sh, 下载huggingface中的模型和数据集（见：https://hf-mirror.com/）
+03. my_dataset.py, 数据读取的类，构建DataLoader
 04. pretokenize_data_more.py, 预处理数据集为bin文件，用于训练
 05. pretrain_my_ddp.py, 自己实现的DDP的预训练脚本
 06. pretrain.py, PyTorch的DDP的预训练脚本
@@ -31,25 +31,25 @@
 08. train_tokenizer.py, 训练自己的分词器
 ```
 
+#### 其他说明
+
+单卡训练脚本看pretrain.py的就行了（就没用到分布式训练，不过分布式训练的实现代码算是这个项目的重要内容）
+
+不用分布式训练的话（其实流程差不多，只是预训练脚本稍有不同），流程应该只有数据集的构建（还没实现数据清洗）、分词器的构建、llm经典结构的构建（llama2，使用融合算子）、预训练阶段
+
+其实这个项目目前还算不上是学习教程&#x1F602;（说明文档还没咋写，或者写的比较乱，等后面有空了完善下），主要是代码实现基本从零开始（调的库少，尽量从零开始编写），可以先看着代码学习（注释写的还算详细）
+
+---
+
 ## 00 环境配置
 我的环境：cuda11.4, pytorch1.12.1
 
 见 requirements.txt，融合算子相应库的具体安装可以看[03-融合算子小节](#融合算子)
 
 ### Docker
-我自己构建了docker镜像（dockerhub和阿里的容器镜像），包含了所需要的环境（安装了融合算子相应的库），包括：pytorch2.0.1, cuda11.4, flash-attn2.1.0, rotary-emb0.1, xentropy-cuda-lib0.1, apex0.1, xformers0.0.24等
+我自己构建了docker镜像（dockerhub和阿里的容器镜像），包含了所需要的环境（安装了融合算子相应的库）
 
-1. dockerhub地址：https://hub.docker.com/r/stdiohg/llm/tags
-
-    命令：`docker pull stdiohg/llm:pytorch2.0.1-cuda11.4`
-
-2. 阿里容器镜像服务：https://cr.console.aliyun.com/cn-hangzhou/instances
-
-    命令：`docker pull registry.cn-hangzhou.aliyuncs.com/stdiohg/llm:pytorch2.0.1-cuda11.4`
-
-该镜像的详细构建过程见：[./build_docker_image.md](./build_docker_image.md) 文件
-
-**注意**，xformers的bug在镜像中已经处理了，处理方式是添加一个判断torch版本，但如果你是pytorch<2.0.0，则还需要自行修改，见[xformers安装章节](#6-swiglu-xformers)
+见章节：[Docker镜像](#10-docker镜像)
 
 ### 硬件
 查看卡间通信：`nvidia-smi topo -m`
@@ -58,6 +58,19 @@ GPU通信方式：https://zhuanlan.zhihu.com/p/74217534
 
 ## 01 数据集
 ### 包含的数据集
+
+1. baike2018qa，https://github.com/brightmart/nlp_chinese_corpus
+2. new2016zh，https://github.com/brightmart/nlp_chinese_corpus
+3. webtext2019zh，https://github.com/brightmart/nlp_chinese_corpus
+4. wikipedia_cn_20240418，根据最新自己处理的，处理流程我参考的：https://www.cnblogs.com/carolsun/p/13860730.html 和 https://spaces.ac.cn/archives/4176
+5. Zhihu-KOL，https://huggingface.co/datasets/wangrui6/Zhihu-KOL
+6. WuDaoCorpus2.0_base_200G，大，https://data.baai.ac.cn/details/WuDaoCorporaText
+7. wikipedia_en_20220301，https://hf-mirror.com/datasets/legacy-datasets/wikipedia/tree/main/data/20220301.en
+8. github-python，https://huggingface.co/datasets/thomwolf/github-python
+9. TigerBot，中英都有，较大，https://github.com/TigerResearch/TigerBot
+
+我预训练用的TigerBot(pretrain_en, pretrain_cn) + github-python + news2016zh, bin文件有51G（差不多26B的token，一个token两个字节）
+
 | 类别  | 文件名                     | raw大小 | 存储格式                 | json大小 | txt大小 | train |
 | ----- | ------------------------- | ------- | ----------------------- | -------- | ------- | ----- |
 | 中文  | baike2018qa               | 1.5G    | .json, 一行一json对象    | 1.5G, 8  | 1.3G    | 8/8   |
@@ -340,4 +353,24 @@ torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py "out/2024_06_05_20_2
 
 ## 10 Docker镜像
 
+提供docker镜像（dockerhub和阿里的容器镜像），包含了所需要的环境（安装了融合算子相应的库），包括：pytorch2.0.1, cuda11.4, flash-attn2.1.0, rotary-emb0.1, xentropy-cuda-lib0.1, apex0.1, xformers0.0.24等
+
+1. dockerhub地址：https://hub.docker.com/r/stdiohg/llm/tags
+
+    命令：`docker pull stdiohg/llm:pytorch2.0.1-cuda11.4`
+
+2. 阿里容器镜像服务：https://cr.console.aliyun.com/cn-hangzhou/instances
+
+    命令：`docker pull registry.cn-hangzhou.aliyuncs.com/stdiohg/llm:pytorch2.0.1-cuda11.4`
+
+该镜像的详细构建过程见：[./build_docker_image.md](./build_docker_image.md) 文件
+
+**注意**，xformers的bug在镜像中已经处理了，处理方式是添加一个判断torch版本，但如果你是pytorch<2.0.0，则还需要自行修改，见[xformers安装章节](#6-swiglu-xformers)
+
 见 ./docker 目录
+
+## 参考项目
+
+1. [llama2.c](https://github.com/karpathy/llama2.c), 预训练脚本
+
+2. [Megatron-LM](https://github.com/NVIDIA/Megatron-LM), DDP和分布式优化器的实现
