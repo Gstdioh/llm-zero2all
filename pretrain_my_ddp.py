@@ -591,8 +591,8 @@ while True:
     if iter_num == 0 and eval_only:
         break
     
-    # 同步以获取真实的耗时
-    if ddp and sync_for_true_micro_time:
+    # 同步一下，防止验证太久，其他进行完成forward后，会在backward时等待通信，等待时间过长可能会报错
+    if ddp:
         torch.cuda.synchronize()
         torch.distributed.barrier()
     
