@@ -59,14 +59,18 @@ class PretokDataset(torch.utils.data.IterableDataset):
             for shard in shard_filenames:
                 # open the dataset for reading but keep it on disk with memmap
                 m = np.memmap(shard, dtype=np.uint16, mode="r")
-                num_batches = len(m) // self.max_seq_len
+                num_tokens = len(m)  # 这个shard的总token数
+                num_batches = num_tokens // self.max_seq_len  # 向下取整
                 assert num_batches > 0, "this shard is way too small? investigate."
                 ixs = list(range(num_batches))
                 # 打乱文件内的样本
                 rng.shuffle(ixs)
                 for ix in ixs:
                     start = ix * self.max_seq_len
-                    end = start + self.max_seq_len + 1
+                    end = start + self.max_seq_len + 1  # 需要多一个token，因为y是x的下一个token
+                    if end > num_tokens:
+                        # 如果end越界，直接跳过，在num_tokens % self.max_seq_len == 0时会发生
+                        continue
                     # calling .astype will copy the data into a new numpy array, now in RAM
                     chunk = torch.from_numpy((m[start:end]).astype(np.int64))
                     x = chunk[:-1]
