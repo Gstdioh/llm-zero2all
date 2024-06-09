@@ -62,8 +62,8 @@ class Bucket:
         self.params_list = params  # 有序
         self.params = set(params)  # 无序，和params_with_grad结合使用判断param是否都准备好了
         self.params_with_grad = set()  # 记录准备好的参数，全部准备好后发起通信
-        self.param_data = param_data
-        self.grad_data = grad_data
+        self.param_data = param_data  # 可能包含了pad
+        self.grad_data = grad_data  # 可能包含了pad
         # The distributed optimizer needs to keep track of this bucket's offset
         # within the full grad_buffer.
         self.offset = offset
@@ -71,13 +71,27 @@ class Bucket:
         
         self.raw_grad_data = None  # 用于保存原始的梯度数据，用于恢复
         
-        # 存储每个param的bucket下的数据范围，(start_index, end_index)
+        # 存储每个param在bucket下的数据范围，(start_index, end_index)，不包括pad
         local_offset = 0
         self.param_index_map = {}
         for param in self.params_list:
             start_index, end_index = local_offset, local_offset + param.data.nelement()
             self.param_index_map[param] = (start_index, end_index)
             local_offset += param.data.nelement()
+        
+        # grad list
+        self.grads_list = []
+        for param in self.params_list:
+            start_index, end_index = self.param_index_map[param]
+            self.grads_list.append(self.grad_data[start_index: end_index].view(param.shape))
+        
+        # 存储每个grad在bucket下的数据范围，(start_index, end_index)，不包括pad
+        local_offset = 0
+        self.grad_index_map = {}
+        for grad in self.grads_list:
+            start_index, end_index = local_offset, local_offset + grad.nelement()
+            self.grad_index_map[grad] = (start_index, end_index)
+            local_offset += grad.nelement()
         
         # 唯一标识
         self.param_dtype = param_dtype
@@ -91,6 +105,11 @@ class Bucket:
         self.data_parallel_group = data_parallel_group
         self.data_parallel_world_size = data_parallel_world_size
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
+        
+        # powerSGD时会用到，因为powerSGD的前几个iter是普通的梯度通信，之后会设置为True
+        # 见：parallel/distributed_data_parallel/ddp_comm_hooks/overlap_optim_step_hooks.py的overlap_optim_step_wrapper
+        self.ready_for_powerSGD = False
+        self.input_tensor_cp = None  # 用于保存原始的梯度数据，用于计算error
         
         self.comm_call = None  # 执行bucket通信的函数
         
@@ -135,19 +154,13 @@ class Bucket:
         
     def gradients(self) -> List[torch.Tensor]:
         """
-        grad list
+        grads list
         """
-        grad_list = []
-        
-        for param in self.params_list:
-            start_index, end_index = self.param_index_map[param]
-            grad_list.append(self.grad_data[start_index: end_index].view(param.shape))
-        
-        return grad_list
+        return self.grads_list
         
     def parameters(self) -> List[torch.Tensor]:
         """
-        param list
+        params list
         """
         return self.params_list
         

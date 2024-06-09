@@ -1,22 +1,3 @@
-"""
-Copy from PyTorch
-
-Bucket定义见：parallel/distributed_data_parallel/param_and_grad_buffer.py
-
-可能用到的参数：
-self.param_data = param_data
-self.grad_data = grad_data
-
-建议hook使用下面代码进行同步，然后hook最后用stream_wrapper包裹一下，以避免阻塞
-event = torch.cuda.Event(enable_timing=False)
-event.record(torch.cuda.current_stream())
-return event
-
-添加两个参数grad_scaling_factor=None, grad_scaling_before_comm=True
-默认，在comm前，进行grad的缩放
-其他可能的情况：想要在comm后对grad进行缩放，并且大小是所有token数和world_size，即尽可能减少精度的损失
-"""
-
 from collections import defaultdict
 import logging
 import math
@@ -26,9 +7,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from ..param_and_grad_buffer import Bucket
 from . import default_hooks as default
-from .default_hooks import stream_wrapper
 
 __all__ = [
     "PowerSGDState", "powerSGD_hook", "batched_powerSGD_hook"
@@ -110,22 +89,14 @@ def _should_compress(
     """  # noqa: B950
     uncompressed_size = num_rows * num_cols
     compressed_size = (num_rows + num_cols) * matrix_approximation_rank
-    
-    # 其他条件
-    flag = True
-    # if num_rows > 60_000 or num_cols > 60_000:
-    #     # 维度大的，不压缩，特指：embedding层和unembedding层
-    #     flag = False
-    # # 设置min_compression_rate = 2，即使得一维的参数不压缩
-        
     return (
-        compressed_size * min_compression_rate < uncompressed_size and flag,
+        compressed_size * min_compression_rate < uncompressed_size,
         uncompressed_size,
         compressed_size,
     )
 
 
-def _report_compression_stats(bucket: Bucket, state):
+def _report_compression_stats(bucket, state):
     """
     Report compression stats at the frequency of `compression_stats_logging_frequency` specified in PowerSGD state.
     """
@@ -327,7 +298,7 @@ class PowerSGDState(object):
 
 
 def powerSGD_hook(
-    bucket: Bucket, state: PowerSGDState, grad_scaling_factor=None, grad_scaling_before_comm=True
+    state: PowerSGDState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
     r"""
     This DDP communication hook implements PowerSGD gradient compression
@@ -372,7 +343,7 @@ def powerSGD_hook(
         state (PowerSGDState): State information to configure the compression rate and support error feedback, warm start, etc.
             To tune the compression configs, mainly need to tune ``matrix_approximation_rank``, ``start_powerSGD_iter``
             and ``min_compression_rate``.
-        bucket (Bucket): Bucket that stores a 1D flattened gradient tensor that batches multiple per-variable tensors.
+        bucket (dist.GradBucket): Bucket that stores a 1D flattened gradient tensor that batches multiple per-variable tensors.
             Note that since DDP comm hook only supports single process single device mode,
             only exactly one tensor is stored in this bucket.
 
@@ -387,9 +358,6 @@ def powerSGD_hook(
     process_group = state.process_group
     group_to_use = process_group if process_group is not None else dist.group.WORLD
     world_size = group_to_use.size()
-    
-    if grad_scaling_factor is None:
-        grad_scaling_factor = 1.0 / world_size
 
     # The input tensor is a flattened 1D tensor.
     input_tensor = bucket.buffer()
@@ -397,8 +365,7 @@ def powerSGD_hook(
     # Run vanilla allreduce in the first `start_powerSGD_iter` iterations.
     if state.iter < state.start_powerSGD_iter:
         state.maybe_increase_iter(bucket)
-        return default.all_reduce_hook(bucket, process_group=group_to_use, async_op=True,\
-            grad_scaling_factor=grad_scaling_factor, grad_scaling_before_comm=grad_scaling_before_comm)  #* 改
+        return default._allreduce_fut(group_to_use, input_tensor)
 
     # Apply PowerSGD after `start_powerSGD_iter` iterations.
     device = input_tensor.device
@@ -532,7 +499,7 @@ def powerSGD_hook(
         for q in qs:
             _orthogonalize(q, state.orthogonalization_epsilon)
     else:
-        with torch.random.fork_rng(devices=[tensors[0].device]):  #* 改为从GPU fork，原来可能CPU会阻塞？ 
+        with torch.random.fork_rng(devices=[]):
             # Fork this RNG to avoid changing the seed globally and affecting the random sampling anywhere else in the training.
             # The seed makes sure that the initial random values are the same across all the DDP replicas.
             # This seed should differ at every step.
@@ -543,7 +510,7 @@ def powerSGD_hook(
                 q.copy_(
                     torch.randn(
                         *q.shape,
-                        device=tensors[0].device,
+                        device="cpu",
                         dtype=dtype,
                     )
                 )
@@ -561,9 +528,7 @@ def powerSGD_hook(
     ).get_future()
 
     def unpack_uncompressed_tensors_and_allreduce_ps(fut):
-        #* 改
-        if grad_scaling_before_comm:
-            uncompressed_tensors_memory = fut.value()[0].mul_(grad_scaling_factor)
+        uncompressed_tensors_memory = fut.value()[0].div_(world_size)
         idx = 0
         for tensor in uncompressed_tensors:
             tensor.copy_(
@@ -603,18 +568,10 @@ def powerSGD_hook(
         )
 
     def decompress(fut):
-        #* 改
-        if grad_scaling_before_comm:
-            state.q_memory_dict[bucket_index] = fut.value().mul_(grad_scaling_factor)
-        else:
-            state.q_memory_dict[bucket_index] = fut.value()
+        state.q_memory_dict[bucket_index] = fut.value().div_(world_size)
 
         for p, q, tensor in zip(ps, qs, tensors_to_compress):
             torch.bmm(p, q.transpose(1, 2), out=tensor)
-        
-            # 放到optim中实现，因为这里的grad可能还是fp16的，会导致精度损失
-            # if not grad_scaling_before_comm:
-            #     tensor.mul_(grad_scaling_factor)
 
         # Copy batched tensors back to original buffer.
         if state.batch_tensors_with_same_shape:
@@ -626,39 +583,31 @@ def powerSGD_hook(
                 for i, original_tensor in enumerate(original_tensors):
                     original_tensor.copy_(tensor[i])
 
-        #* 删除，不阻塞
-        #* 但是删除后，会导致结果不准确，损失不怎么降，奇怪
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
 
         if state.use_error_feedback:
             # Memorize the local errors.
             state.error_dict[bucket_index] = input_tensor_cp - input_tensor
-        #* 不清空
         if not state.warm_start:
-            # #* 可能阻塞需要加在这里？
-            # if torch.cuda.is_available():
-            #     torch.cuda.synchronize(device)
-            #* 或者改为在前面进行清空
-            #* 又或者不清空，因为后续也会覆盖
             state.p_memory_dict.clear()
             state.q_memory_dict.clear()
 
         state.maybe_increase_iter(bucket)
-        
-    allreduce_contiguous_uncompressed_tensors_fut.then(
-        unpack_uncompressed_tensors_and_allreduce_ps
-    ).then(compute_qs).then(decompress)
-        
-    # 添加event，用于同步
-    event = torch.cuda.Event(enable_timing=False)
-    event.record(torch.cuda.current_stream())
 
-    return event
+        return input_tensor
+
+    return (
+        allreduce_contiguous_uncompressed_tensors_fut.then(
+            unpack_uncompressed_tensors_and_allreduce_ps
+        )
+        .then(compute_qs)
+        .then(decompress)
+    )
 
 
 def batched_powerSGD_hook(
-    bucket: Bucket, state: PowerSGDState, grad_scaling_factor=None, grad_scaling_before_comm=True
+    state: PowerSGDState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
     r"""
     This DDP communication hook implements a simplified PowerSGD gradient compression
@@ -702,7 +651,7 @@ def batched_powerSGD_hook(
     Args:
         state (PowerSGDState): State information to configure the compression rate and support error feedback, warm start, etc.
             To tune the compression configs, mainly need to tune ``matrix_approximation_rank`` and ``start_powerSGD_iter``.
-        bucket (Bucket): Bucket that stores a 1D flattened gradient tensor that batches multiple per-variable tensors.
+        bucket (dist.GradBucket): Bucket that stores a 1D flattened gradient tensor that batches multiple per-variable tensors.
             Note that since DDP comm hook only supports single process single device mode,
             only exactly one tensor is stored in this bucket.
 
@@ -716,9 +665,6 @@ def batched_powerSGD_hook(
     process_group = state.process_group
     group_to_use = process_group if process_group is not None else dist.group.WORLD
     world_size = group_to_use.size()
-    
-    if grad_scaling_factor is None:
-        grad_scaling_factor = 1.0 / world_size
 
     # The input tensor is a flattened 1D tensor.
     input_tensor = bucket.buffer()
@@ -726,8 +672,7 @@ def batched_powerSGD_hook(
     # Run vanilla allreduce in the first `start_powerSGD_iter` iterations.
     if state.iter < state.start_powerSGD_iter:
         state.maybe_increase_iter(bucket)
-        return default.all_reduce_hook(bucket, process_group=group_to_use, async_op=True,\
-            grad_scaling_factor=grad_scaling_factor, grad_scaling_before_comm=grad_scaling_before_comm)  #* 改
+        return default._allreduce_fut(group_to_use, input_tensor)
 
     # Apply PowerSGD after `start_powerSGD_iter` iterations.
     device = input_tensor.device
@@ -782,7 +727,7 @@ def batched_powerSGD_hook(
         def create_low_rank_tensor(fill_random_values, rng):
             "Returns a low-rank 2D tensor of square_side_length * matrix_approximation_rank."
             if fill_random_values:
-                with torch.random.fork_rng(devices=[input_tensor.device]):  #* 改为从GPU fork，原来可能CPU会阻塞？ 
+                with torch.random.fork_rng(devices=[]):
                     # Fork this RNG to avoid changing the seed globally and affecting the random sampling
                     # anywhere else in the training.
                     # The seed makes sure that the initial random values are the same across all the DDP replicas.
@@ -842,48 +787,27 @@ def batched_powerSGD_hook(
         )
 
     def decompress(fut):
-        #* 改
-        if grad_scaling_before_comm:
-            state.q_memory_dict[bucket_index] = fut.value().mul_(grad_scaling_factor)
-        else:
-            state.q_memory_dict[bucket_index] = fut.value()
+        state.q_memory_dict[bucket_index] = fut.value().div_(world_size)
         torch.matmul(
             state.p_memory_dict[bucket_index],
             state.q_memory_dict[bucket_index].t(),
             out=matrix,
         )
-        # 放到optim中实现，因为这里的grad可能还是fp16的，会导致精度损失
-        # if not grad_scaling_before_comm:
-        #     matrix.mul_(grad_scaling_factor)
 
         if state.use_error_feedback:
             # Memorize the local errors.
             state.error_dict[bucket_index] = input_tensor_cp - input_tensor
         # Removing this seemingly unnecessary sync somehow may cause faliures.
         # See: https://github.com/pytorch/pytorch/pull/54838
-        #* 不懂，是否添加event来同步就行了，就不用阻塞了
-        # if torch.cuda.is_available():
-        #     torch.cuda.synchronize(device)
-        
-        #* 不清空
-        # if not state.warm_start:
-        #     #* 可能阻塞需要加在这里？
-        #     if torch.cuda.is_available():
-        #         torch.cuda.synchronize(device)
-        #     #* 或者改为在前面进行清空
-        #     #* 又或者不清空，因为后续也会覆盖
-        #     state.p_memory_dict.clear()
-        #     state.q_memory_dict.clear()
-        
-        #* 可能会阻塞，直接删除，因为MyDDP中不需要返回结果值，只需要返回handle就行（有wait()）
-        # ret = input_tensor.resize_(total_length)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        if not state.warm_start:
+            state.p_memory_dict.clear()
+            state.q_memory_dict.clear()
+        ret = input_tensor.resize_(total_length)
 
         state.maybe_increase_iter(bucket)
-        
-        # 添加event，用于同步
-        event = torch.cuda.Event(enable_timing=False)
-        event.record(torch.cuda.current_stream())
 
-        return event
+        return ret
 
     return allreduce_p_fut.then(compute_q).then(decompress)

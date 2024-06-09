@@ -66,6 +66,12 @@ class OptimizerConfig:
     若为False，则会对整个buffer进行清零（只启动一次kernel，可能更快）
     若为True，则会对每个bucket的buffer一个一个进行清零
     """
+    
+    grad_buffer_is_powerSGD_error: bool = False
+    
+    """
+    梯度缓冲区是否是PowerSGD的error缓冲区，如果是，则不需要清零，这样可以节省内存
+    """
 
     #######################
     # Distributed optimizer

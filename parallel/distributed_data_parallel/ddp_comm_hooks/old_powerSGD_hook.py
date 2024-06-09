@@ -19,12 +19,8 @@ return event
 powerSGD_hook中，我进行了一些修改：
 1. 添加了些重叠，并且全程在一个流中，不使用future（then会创建新的流，使得结果需要torch.cuda.synchronize()同步）
 2. 添加对embedding层和unembedding层的过滤，不进行压缩
-3. loss结果和全pytoch的实现一致，速度快了些（因为实现了异步，可以重叠通信和计算），mfu: 54.07% -> 55.04%（不过滤embedding和unembedding）
+3. loss结果和全pytoch的实现一致，速度快了些，mfu: 54.07% -> 55.04%（不过滤embedding和unembedding）
     过滤embedding、unembedding、一维tensor情况下，mfu: 48.12%
-4. 添加grad_buffer_is_powerSGD_error参数，将grad_buffer和error_dict的内存空间共享，可以节省模型梯度大小的内存
-5. 对于uncompressed_tensors，不需要error_dict，设置为0
-6. 添加orthogonalize_in_float32，设置正交化操作在float32上进行，可以提高精度
-7. 添加use_fixed_Q，使用固定的随机高斯矩阵Q，后续不对其更新，参考：DALL-E: Zero-Shot Text-to-Image Generation
 """
 
 from collections import defaultdict
@@ -34,6 +30,7 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.distributed import distributed_c10d
 
 from ..param_and_grad_buffer import Bucket
 from . import default_hooks as default
@@ -177,8 +174,6 @@ class PowerSGDState(object):
         If error feedback or warm-up is enabled, the minimum value of ``start_powerSGD_iter`` allowed in DDP is 2.
         This is because there is another internal optimization that rebuilds buckets at iteration 1 in DDP,
         and this can conflict with any tensor memorized before the rebuild process.
-        
-    我多添加了个grad_buffer_is_powerSGD_error参数，将grad_buffer和error_dict的内存空间共享，可以节省模型梯度大小的内存
     """  # noqa: B950
 
     __slots__ = [
@@ -193,15 +188,11 @@ class PowerSGDState(object):
         "use_error_feedback",
         "warm_start",
         "batch_tensors_with_same_shape",
-        "grad_buffer_is_powerSGD_error",
-        "orthogonalize_in_float32",
-        "use_fixed_Q",
         # The fields below are internal state.
         "rng",
         "error_dict",
         "p_memory_dict",
         "q_memory_dict",
-        "fixed_q_memory_dict",
         "iter",
         # The fields below are for recording compression stats.
         "total_numel_before_compression",
@@ -218,13 +209,10 @@ class PowerSGDState(object):
         min_compression_rate=2,
         use_error_feedback=True,
         warm_start=True,
-        orthogonalization_epsilon=1e-6,
+        orthogonalization_epsilon=0,
         random_seed=0,
         compression_stats_logging_frequency=10_000,
         batch_tensors_with_same_shape: bool = False,
-        grad_buffer_is_powerSGD_error: bool = False,
-        orthogonalize_in_float32: bool = False,
-        use_fixed_Q: bool = False,
     ):
         logger.info(
             "PowerSGD config: matrix_approximation_rank = {}; start_powerSGD_iter = {}; "
@@ -308,22 +296,6 @@ class PowerSGDState(object):
         # Turn on if compression / decompression computation is a bottleneck.
         self.batch_tensors_with_same_shape = batch_tensors_with_same_shape
 
-        # 梯度缓冲区是否是PowerSGD的error缓冲区，如果是，则不需要清零，这样可以节省内存
-        self.grad_buffer_is_powerSGD_error = grad_buffer_is_powerSGD_error
-        
-        if self.grad_buffer_is_powerSGD_error:
-            assert self.use_error_feedback, "grad_buffer_is_powerSGD_error=True时，use_error_feedback必须为True！"
-        
-        # 设置正交化操作在float32上进行，可以提高精度
-        self.orthogonalize_in_float32 = orthogonalize_in_float32
-        
-        # 使用固定的随机高斯矩阵Q，后续不对其更新，参考：DALL-E: Zero-Shot Text-to-Image Generation
-        self.use_fixed_Q = use_fixed_Q
-        self.fixed_q_memory_dict: Dict[int, torch.Tensor] = {}
-        
-        if self.use_fixed_Q:
-            assert not self.warm_start, "warm_start和use_fixed_Q不能同时为True！"
-        
     # def __getstate__(self):
     #     r"""
     #     Return a ``Dict[str, Any]`` which will be pickled and saved.
@@ -373,10 +345,6 @@ class PowerSGDState(object):
             logger.info(
                 "Start to apply PowerSGD after {} iterations.".format(self.iter)
             )
-        # 不能在self.iter == self.start_powerSGD_iter时就设置bucket.ready_for_powerSGD = True
-        # 因为self.iter == self.start_powerSGD_iter时的optim.step还是正常的梯度，后面才是powerSGD
-        if self.iter == self.start_powerSGD_iter + 1:
-            bucket.ready_for_powerSGD = True
 
     def compression_stats(self):
         r"""
@@ -402,7 +370,7 @@ class PowerSGDState(object):
 
 def powerSGD_hook(
     bucket: Bucket, state: PowerSGDState, grad_scaling_factor=None, grad_scaling_before_comm=True
-):
+) -> torch.futures.Future[torch.Tensor]:
     r"""
     This DDP communication hook implements PowerSGD gradient compression
     algorithm described in the `paper <https://arxiv.org/abs/1905.13727>`_.
@@ -483,27 +451,22 @@ def powerSGD_hook(
     input_tensor_cp = None
     total_length = input_tensor.shape[0]
     if state.use_error_feedback:
-        # grad_buffer和error_dict的内存空间共享，可以节省模型梯度大小的内存
-        # 这里的input_tensor已经是加上error的值了，这里需要保存下，以便后面使用完grad后计算error
-        if state.grad_buffer_is_powerSGD_error:
-            bucket.input_tensor_cp = torch.clone(input_tensor).detach()
+        if bucket_index in state.error_dict:
+            input_tensor.add_(state.error_dict[bucket_index])
         else:
-            if bucket_index in state.error_dict:
-                input_tensor.add_(state.error_dict[bucket_index])
-            else:
-                logger.info(
-                    "A zero tensor of length {} that represents local error is created.".format(
-                        total_length
-                    )
+            logger.info(
+                "A zero tensor of length {} that represents local error is created.".format(
+                    total_length
                 )
-                state.error_dict[bucket_index] = torch.zeros(
-                    total_length, device=device, dtype=dtype
-                )
+            )
+            state.error_dict[bucket_index] = torch.zeros(
+                total_length, device=device, dtype=dtype
+            )
 
-            # Keep a copy of the input tensor,
-            # so that we can compute the local error caused by compression later,
-            # by comparing this copy and the input tensor updated after decompression.
-            input_tensor_cp = torch.clone(input_tensor).detach()
+        # Keep a copy of the input tensor,
+        # so that we can compute the local error caused by compression later,
+        # by comparing this copy and the input tensor updated after decompression.
+        input_tensor_cp = torch.clone(input_tensor).detach()
 
     # Unflatten the input tensor into per-parameter tensors, for layer-wise compression.
     tensors = bucket.gradients()
@@ -540,29 +503,27 @@ def powerSGD_hook(
         else torch.tensor([], device=device, dtype=dtype)
     )
 
-    # 按情况初始化Q
+    # Step III: Handle the tensors that should be compressed.
+    # Allocate contiguous memory for Ps and Qs to allreduce efficiently.
+    # If warm-start is enabled, reuse Ps and Qs from the previous iteration if possible.
+    # The memory spaces of Ps and Qs need to be allocated in the first iteration when PowerSGD is applied.
     need_randomize_qs = False
-    if state.use_fixed_Q:
-        # 如果使用固定的Q，后续不对其更新，参考：DALL-E: Zero-Shot Text-to-Image Generation
-        # 会进行正则化，但不会再次进行初始化
-        if bucket_index not in state.fixed_q_memory_dict:
-            with torch.random.fork_rng(devices=[device]):
-                torch.manual_seed(state.rng.randint(1_000_000_000))
-                state.fixed_q_memory_dict[bucket_index] = torch.randn(
-                    total_Qs_size, device=device, dtype=dtype
+    if not state.warm_start or bucket_index not in state.p_memory_dict:
+        need_randomize_qs = True
+        # If warm-start is disabled, low-rank tensors will be initialized at every step.
+        # Only log this if warm-start to avoid spamming.
+        if state.warm_start:
+            logger.info(
+                "Allocating contiguous memory of length {} for Ps, and of length {} for Qs, respectively.".format(
+                    total_Ps_size, total_Qs_size
                 )
-        state.q_memory_dict[bucket_index] = torch.clone(state.fixed_q_memory_dict[bucket_index]).detach()
-    elif not state.warm_start or bucket_index not in state.q_memory_dict:
-        need_randomize_qs = True  # 后面需要初始化
-        # 或者，非warm，或者没有初始化，则初始化为空，后续会赋值为随机高斯矩阵，并且正则化
+            )
+        state.p_memory_dict[bucket_index] = torch.empty(
+            total_Ps_size, device=device, dtype=dtype
+        )
         state.q_memory_dict[bucket_index] = torch.empty(
             total_Qs_size, device=device, dtype=dtype
         )
-    
-    # P每次都是重新算，所以直接初始化为空
-    state.p_memory_dict[bucket_index] = torch.empty(
-        total_Ps_size, device=device, dtype=dtype
-    )
 
     # Batch tensors to compress by shape.
     shape_to_tensors = defaultdict(list)
@@ -612,14 +573,7 @@ def powerSGD_hook(
     # 1. q的初始化和正交化，如果warm-start，可以跳过
     if not need_randomize_qs:
         for q in qs:
-            # 设置正交化操作在float32上进行，可以提高精度
-            if state.orthogonalize_in_float32 and q.dtype != torch.float32:
-                temp_q = q.float()
-                _orthogonalize(temp_q, state.orthogonalization_epsilon)
-                q.copy_(temp_q)
-                temp_q = None
-            else:
-                _orthogonalize(q, state.orthogonalization_epsilon)
+            _orthogonalize(q, state.orthogonalization_epsilon)
     else:
         with torch.random.fork_rng(devices=[device]):  #* 改为从GPU fork，原来可能CPU会阻塞？ 
             # Fork this RNG to avoid changing the seed globally and affecting the random sampling anywhere else in the training.
@@ -636,14 +590,7 @@ def powerSGD_hook(
                         dtype=dtype,
                     )
                 )
-                # 设置正交化操作在float32上进行，可以提高精度
-                if state.orthogonalize_in_float32 and q.dtype != torch.float32:
-                    temp_q = q.float()
-                    _orthogonalize(temp_q, state.orthogonalization_epsilon)
-                    q.copy_(temp_q)
-                    temp_q = None
-                else:
-                    _orthogonalize(q, state.orthogonalization_epsilon)
+                _orthogonalize(q, state.orthogonalization_epsilon)
 
     # 2. p的计算
     for tensor, q, p in zip(tensors_to_compress, qs, ps):
@@ -663,14 +610,7 @@ def powerSGD_hook(
     
     # 4. p的正交化
     for p in ps:
-        # 设置正交化操作在float32上进行，可以提高精度
-        if state.orthogonalize_in_float32 and p.dtype != torch.float32:
-            temp_p = p.float()
-            _orthogonalize(temp_p, state.orthogonalization_epsilon)
-            p.copy_(temp_p)
-            temp_p = None
-        else:
-            _orthogonalize(p, state.orthogonalization_epsilon)
+        _orthogonalize(p, state.orthogonalization_epsilon)
 
     # 5. q的计算
     for tensor, p, q in zip(tensors_to_compress, ps, qs):
@@ -690,17 +630,6 @@ def powerSGD_hook(
             uncompressed_tensors_memory[idx : idx + tensor.numel()].view_as(tensor)
         )
         idx += tensor.numel()
-        
-        # 注意all_reduce后，uncompressed_tensors_memory的值会变，即和bucket.input_tensor_cp不一致了
-        # 这里需要将uncompressed_tensors_memory的值复制到bucket.input_tensor_cp中，以便后面正确计算error
-        # 因为uncompressed_tensors_memory其实不需要error，这样后续对应的error即为0了
-        if state.use_error_feedback:
-            if state.grad_buffer_is_powerSGD_error:
-                start_index, end_index = bucket.grad_index_map[tensor]
-                bucket.input_tensor_cp[start_index: end_index].copy_(tensor.view(-1))  # 记得转换为一样的维度再copy
-            else:
-                start_index, end_index = bucket.grad_index_map[tensor]
-                input_tensor_cp[start_index: end_index].copy_(tensor.view(-1))
 
     # 7. 最终梯度的计算
     all_reduce_q_handle.wait()
@@ -725,21 +654,20 @@ def powerSGD_hook(
     # if torch.cuda.is_available():
     #     torch.cuda.synchronize(device)
 
-    # state.grad_buffer_is_powerSGD_error=True时，grad_buffer和error_dict的内存空间共享，可以节省模型梯度大小的内存
-    # error的值在后面overlap_optim_step时计算，所以需要和overlap_optim_step一起用
-    if state.use_error_feedback and not state.grad_buffer_is_powerSGD_error:
+    if state.use_error_feedback:
         # Memorize the local errors.
         state.error_dict[bucket_index] = input_tensor_cp - input_tensor
-    
-    # 非warm下需要清空，但是不会清空fixed_q_memory_dict
-    # warm和use_fixed_Q不能同时使用
+    #* 不清空
     if not state.warm_start:
+        # #* 可能阻塞需要加在这里？
+        # if torch.cuda.is_available():
+        #     torch.cuda.synchronize(device)
+        #* 或者改为在前面进行清空
+        #* 又或者不清空，因为后续也会覆盖
+        state.p_memory_dict.clear()
         state.q_memory_dict.clear()
 
-    # P可以清空，因为下一个iter又会重新算
-    state.p_memory_dict.clear()
-    
-    state.maybe_increase_iter(bucket)  # 加完后，后面进行step
+    state.maybe_increase_iter(bucket)
         
     # 添加event，用于同步
     event = torch.cuda.Event(enable_timing=False)

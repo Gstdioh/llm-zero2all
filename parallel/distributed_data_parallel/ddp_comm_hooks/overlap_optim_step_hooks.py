@@ -54,7 +54,12 @@ def overlap_optim_step_wrapper(hook, optimizer):
         optimizer.step(is_bucket_step=True, bucket=bucket)  # 指定bucket的step
         
         if optimizer.optim_config.overlap_zero_grad_buffer:
-            bucket.grad_data.zero_()  # 清零bucket对应的model main_grads
+            # 如果使用了PowerSGD_hook，并且bucket开始进行powerSGD了，那么grad_data不需要清零，应该是保存的error值
+            if optimizer.optim_config.grad_buffer_is_powerSGD_error and getattr(bucket, "ready_for_powerSGD", False):
+                bucket.grad_data.copy_(bucket.input_tensor_cp - bucket.grad_data)  # grad中保存的是error
+                bucket.input_tensor_cp = None  # 释放内存
+            else:
+                bucket.grad_data.zero_()  # 清零bucket对应的model main_grads
             
         if bucket.is_last():
             # 记得将optim的param_groups还原回来
