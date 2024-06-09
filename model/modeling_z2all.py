@@ -128,8 +128,9 @@ class Z2allMLP(nn.Module):
         # if not self.use_fused_swiglu:
         #     print("WARNING: using slow swiglu. fused swiglu requires xformers")
         
+        # 不pack，powerSGD可能效果好点
         if self.use_fused_swiglu:
-            self.swiglu = SwiGLU(self.hidden_dim, self.intermediate_size, bias=False, _pack_weights=True)
+            self.swiglu = SwiGLU(self.hidden_dim, self.intermediate_size, bias=False, _pack_weights=False)
         else:
             # 变量名和fused SwiGLU一致
             self.w1 = nn.Linear(self.hidden_dim, self.intermediate_size, bias=False)
@@ -205,14 +206,14 @@ class Z2allAttention(nn.Module):
                 f"hidden_dim 必须能被 n_heads 整除，但是 `hidden_dim`:{self.hidden_dim} 和 `n_heads`:{self.n_heads}"
             )
             
-        # 1. 分开计算
-        # self.q_proj = nn.Linear(self.hidden_dim, self.n_heads * self.head_dim, bias=config.attention_bias)
-        # self.k_proj = nn.Linear(self.hidden_dim, self.n_kv_heads * self.head_dim, bias=config.attention_bias)
-        # self.v_proj = nn.Linear(self.hidden_dim, self.n_kv_heads * self.head_dim, bias=config.attention_bias)
+        # 1. 分开计算，poweSGD可能效果会好点
+        self.q_proj = nn.Linear(self.hidden_dim, self.n_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_dim, self.n_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_dim, self.n_kv_heads * self.head_dim, bias=config.attention_bias)
         # 2. 合并计算，使用GQA
-        self.q_hidden_dim = self.n_heads * self.head_dim
-        self.kv_hidden_dim = self.n_kv_heads * self.head_dim
-        self.qkv_proj = nn.Linear(self.hidden_dim, self.q_hidden_dim + 2 * self.kv_hidden_dim, bias=config.attention_bias)
+        # self.q_hidden_dim = self.n_heads * self.head_dim
+        # self.kv_hidden_dim = self.n_kv_heads * self.head_dim
+        # self.qkv_proj = nn.Linear(self.hidden_dim, self.q_hidden_dim + 2 * self.kv_hidden_dim, bias=config.attention_bias)
         # 3. 合并计算，模型较小，使用正常的MHA
         # self.qkv_proj = nn.Linear(self.hidden_dim, self.hidden_dim * 3, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
@@ -309,11 +310,11 @@ class Z2allAttention(nn.Module):
         q_len, bsz, _ = hidden_states.size()
 
         # 1. 分开计算
-        # query_states = self.q_proj(hidden_states)
-        # key_states = self.k_proj(hidden_states)
-        # value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
         # 2. 合并计算，使用GQA
-        query_states, key_states, value_states = self.qkv_proj(hidden_states).split([self.q_hidden_dim, self.kv_hidden_dim, self.kv_hidden_dim], dim=-1)
+        # query_states, key_states, value_states = self.qkv_proj(hidden_states).split([self.q_hidden_dim, self.kv_hidden_dim, self.kv_hidden_dim], dim=-1)
         # 3. 合并计算，使用正常的MHA
         # query_states, key_states, value_states = self.qkv_proj(hidden_states).chunk(3, dim=-1)
 
