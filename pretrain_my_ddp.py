@@ -92,9 +92,9 @@ os.environ["NCCL_P2P_DISABLE"] = "1"  # disable p2p
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 5  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
+eval_interval = 200  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
 log_interval = 1
-eval_iters = 5  # 每次验证的step数
+eval_iters = 100  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 resume = False  # if True, resume training from the last checkpoint

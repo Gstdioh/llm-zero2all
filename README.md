@@ -363,6 +363,12 @@ wandb用起来有点问题，5个iter后就报错：BrokenPipeError: [Errno 32] 
 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py "out/2024_06_05_20_27_58/exp_config.py" --resume --out_dir="out/2024_06_05_20_27_58"
 ```
 
+### 监控训练进程
+
+见代码：monitor_process.py，设置相应的参数，运行该代码即可启动训练脚本，该监控进程会监控训练进程，若训练进程异常中断，监控进程会自动重新启动训练进程，并修改命令为resume
+
+对于远程服务器端，监控进程通过ssh发出训练命令
+
 ## 10 Docker镜像
 
 提供docker镜像（dockerhub和阿里的容器镜像），包含了所需要的环境（安装了融合算子相应的库），包括：pytorch2.0.1, cuda11.4, flash-attn2.1.0, rotary-emb0.1, xentropy-cuda-lib0.1, apex0.1, xformers0.0.24等
