@@ -100,7 +100,7 @@ breaks down as: 4 grad accum steps * 8 processes * 16 batch size * 2048 max seq 
 
 ### 2 梯度通信优化
 
-使用DDP的`torch.distributed.algorithms.ddp_comm_hooks`
+使用DDP的`torch.distributed.algorithms.ddp_comm_hooks`，注意MyDDP实现了自己的powerSGD_hook，并且相对PyTorch版本进行了一些优化和修改
 
 1. `bf16_compress_hook`，压缩到bf16，allreduce通信，解压缩回来
 
@@ -145,7 +145,25 @@ breaks down as: 4 grad accum steps * 8 processes * 16 batch size * 2048 max seq 
 
 最终我使用nccl后端，并且设置NCCL_IB_DISABLE=1，NCCL_IBEXT_DISABLE=1，NCCL_P2P_DISABLE=1，见：https://github.com/microsoft/DeepSpeedExamples/issues/542
 
-#### 使用cuda的stream和event使得PowerSGD的计算和通信进一步重叠
+#### PowerSGD
+
+```txt
+添加两个参数grad_scaling_factor=None, grad_scaling_before_comm=True
+默认，在comm前，进行grad的缩放
+其他可能的情况：想要在comm后对grad进行缩放，并且大小是所有token数和world_size，即尽可能减少精度的损失
+
+powerSGD_hook中，我进行了一些修改：
+1. 添加了些重叠，并且全程在一个流中，不使用future（then会创建新的流，使得结果需要torch.cuda.synchronize()同步）
+2. 添加对embedding层和unembedding层的过滤，不进行压缩
+3. loss结果和全pytoch的实现一致，速度快了些（因为实现了异步，可以重叠通信和计算），mfu: 54.07% -> 55.04%（不过滤embedding和unembedding）
+    过滤embedding、unembedding、一维tensor情况下，mfu: 48.12%
+4. 添加grad_buffer_is_powerSGD_error参数，将grad_buffer和error_dict的内存空间共享，可以节省模型梯度大小的内存
+5. 对于uncompressed_tensors，不需要error_dict，设置为0
+6. 添加orthogonalize_in_float32，设置正交化操作在float32上进行，可以提高精度
+7. 添加use_fixed_Q，使用固定的随机高斯矩阵Q，后续不对其更新，参考：DALL-E: Zero-Shot Text-to-Image Generation
+```
+
+##### 使用cuda的stream和event使得PowerSGD的计算和通信进一步重叠
 
 原先PowerSGD通信时，backward没有计算，因为PowerSGD中还有计算kernel，会阻塞backward中的计算kernel。
 
@@ -177,7 +195,7 @@ model.register_comm_hook(powerSGD_state, stream_wrapper(powerSGD_hook))
 
 后：16.9890s | mfu 54.00% | backward_comm: 2.6669s
 
-### 3 我的DDP实现
+### 3 MyDDP实现
 
 基于Megatron-LM源码，简化了实现代码，添加了部分其他特性。
 

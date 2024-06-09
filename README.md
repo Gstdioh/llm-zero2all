@@ -11,24 +11,36 @@
 4. [训练](#04-训练)，使用自己实现的DDP和分布式优化器（基于Megatron-LM源码，简化了）来训练，代码实现更易懂
 
     * PyTorch的DDP的脚本训练
-    * 自己实现的DDP和分布式优化器（基于Megatron-LM源码，简化了实现代码，添加了部分其他特性，如添加overlap_optim_step的支持等），还有混合精度优化器的实现，可以使用register_comm_hook来自定义梯度通信，包含三种通信和计算重叠（overlap_grad_reduce, overlap_param_gather, overlap_optim_step）
-    还包含PowerSGD的实现（基于PyTorch源码，不过源码中是阻塞的，我通过cuda的stream和event实现了powerSGD_hook的异步，能与grad_reduce并行）
-    * 构建了一个简单的实验过程可视化（通过ssh远程获取文件来可视化），主要是因为使用wandb时有错误，所以写了一个可视化。
-    * 训练可以从断点重新训练，保存的方式更加稳定（保存最优和次优的文件，防止保存失败导致文件损坏）
+    * 自己实现的**DDP和分布式优化器**，基于Megatron-LM源码，简化实现代码，添加了部分新功能
+        * 实现了**混合精度优化器**
+        * 可以使用register_comm_hook来**自定义梯度通信**
+        * 同时实现了**三种通信和计算重叠**（overlap_grad_reduce, overlap_param_gather, overlap_optim_step）
+    * **PowerSGD**的实现，基于PyTorch源码，通过cuda的stream和event实现了powerSGD_hook的异步，能与grad_reduce并行。同时添加了多个优化（powerSGD_hook.py）
+    * 构建了一个简单的**实验过程可视化**（通过ssh远程获取文件来可视化）。
+    * 训练可以从**断点重新训练**，且重新训练时结果与之前一致（可复现），保存的方式更加稳定（保存最优和次优的文件，防止保存失败导致文件损坏）
+    * 实现训练进程的监控，当进程异常中断时，监控进程可以**自动重新启动进程**（monitor_process.py）
 
 5. 其他，提供[docker镜像](#10-docker镜像)，包含实验所需的所有环境
 
-**注意**，目前的代码可能比较乱（主要是根目录我添加了很多测试各种特性的代码，看文件名应该可以理解-.-），根目录下的非测试代码如下（按字母顺序）：
+**注意**，目前的代码可能比较乱（主要是根目录我添加了很多测试各种特性的代码，看文件名应该可以理解-.-），根目录下的非测试代码如下：
 
 ```txt
-01. configurator.py, 解析命令行
-02. hfd.sh, 下载huggingface中的模型和数据集（见：https://hf-mirror.com/）
-03. my_dataset.py, 数据读取的类，构建DataLoader
-04. pretokenize_data_more.py, 预处理数据集为bin文件，用于训练
-05. pretrain_my_ddp.py, 自己实现的DDP的预训练脚本
-06. pretrain.py, PyTorch的DDP的预训练脚本
-07. README.md, 说明文档
-08. train_tokenizer.py, 训练自己的分词器
+README.md, 说明文档
+
+hfd.sh, 下载huggingface中的模型和数据集（见：https://hf-mirror.com/）
+
+train_tokenizer.py, 训练自己的分词器
+
+pretokenize_data_more.py, 预处理数据集为bin文件，用于训练
+
+my_dataset.py, 数据读取的类，构建DataLoader
+
+pretrain_my_ddp.py, 自己实现的DDP的预训练脚本，版本最新
+pretrain.py, PyTorch的DDP的预训练脚本，版本较老（不包含各种计算通信重叠等新功能）
+configurator.py, 解析训练脚本的命令行
+
+monitor_pretrain_my_ddp.sh，运行monitor_process.py的脚本
+monitor_process.py，监控训练进程，当进程异常中断时，能够自动重新启动进程
 ```
 
 #### 其他说明
