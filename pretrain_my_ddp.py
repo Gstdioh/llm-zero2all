@@ -65,7 +65,7 @@ from transformers import AutoConfig, AutoTokenizer
 from my_dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 import utils
-from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config, copy_tensor_to_device_in_object
+from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config, copy_tensor_to_device_in_object, save_checkpoint
 
 from parallel.distributed_data_parallel import DistributedDataParallelConfig
 from parallel.distributed_data_parallel import DistributedDataParallel as MyDDP
@@ -92,12 +92,13 @@ os.environ["NCCL_P2P_DISABLE"] = "1"  # disable p2p
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-eval_interval = 200  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
+iter_num = 0  # 从该iter开始训练
+eval_interval = 3  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
 log_interval = 1
-eval_iters = 100  # 每次验证的step数
+eval_iters = 1  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 resume = False  # if True, resume training from the last checkpoint
+resume_from = "best"  # ["best", "last"] 从哪个开始resume
 sync_for_true_time = False  # 是否同步以获取mirco的真实耗费的时间，测试时用
 # my logging
 use_reslog = True  # wandb用起来有问题，改为自己的日志和画图工具，这个必须为True，因为还会被用来判断文件是否保存成功
@@ -127,9 +128,9 @@ tie_word_embeddings = False  # 是否共享word embedding和word prediction的�
 rope_theta = 10000.0
 rope_scaling = None  # 缩放方法，用于长度外推
 attention_bias = True  # attention中的project是否加bias，Qwen中加了
-attention_dropout = 0  # TODO: 或许不用设置dropout
-dropout1 = 0
-dropout2 = 0
+attention_dropout = 0.1  # TODO: 或许不用设置dropout
+dropout1 = 0.1
+dropout2 = 0.1
 residual_in_fp32 = True  # 残差连接是否使用fp32
 loss_reduction = "none" if grad_div_total_tokens else "mean"  # 损失函数的reduction方式，"mean" or "none"，使用"none"可以和grad_scaling_before_comm=False配合使用，减少精度损失
 # adamw optimizer
@@ -194,7 +195,7 @@ config_keys = [
 ]
 exec(open("configurator.py").read())  # 根据命令行或者配置文件来覆盖参数
 # 最终的配置文件
-exp_config = {k: globals()[k] for k in config_keys}  # will be useful for logging
+exp_config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
 # 删除tokenizer，后面不会用到了
@@ -326,7 +327,7 @@ _ = logger.info("Initializing model and optimizer") if master_process else None 
 init_mode_optim_time = time.time()
 # -----------------------------------------------------------------------------
 # 实验过程中的信息
-iter_num = 0
+# iter_num = 0  # 放到上面作为参数了
 best_val_loss = 1e9
 # -----------------------------------------------------------------------------
 # 模型初始化
@@ -397,32 +398,35 @@ if ddp:
 # resume，加载模型参数和优化器状态等，先加载到rank0上，然后进行广播
 powerSGD_state = None  # 看是否使用了PowerSGD
 if resume:
-    _ = logger.info(f"Resuming training from {out_dir}") if master_process else None
+    # 最好结果的前缀，或者最新, ["best", "last"]
+    best1_prefix = f"{resume_from}1_"
+    best2_prefix = f"{resume_from}2_"
+    
+    ckpt_out_dir = os.path.join(out_dir, "ckpt")
+    os.makedirs(ckpt_out_dir, exist_ok=True)
+    
+    _ = logger.info(f"Resuming training from {out_dir} ({best1_prefix})") if master_process else None
     
     resume_time = time.time()
-    
-    # 最好结果的前缀
-    best1_prefix = "best1_"
-    best2_prefix = "best2_"
     
     # -----------------------------------------------------------------------------
     # 考虑保存时中断的特殊情况，假设：如果存在实验日志，则说明模型状态等文件保存成功了
     if ddp_local_rank == 0:
         # 没有中止的实验日志，说明还没有保存过模型状态等信息
-        if not os.path.exists(os.path.join(out_dir, "best1_reslog.pkl")) and not os.path.exists(os.path.join(out_dir, "best2_reslog.pkl")):
+        if not os.path.exists(os.path.join(ckpt_out_dir, best1_prefix + "reslog.pkl")) and not os.path.exists(os.path.join(ckpt_out_dir, best2_prefix + "reslog.pkl")):
             raise ValueError("没有中止的实验日志，说明还没有保存过模型状态等信息，建议从头开始训练")
         
         # best1文件不存在，说明之前的best1保存失败，若存在，说明文件损坏，删除
-        if not os.path.exists(os.path.join(out_dir, "best1_reslog.pkl")):
-            # 删除out_dir下所有best1前缀的文件
-            for file_basename in os.listdir(out_dir):
+        if not os.path.exists(os.path.join(ckpt_out_dir, best1_prefix + "reslog.pkl")):
+            # 删除ckpt_out_dir下所有best1前缀的文件
+            for file_basename in os.listdir(ckpt_out_dir):
                 if file_basename.startswith(best1_prefix):
-                    os.remove(os.path.join(out_dir, file_basename))
+                    os.remove(os.path.join(ckpt_out_dir, file_basename))
             # 然后将次优(best2)改名为最优(best1)
-            for file_basename in os.listdir(out_dir):
+            for file_basename in os.listdir(ckpt_out_dir):
                 if file_basename.startswith(best2_prefix):
                     new_file_basename = best1_prefix + file_basename[len(best2_prefix):]
-                    os.rename(os.path.join(out_dir, file_basename), os.path.join(out_dir, new_file_basename))
+                    os.rename(os.path.join(ckpt_out_dir, file_basename), os.path.join(ckpt_out_dir, new_file_basename))
     
     # -----------------------------------------------------------------------------
     # 加载模型状态
@@ -430,7 +434,7 @@ if resume:
     object_list = [None]
     if master_process:
         # 加载模型状态，先放在cpu上
-        model_path = os.path.join(out_dir, best1_prefix + "model.pt")
+        model_path = os.path.join(ckpt_out_dir, best1_prefix + "model.pt")
         model_state_dict = torch.load(model_path, map_location="cpu")
         object_list = [model_state_dict]
     # DDP下需要将状态广播到其他rank
@@ -450,7 +454,7 @@ if resume:
     # 待会广播给其他rank
     object_list = [None]
     if master_process:
-        ckpt_path = os.path.join(out_dir, best1_prefix + "ckpt.pt")
+        ckpt_path = os.path.join(ckpt_out_dir, best1_prefix + "ckpt.pt")
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         object_list = [checkpoint]
     # DDP下需要将状态广播到其他rank
@@ -483,7 +487,7 @@ if resume:
     if ddp and use_powerSGD_hook:
         # 注意每个rank都有自己的powerSGD_state，文件名不同
         rank_prefix = best1_prefix + f"rank{ddp_rank}_"
-        powerSGD_state_dict = torch.load(os.path.join(out_dir, rank_prefix + "powerSGD_state.pt"), map_location=device)
+        powerSGD_state_dict = torch.load(os.path.join(ckpt_out_dir, rank_prefix + "powerSGD_state.pt"), map_location=device)
         powerSGD_state = powerSGD_state_dict["powerSGD_state"]  # 后面作为powerSGD_hook的参数
         # 如果powerSGD_grad_buffer_is_error=True，则error_dict状态在grad_buffers中
         # 将其复制给对应的model的buffers的grad_data即可
@@ -501,10 +505,10 @@ if resume:
     
     # 只有主进程需要加载实验过程日志
     if master_process:
-        reslog.load(os.path.join(out_dir, best1_prefix + "reslog.pkl"))  # 读取中止的实验日志
+        reslog.load(os.path.join(ckpt_out_dir, best1_prefix + "reslog.pkl"))  # 读取中止的实验日志
         
     resume_time = time.time() - resume_time
-    _ = logger.info(f"Resumed  training from {out_dir}, {resume_time:.4f}s") if master_process else None
+    _ = logger.info(f"Resumed  training from {out_dir} ({best1_prefix}), {resume_time:.4f}s") if master_process else None
 
 # 同步一下
 if ddp:
@@ -595,7 +599,7 @@ def estimate_loss():
 train_batch_iter = iter_batches(split="train")
 X, Y = next(train_batch_iter)  # fetch the very first batch
 # 如果resume，需要跳过前面的iter
-if resume:
+if resume or iter_num != 0:
     _ = logger.info(f"Skipping {iter_num} iters ({iter_num * gradient_accumulation_steps} batches)") if master_process else None
     skip_data_time = time.time()
     for _ in range(iter_num * gradient_accumulation_steps):  # 这里假设实验配置还是resume之前的
@@ -657,92 +661,29 @@ while True:
         torch.distributed.broadcast(val_loss, src=0, async_op=False)
         
     val_loss = val_loss.item()  # 没有验证的话，则值为-1.0
+    
+    # 保存最新状态，第一次iter不保存，resume后的第一次验证也不保存
+    if iter_num % eval_interval == 0 and iter_num > 0 and not resume:
+        save_checkpoint_time = time.time()
+        
+        # 保存状态
+        save_checkpoint(globals(), prefix="last")
+            
+        save_checkpoint_time = time.time() - save_checkpoint_time
+        _ = logger.info(f"save last checkpoint to {out_dir}, {save_checkpoint_time:.4f}s") if master_process else None
         
     # -----------------------------------------------------------------------------
-    # 看看是否需要保存checkpoint，resume后的第一个不需要保存，因为还是原来的
-    if iter_num % eval_interval == 0 and (val_loss < best_val_loss or always_save_checkpoint) and not resume:
+    # 看看是否需要保存最优checkpoint，resume后的第一个不需要保存，因为还是原来的
+    if iter_num % eval_interval == 0 and val_loss < best_val_loss and not resume:
         best_val_loss = val_loss
         if iter_num > 0:
             save_checkpoint_time = time.time()
             
-            # 保存PowerSGD的状态前，需要将process_group设置为None，因为process_group不能被序列化
-            if use_powerSGD_hook:
-                # 保存process_group有问题：https://discuss.pytorch.org/t/how-to-resume-with-powersgd-enabled-training/148747/2
-                pg = powerSGD_state.process_group
-                powerSGD_state.process_group = None
-            
-            # 为了防止保存最优时程序中断，即最优保存失败，需要保存一个次优版本
-            # 先将次优(best2)删除，然后将最优(best1)改名为次优
-            best1_prefix = "best1_"
-            best2_prefix = "best2_"
-            
-            # 只有每个节点的local rank0需要进行删除和重名操作
-            if ddp_local_rank == 0:
-                # 先将out_dir下的次优前缀文件删除
-                for file_basename in os.listdir(out_dir):
-                    if file_basename.startswith(best2_prefix):
-                        os.remove(os.path.join(out_dir, file_basename))
-                # 然后将最优(best1)改名为次优
-                for file_basename in os.listdir(out_dir):
-                    if file_basename.startswith(best1_prefix):
-                        new_file_basename = best2_prefix + file_basename[len(best1_prefix):]
-                        os.rename(os.path.join(out_dir, file_basename), os.path.join(out_dir, new_file_basename))
-            
-            if ddp:
-                # 等待所有rank都删除和重名完
-                torch.distributed.barrier()
-            
-            # 保存完次优后，可以放心进行保存最优了
-            # rank0需要保存的文件
-            if master_process:
-                # 1. 单独保存模型权重文件
-                torch.save(raw_model.state_dict(), os.path.join(out_dir, best1_prefix + "model.pt"))
-                # 2. 保存训练状态
-                checkpoint = {
-                    "optimizer": optimizer.state_dict(),
-                    "iter_num": iter_num,
-                    "best_val_loss": best_val_loss,
-                    # "powerSGD_state": powerSGD_state,
-                    "cpu_rng_state": torch.get_rng_state(),
-                    "cuda_rng_state": torch.cuda.get_rng_state(),  # 获取当前的RNG状态，使得resume后的随机数和当前一致（即考虑到dropout等操作的影响）
-                }
-                torch.save(checkpoint, os.path.join(out_dir, best1_prefix + "ckpt.pt"))
-                checkout = None  # 保存完，可以删除引用了
-                
-            # 所有rank都需要保存的文件，powerSGD_state
-            if use_powerSGD_hook:
-                powerSGD_state_dict = {}
-                powerSGD_state_dict["powerSGD_state"] = powerSGD_state
-                # 如果powerSGD_grad_buffer_is_error=True，则error_dict状态在grad_buffer中
-                if grad_buffer_is_powerSGD_error:
-                    powerSGD_state_dict["powerSGD_state"].error_dict = {}  # error_dict保存在grad_buffer中
-                    grad_buffers = []
-                    for buffer in model.buffers:
-                        grad_buffers.append(buffer.grad_data)
-                    powerSGD_state_dict["grad_buffers"] = grad_buffers  # 加载时，复制给model.buffers中的grad_data
-                
-                # 保存powerSGD_state，注意每个rank都有自己的powerSGD_state，文件名不同
-                rank_prefix = best1_prefix + f"rank{ddp_rank}_"
-                torch.save(powerSGD_state_dict, os.path.join(out_dir, rank_prefix + "powerSGD_state.pt"))
-                powerSGD_state_dict = None  # 保存完，可以删除引用了
-            
-            if ddp_local_rank == 0:
-                # 3. 保存实验过程日志，可用resplot来展示，放在最后保存，可以以此判断之前的文件是否保存成功
-                # 每个节点的local rank0都需要保存下，可以用于判断之前的文件是否保存成功
-                # 其中只有master_process的reslog文件才有值，其他的都是空文件（因为reslog.log只在mater_process用）
-                reslog.save(os.path.join(out_dir, best1_prefix + "reslog.pkl"))
-            
-            # 记得还原PowerSGD的进程组状态
-            if use_powerSGD_hook:
-                # 直接保存process_group有问题：https://discuss.pytorch.org/t/how-to-resume-with-powersgd-enabled-training/148747/2
-                powerSGD_state.process_group = pg
-                
-            # 等待所有rank都保存完
-            if ddp:
-                torch.distributed.barrier()
+            # 保存状态
+            save_checkpoint(globals(), prefix="best")
                 
             save_checkpoint_time = time.time() - save_checkpoint_time
-            _ = logger.info(f"save checkpoint to {out_dir}, {save_checkpoint_time:.4f}s") if master_process else None
+            _ = logger.info(f"save best checkpoint to {out_dir}, {save_checkpoint_time:.4f}s") if master_process else None
     if iter_num % eval_interval == 0:
         # 验证过了，重置下训练的开始时间
         train_time0 = time.time()

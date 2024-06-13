@@ -205,22 +205,3 @@ def save_run_exp_config(save_path, exp_config):
 
     with open(save_path, "w", encoding="utf-8") as f:
         f.write(exp_config_text)
-
-
-def copy_tensor_to_device_in_object(obj, device):
-    '''
-    将对象中的所有张量复制到指定的设备上
-    
-    需要给PowerSGDState添加copy_tensor_to_device方法
-    '''
-    if isinstance(obj, torch.Tensor):
-        obj = obj.to(device)
-    elif isinstance(obj, dict):
-        for key, value in obj.items():
-            obj[key] = copy_tensor_to_device_in_object(value, device)
-    elif isinstance(obj, list):
-        for i, value in enumerate(obj):
-            obj[i] = copy_tensor_to_device_in_object(value, device)
-    elif hasattr(obj, "copy_tensor_to_device"):
-        obj.copy_tensor_to_device(device)
-    return obj
