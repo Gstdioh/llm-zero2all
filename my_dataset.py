@@ -58,10 +58,20 @@ class PretokDataset(torch.utils.data.IterableDataset):
             rng.shuffle(shard_filenames)
             for shard in shard_filenames:
                 # open the dataset for reading but keep it on disk with memmap
-                m = np.memmap(shard, dtype=np.uint16, mode="r")
+                # 注意，data/02_train_data_more/01_bin_for_train_hf/file_004_00035.bin为空
+                # 要考虑下文件可能为空的情况，直接跳过
+                try:
+                    m = np.memmap(shard, dtype=np.uint16, mode="r")
+                except:
+                    print(f"file {shard} is empty, skipping")
+                    continue
                 num_tokens = len(m)  # 这个shard的总token数
                 num_batches = num_tokens // self.max_seq_len  # 向下取整
-                assert num_batches > 0, "this shard is way too small? investigate."
+                # 太小不足以构成一个样本，跳过
+                if num_batches <= 0:
+                    print(f"file {shard} is too small, skipping")
+                    continue
+                # assert num_batches > 0, "this shard is way too small? investigate."
                 ixs = list(range(num_batches))
                 # 打乱文件内的样本
                 rng.shuffle(ixs)
