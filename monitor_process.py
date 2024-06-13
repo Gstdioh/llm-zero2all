@@ -127,8 +127,19 @@ while True:
             # 重新启动rank0进程
             p = subprocess.Popen(rank0_command, env=env)
             time.sleep(1)  # 确保rank0进程已经启动
-            # 重新启动远程服务器的命令
+            # -----------------------------------------------------------------------------
+            # 执行远程服务器的命令
+            # 首先创建一个SSH客户端
             if args.remote:
+                try:
+                    ssh.close()
+                except:
+                    pass
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                # 连接到远程服务器
+                ssh.connect(hostname=args.hostname, port=args.port, username=args.username, password=args.password)
+                # 执行远程服务器的命令
                 remote_stdin, remote_stdout, remote_stderr = ssh.exec_command(remote_command)
         else:
             # 等待一段时间再次检查
@@ -157,6 +168,17 @@ while True:
         # 重新启动rank0进程
         p = subprocess.Popen(rank0_command, env=env)
         time.sleep(1)  # 确保rank0进程已经启动
-        # 重新启动远程服务器的命令
+        # -----------------------------------------------------------------------------
+        # 执行远程服务器的命令
+        # 首先创建一个SSH客户端
         if args.remote:
+            try:
+                ssh.close()
+            except:
+                pass
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            # 连接到远程服务器
+            ssh.connect(hostname=args.hostname, port=args.port, username=args.username, password=args.password)
+            # 执行远程服务器的命令
             remote_stdin, remote_stdout, remote_stderr = ssh.exec_command(remote_command)

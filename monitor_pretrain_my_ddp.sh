@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# 将标准输出和标准错误同时也输出到文件中
+# ./local.sh 2>&1 | tee monitor_out.txt
+
 REMOTE1_ARGS=(
     --remote_torchrun "abspath_to_torchrun"
     --remote_workspace "abspath_to_remote_workspace"
