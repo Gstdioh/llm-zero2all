@@ -97,7 +97,7 @@ log_interval = 1
 eval_iters = 100  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
 resume = False  # if True, resume training from the last checkpoint
-resume_from = "best"  # ["best", "last"] 从哪个开始resume
+resume_from = "last"  # ["best", "last"] 从哪个开始resume
 sync_for_true_time = False  # 是否同步以获取mirco的真实耗费的时间，测试时用
 # my logging
 use_reslog = True  # wandb用起来有问题，改为自己的日志和画图工具，这个必须为True，因为还会被用来判断文件是否保存成功
