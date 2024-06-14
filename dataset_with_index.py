@@ -33,7 +33,7 @@ class PretokDataset(torch.utils.data.IterableDataset):
     注意，要考虑到num_workers和ddp的影响
     """
 
-    def __init__(self, split, max_seq_len, train_bin_dir, valid_bin_dir, random_seed=42):
+    def __init__(self, split, max_seq_len, train_bin_dir, valid_bin_dir, random_seed=42, **kwargs):
         super().__init__()
         self.split = split
         self.max_seq_len = max_seq_len
@@ -78,15 +78,18 @@ class PretokDataset(torch.utils.data.IterableDataset):
         cur_index = 0 + ddp_world_size * worker_id + ddp_rank  # 因为num_workers的数量可能大于batch_size，所以worker_id要在外层，ddp_rank要在内层
         all_index_len = num_workers * ddp_world_size  # cur_index每次应该跳过的长度
         
+        # 无限循环，是否结束由外部控制
         while True:
-            # 打乱索引
+            # 首先进行索引的打乱
             shuffle_time = time.time()
             rng.shuffle(self.sample_index_list)
             shuffle_time = time.time() - shuffle_time
             print(f"worker_id {worker_id} ddp_rank {ddp_rank} shuffled {self.split} sample_index_list, {shuffle_time:.4f}s")
+
+            # 索引从头开始，即开始一个新的epoch
+            cur_index %= self.num_samples
             
-            cur_index %= self.num_samples  # 从头开始，即开始一个新的epoch
-            
+            # 进行一个epoch的数据读取
             while cur_index < self.num_samples:
                 sample_index = self.sample_index_list[cur_index]
                 cur_index += all_index_len
@@ -109,7 +112,7 @@ class PretokDataset(torch.utils.data.IterableDataset):
                 x = chunk[:-1]
                 y = chunk[1:]
                 yield x, y
-                
+
 
 class Task:
 

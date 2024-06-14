@@ -30,7 +30,7 @@ class PretokDataset(torch.utils.data.IterableDataset):
     两个地方随机打乱，文件名和每个文件内部的一个样本
     """
 
-    def __init__(self, split, max_seq_len, train_bin_dir, valid_bin_dir,):
+    def __init__(self, split, max_seq_len, train_bin_dir, valid_bin_dir, **kwargs):
         super().__init__()
         self.split = split
         self.max_seq_len = max_seq_len

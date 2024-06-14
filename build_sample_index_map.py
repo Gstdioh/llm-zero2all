@@ -72,6 +72,9 @@ def build_sample_index_map(file_list, max_seq_len, sample_index_map_path):
     # 保存np文件
     with open(sample_index_map_path, "wb") as f:
         f.write(sample_index_map.tobytes())
+        
+    num_samples = len(sample_index_map) // 2
+    print(f"Build {sample_index_map_path} done, num_samples: {num_samples}")
 
 
 max_seq_len = 2048
