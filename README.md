@@ -4,6 +4,8 @@
 
 1. [构建数据集](#01-数据集)，使用多个公开数据集，构建文本文件来训练分词器，通过分词器构建bin文件用于训练，能从多个文件中挑选出部分内容作为验证集。
 
+    * 数据集的读取使用索引，节省内存。
+
 2. [分词器](#02-分词器tokenizer)，两个，huggingface的tokenizers，sentencepiece，最后构建出的类可以通过`save_pretrained(dir)`保存，通过`AutoTokenizer.from_pretrained(dir)`导入。
 
 3. [模型结构](#03-模型结构-z2all-使用-llama2-结构)，使用llama2结构，并且将多个模块更改为融合算子，加速计算。
@@ -33,7 +35,9 @@ train_tokenizer.py, 训练自己的分词器
 
 pretokenize_data_more.py, 预处理数据集为bin文件，用于训练
 
-my_dataset.py, 数据读取的类，构建DataLoader
+dataset.py, 数据读取的类，构建DataLoader
+build_sample_index_map.py, 构建数据集的索引
+dataset_with_index.py, 使用索引来取数据的数据集，需要先通过build_sample_index_map.py构建索引
 
 pretrain_my_ddp.py, 自己实现的DDP的预训练脚本，版本最新
 pretrain.py, PyTorch的DDP的预训练脚本，版本较老（不包含各种计算通信重叠等新功能）
@@ -45,7 +49,7 @@ monitor_process.py，监控训练进程，当进程异常中断时，能够自�
 
 #### 其他说明
 
-单卡训练脚本看pretrain.py的就行了（就没用到分布式训练，不过分布式训练的实现代码算是这个项目的重要内容）
+单卡训练脚本也可以看pretrain_my_ddp.py（就没用到分布式训练，不过分布式训练的实现代码算是这个项目的重要内容）
 
 不用分布式训练的话（其实流程差不多，只是预训练脚本稍有不同），流程应该只有数据集的构建（还没实现数据清洗）、分词器的构建、llm经典结构的构建（llama2，使用融合算子）、预训练阶段
 
