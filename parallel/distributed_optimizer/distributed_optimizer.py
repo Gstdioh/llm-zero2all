@@ -9,7 +9,6 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
-from apex.optimizers import FusedAdam as Adam
 
 from parallel.distributed_data_parallel import ParamAndGradBuffer, Bucket, DistributedDataParallel
 from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import stream_wrapper

@@ -71,9 +71,11 @@ if args.remote:
     remote_start_command = f"cd {remote_workspace} ; {remote_start_command} --out_dir={out_dir}"
     remote_resume_command = remote_start_command + " --resume"
 
+ckpt_out_dir = os.path.join(out_dir, "ckpt")
+
 # -----------------------------------------------------------------------------
 # 如果输出目录中存在best1_reslog.pkl或者best2_reslog.pkl文件，说明已经训练过了，可以直接resume，否则从头开始
-if os.path.exists(os.path.join(out_dir, "best1_reslog.pkl")) or os.path.exists(os.path.join(out_dir, "best2_reslog.pkl")):
+if os.path.exists(os.path.join(ckpt_out_dir, "best1_reslog.pkl")) or os.path.exists(os.path.join(ckpt_out_dir, "best2_reslog.pkl")):
     rank0_command = rank0_resume_command
     remote_command = remote_resume_command
 else:
@@ -117,7 +119,7 @@ while True:
             print(monitor_prefix + f"重新启动进程: {' '.join(rank0_command)}")
             
             # 如果输出目录中存在best1_reslog.pkl或者best2_reslog.pkl文件，说明已经训练过了，可以直接resume，否则从头开始
-            if os.path.exists(os.path.join(out_dir, "best1_reslog.pkl")) or os.path.exists(os.path.join(out_dir, "best2_reslog.pkl")):
+            if os.path.exists(os.path.join(ckpt_out_dir, "best1_reslog.pkl")) or os.path.exists(os.path.join(ckpt_out_dir, "best2_reslog.pkl")):
                 rank0_command = rank0_resume_command
                 remote_command = remote_resume_command
             else:
@@ -158,7 +160,7 @@ while True:
         print(monitor_prefix + f"重新启动进程: {' '.join(rank0_command)}")
         
         # 如果输出目录中存在best1_reslog.pkl或者best2_reslog.pkl文件，说明已经训练过了，可以直接resume，否则从头开始
-        if os.path.exists(os.path.join(out_dir, "best1_reslog.pkl")) or os.path.exists(os.path.join(out_dir, "best2_reslog.pkl")):
+        if os.path.exists(os.path.join(ckpt_out_dir, "best1_reslog.pkl")) or os.path.exists(os.path.join(ckpt_out_dir, "best2_reslog.pkl")):
             rank0_command = rank0_resume_command
             remote_command = remote_resume_command
         else:

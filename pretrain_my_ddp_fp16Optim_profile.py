@@ -58,7 +58,7 @@ import torch.distributed as dist
 import torch.distributed
 from transformers import AutoConfig, AutoTokenizer
 
-from my_dataset import Task
+from dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 import utils
 from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config

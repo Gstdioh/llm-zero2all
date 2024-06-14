@@ -3,9 +3,6 @@ import sys
 import json
 import regex as re
 import unicodedata
-import inspect
-
-import torch
 
 
 # 解析命令行参数

@@ -3,8 +3,12 @@ from typing import List, Optional, Union
 from abc import ABC, abstractmethod
 
 import torch
-import amp_C
-from apex.multi_tensor_apply import multi_tensor_applier
+
+try:
+    import amp_C
+    from apex.multi_tensor_apply import multi_tensor_applier
+except:
+    multi_tensor_applier = None
 
 from optimizer import OptimizerConfig
 from parallel.distributed_data_parallel import DistributedDataParallel
@@ -39,7 +43,7 @@ def _multi_tensor_copy_this_to_that(
     is not provided, we default back to simple loop copy to be compatible
     with bfloat16.
     """
-    if overflow_buf is not None:
+    if overflow_buf is not None and multi_tensor_applier is not None:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
         multi_tensor_applier(amp_C.multi_tensor_scale, overflow_buf, [this, that], 1.0)

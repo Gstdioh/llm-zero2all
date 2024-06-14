@@ -415,7 +415,7 @@ class Z2allDecoderLayer(nn.Module):
         self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
         self.use_fused_rmsnorm = (MixedFusedRMSNorm is not None) and config.use_fused_rmsnorm
         # 只有在不使用fused_dropout_add_norm，并且能使用fused_rmsnorm时，才使用fused_rmsnorm
-        if not self.use_fused_dropout_add_norm and config.use_fused_rmsnorm:
+        if not self.use_fused_dropout_add_norm and self.use_fused_rmsnorm:
             RMSNorm = MixedFusedRMSNorm
         else:
             RMSNorm = RMSNormTorch
@@ -604,7 +604,7 @@ class Z2allModel(Z2allPreTrainedModel):
         self.use_fused_dropout_add_norm = (dropout_add_rms_norm is not None) and config.use_fused_dropout_add_norm
         self.use_fused_rmsnorm = (MixedFusedRMSNorm is not None) and config.use_fused_rmsnorm
         # 只有在不使用fused_dropout_add_norm，并且能使用fused_rmsnorm时，才使用fused_rmsnorm
-        if not self.use_fused_dropout_add_norm and config.use_fused_rmsnorm:
+        if not self.use_fused_dropout_add_norm and self.use_fused_rmsnorm:
             RMSNorm = MixedFusedRMSNorm
         else:
             RMSNorm = RMSNormTorch

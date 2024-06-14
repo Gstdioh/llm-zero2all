@@ -3,37 +3,37 @@ This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
 To run on a single GPU small debug run, example:
-$ python -m pretrain.py --compile=False --eval_iters=10 --batch_size=8
+$ python -m pretrain_my_ddp.py --compile=False --eval_iters=10 --batch_size=8
 
 To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 pretrain.py
+$ torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py
 
 To run with DDP on 4 gpus across 2 nodes, example:
 - Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 pretrain.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 pretrain_my_ddp.py
 - Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 pretrain.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 pretrain_my_ddp.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 $ export NCCL_IB_DISABLE=1
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 pretrain.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 pretrain_my_ddp.py
 
 my_run
 # single
-$ python pretrain.py --batch_size=2 --gradient_accumulation_steps=2
+$ python pretrain_my_ddp.py --batch_size=2 --gradient_accumulation_steps=2
 # 看速度，不用flash可能会超显存，所以使用小的batch_size
-$ python pretrain.py --batch_size=2 --gradient_accumulation_steps=16
+$ python pretrain_my_ddp.py --batch_size=2 --gradient_accumulation_steps=16
 # 看显存占用
-$ python pretrain.py --batch_size=16 --gradient_accumulation_steps=2
+$ python pretrain_my_ddp.py --batch_size=16 --gradient_accumulation_steps=2
 
 OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --gradient_accumulation_steps=12
 
 # gpu4
-$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py
 # test
-$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain.py --ddp_backend=gloo  # gloo
-$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain.py --ddp_backend=nccl  # nccl
-$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 NCCL_BUFFLE_SIZE=16777216 torchrun --standalone --nproc_per_node=4 pretrain.py
-$ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standalone --nproc_per_node=4 pretrain.py # error
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --ddp_backend=gloo  # gloo
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --ddp_backend=nccl  # nccl
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 NCCL_BUFFLE_SIZE=16777216 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py
+$ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py # error
 
 # gpu4, gpu4_2
 - gpu4
@@ -62,7 +62,6 @@ import torch.distributed as dist
 import torch.distributed
 from transformers import AutoConfig, AutoTokenizer
 
-from my_dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 import utils
 from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config, copy_tensor_to_device_in_object, save_checkpoint
@@ -93,9 +92,9 @@ os.environ["NCCL_P2P_DISABLE"] = "1"  # disable p2p
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
 iter_num = 0  # 从该iter开始训练
-eval_interval = 3  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
+eval_interval = 200  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
 log_interval = 1
-eval_iters = 1  # 每次验证的step数
+eval_iters = 100  # 每次验证的step数
 eval_only = False  # if True, script exits right after the first eval
 resume = False  # if True, resume training from the last checkpoint
 resume_from = "best"  # ["best", "last"] 从哪个开始resume
@@ -109,7 +108,8 @@ reslog_save_interval = 10  # 想快速看结果，可以用小点的数
 train_bin_dir = "data/02_train_data_more/01_bin_for_train_hf"
 valid_bin_dir = "data/02_train_data_more/02_bin_for_valid_hf"
 num_workers = 0  # 数据加载器的工作进程数
-## global_batch_size=batch_size*gradient_accumulation_steps*ddp_world_size
+use_dataset_with_index = False  # 是否使用索引来遍历数据集，需要先通过build_sample_index_map.py构建sample的索引
+## global_batch_size = batch_size * gradient_accumulation_steps * ddp_world_size
 batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 2048
 grad_div_total_tokens = False  # 是否在计算梯度时除以总的token数，设置reduction="none" and grad_scaling_before_comm=False，使用PowerSGD时不能使用（loss不好，可能因为PowerSGD对数大的压缩不好，有正交化操作）
@@ -200,6 +200,13 @@ exp_config = {k: globals()[k] for k in config_keys}
 
 # 删除tokenizer，后面不会用到了
 tokenizer = None
+
+# -----------------------------------------------------------------------------
+# 是否使用索引来遍历数据集，需要先通过build_sample_index_map.py构建sample的索引
+if use_dataset_with_index:
+    from dataset_with_index import Task
+else:
+    from dataset import Task
 
 # -----------------------------------------------------------------------------
 # 不能一起使用的参数配置
@@ -579,7 +586,7 @@ def get_lr(it):
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ["train", "val"]:
+    for split in ["train", "valid"]:
         batch_iter = iter_batches(split=split)
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
@@ -638,29 +645,29 @@ while True:
     # -----------------------------------------------------------------------------
     # 验证，只在rank0上验证和保存
     # 但是其他rank也需要知道该信息，用于保存powerSGD的状态（每个rank都需要保存自己的error_dict）
-    val_loss = torch.tensor([-1.0], dtype=torch.float32, device=device)  # 初始为-1，若验证过了，则必为正数，这样可以判断是否验证过了
+    valid_loss = torch.tensor([-1.0], dtype=torch.float32, device=device)  # 初始为-1，若验证过了，则必为正数，这样可以判断是否验证过了
     if iter_num % eval_interval == 0 and master_process:
-        val_t0 = time.time()
+        valid_t0 = time.time()
         losses = estimate_loss()
-        val_dt = time.time() - val_t0
-        logger.info(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, {val_dt:.4f}s")
+        valid_dt = time.time() - valid_t0
+        logger.info(f"step {iter_num}: train loss {losses['train']:.4f}, valid loss {losses['valid']:.4f}, {valid_dt:.4f}s")
         if use_reslog and master_process:
             reslog.log({
                 "iter": iter_num,
                 "tokens": iter_num * tokens_per_iter,
                 "loss/train": losses["train"],
-                "loss/val": losses["val"],
+                "loss/valid": losses["valid"],
                 "lr": lr,
                 "mfu": running_mfu * 100,  # convert to percentage
             }, name="valid", step = iter_num)
             
-        val_loss = torch.tensor(losses["val"], dtype=torch.float32, device=device)
+        valid_loss = torch.tensor(losses["valid"], dtype=torch.float32, device=device)
         
-    # 将val_loss广播给其他rank
+    # 将valid_loss广播给其他rank
     if iter_num % eval_interval == 0 and ddp:
-        torch.distributed.broadcast(val_loss, src=0, async_op=False)
+        torch.distributed.broadcast(valid_loss, src=0, async_op=False)
         
-    val_loss = val_loss.item()  # 没有验证的话，则值为-1.0
+    valid_loss = valid_loss.item()  # 没有验证的话，则值为-1.0
     
     # 保存最新状态，第一次iter不保存，resume后的第一次验证也不保存
     if iter_num % eval_interval == 0 and iter_num > 0 and not resume:
@@ -674,8 +681,8 @@ while True:
         
     # -----------------------------------------------------------------------------
     # 看看是否需要保存最优checkpoint，resume后的第一个不需要保存，因为还是原来的
-    if iter_num % eval_interval == 0 and val_loss < best_val_loss and not resume:
-        best_val_loss = val_loss
+    if iter_num % eval_interval == 0 and valid_loss < best_val_loss and not resume:
+        best_val_loss = valid_loss
         if iter_num > 0:
             save_checkpoint_time = time.time()
             
@@ -706,7 +713,10 @@ while True:
     # -----------------------------------------------------------------------------
     # 前向传播和反向传播，梯度更新
     # 使用model.no_sync()来设置是否同步
-    with model.no_sync():
+    no_sync = nullcontext
+    if ddp:
+        no_sync = model.no_sync
+    with no_sync():
         for micro_step in range(gradient_accumulation_steps - 1):
             micro_time = time.time()  #! 1
             with ctx:
@@ -753,7 +763,7 @@ while True:
     optim_step_time = time.time()  #! 3
     
     optimizer.step()  # scaler和grad_clip放在了这里面，里面会进行参数更新的同步
-    optimizer.zero_grad(set_to_none=True)  # overlap_param_gather时会在这里发起all-gather同步
+    optimizer.zero_grad()  # overlap_param_gather时会在这里发起all-gather同步
     
     # 同步一下
     if ddp:
@@ -765,7 +775,8 @@ while True:
     optim_step_time = time.time() - optim_step_time  #! 3
     
     # 获取所有rank下的loss
-    torch.distributed.all_reduce(train_loss, group=process_group, async_op=False)
+    if ddp:
+        torch.distributed.all_reduce(train_loss, group=process_group, async_op=False)
     # 需要取平均值
     if loss_reduction == "mean":
         train_loss = train_loss / ddp_world_size

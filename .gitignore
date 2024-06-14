@@ -13,10 +13,14 @@ __pycache__
 *.rar
 *.bz2
 *.bin
+*.ibin
 *.pkl
+*.npy
 /data/zhihu
 /data/Zhihu-KOL
 /data/ZZ_others_wikipedia
 
 local_test_*
 test.py
+
+my_*

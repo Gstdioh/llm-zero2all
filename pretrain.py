@@ -66,7 +66,7 @@ from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compr
 from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
 from transformers import AutoConfig
 
-from my_dataset import Task
+from dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 from transformers import AutoTokenizer
 import utils
@@ -353,7 +353,7 @@ def get_lr(it):
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ["train", "val"]:
+    for split in ["train", "valid"]:
         batch_iter = iter_batches(split=split)
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
@@ -449,25 +449,25 @@ while True:
         param_group["lr"] = lr
 
     # 验证
-    # evaluate the loss on train/val sets and write checkpoints
+    # evaluate the loss on train/valid sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        val_t0 = time.time()
+        valid_t0 = time.time()
         losses = estimate_loss()
-        val_dt = time.time() - val_t0
-        logger.info(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, {val_dt:.4f}s")
+        valid_dt = time.time() - valid_t0
+        logger.info(f"step {iter_num}: train loss {losses['train']:.4f}, valid loss {losses['valid']:.4f}, {valid_dt:.4f}s")
         if use_reslog and master_process:
             reslog.log({
                 "iter": iter_num,
                 "tokens": iter_num * tokens_per_iter,
                 "loss/train": losses["train"],
-                "loss/val": losses["val"],
+                "loss/valid": losses["valid"],
                 "lr": lr,
                 "mfu": running_mfu * 100,  # convert to percentage
             }, name="valid", step = iter_num)
             
         # 保存checkpoint，resume后的第一个不需要保存，因为还是原来的
-        if (losses["val"] < best_val_loss or always_save_checkpoint) and not resume:
-            best_val_loss = losses["val"]
+        if (losses["valid"] < best_val_loss or always_save_checkpoint) and not resume:
+            best_val_loss = losses["valid"]
             if iter_num > 0:
                 # 保存PowerSGD的状态
                 if use_powerSGD_hook:

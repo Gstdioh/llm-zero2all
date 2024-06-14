@@ -2,6 +2,7 @@ from typing import Dict
 import os
 
 import torch
+import torch.distributed
 
 
 def copy_tensor_to_device_in_object(obj, device):
@@ -42,13 +43,13 @@ def save_checkpoint(exp_global: Dict, prefix="best"):
     model = exp_global["model"]
     ddp_rank = exp_global["ddp_rank"]
     
-    if use_powerSGD_hook:
+    if ddp and use_powerSGD_hook:
         powerSGD_state = exp_global["powerSGD_state"]
     if ddp_local_rank == 0:
         reslog = exp_global["reslog"]
     
     # 保存PowerSGD的状态前，需要将process_group设置为None，因为process_group不能被序列化
-    if use_powerSGD_hook:
+    if ddp and use_powerSGD_hook:
         # 保存process_group有问题：https://discuss.pytorch.org/t/how-to-resume-with-powersgd-enabled-training/148747/2
         pg = powerSGD_state.process_group
         powerSGD_state.process_group = None
@@ -95,7 +96,7 @@ def save_checkpoint(exp_global: Dict, prefix="best"):
         checkpoint = None  # 保存完，可以删除引用了
         
     # 所有rank都需要保存的文件，powerSGD_state
-    if use_powerSGD_hook:
+    if ddp and use_powerSGD_hook:
         powerSGD_state_dict = {}
         powerSGD_state_dict["powerSGD_state"] = powerSGD_state
         # 如果powerSGD_grad_buffer_is_error=True，则error_dict状态在grad_buffer中
@@ -118,7 +119,7 @@ def save_checkpoint(exp_global: Dict, prefix="best"):
         reslog.save(os.path.join(ckpt_out_dir, best1_prefix + "reslog.pkl"))
     
     # 记得还原PowerSGD的进程组状态
-    if use_powerSGD_hook:
+    if ddp and use_powerSGD_hook:
         # 直接保存process_group有问题：https://discuss.pytorch.org/t/how-to-resume-with-powersgd-enabled-training/148747/2
         powerSGD_state.process_group = pg
         
