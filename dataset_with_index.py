@@ -117,7 +117,7 @@ class PretokDataset(torch.utils.data.IterableDataset):
 class Task:
 
     @staticmethod
-    def iter_batches(batch_size, device, num_workers=0, **dataset_kwargs):
+    def iter_batches(batch_size, device, skip_batches=0, num_workers=0, **dataset_kwargs):
         ds = PretokDataset(**dataset_kwargs)
         # 使用pin_memory=True和non_blocking=True可以加速数据传输
         # 见：https://pytorch.org/docs/stable/notes/cuda.html#cuda-memory-pinning
@@ -126,6 +126,10 @@ class Task:
         )
         # PyTorch会正确地在内部处理必要的同步，确保在计算操作（如线性层的计算）开始之前数据已经被传输完成。
         for x, y in dl:
+            # resume时，跳过已经训练过的batch
+            if skip_batches > 0:
+                skip_batches -= 1
+                continue
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             yield x, y

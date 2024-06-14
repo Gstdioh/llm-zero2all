@@ -316,19 +316,6 @@ ctx = (
 )
 
 # -----------------------------------------------------------------------------
-# 任务构造器，用于生成训练和验证数据，不同进程会有不同的rng种子
-# task-specific setup
-iter_batches = partial(
-    Task.iter_batches,
-    batch_size=batch_size,
-    max_seq_len=max_seq_len,
-    train_bin_dir=train_bin_dir,
-    valid_bin_dir=valid_bin_dir,
-    device=device,
-    num_workers=0,
-)
-
-# -----------------------------------------------------------------------------
 # 初始化设置
 _ = logger.info("Initializing model and optimizer") if master_process else None  # 通过这种方式可以避免在非master进程中打印
 init_mode_optim_time = time.time()
@@ -581,6 +568,18 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # -----------------------------------------------------------------------------
+# 任务构造器，用于生成训练和验证数据，不同进程会有不同的rng种子
+iter_batches = partial(
+    Task.iter_batches,
+    batch_size=batch_size,
+    max_seq_len=max_seq_len,
+    train_bin_dir=train_bin_dir,
+    valid_bin_dir=valid_bin_dir,
+    device=device,
+    num_workers=0,
+)
+
+# -----------------------------------------------------------------------------
 # 测试函数，只在rank0上进行验证
 @torch.no_grad()
 def estimate_loss():
@@ -603,16 +602,15 @@ def estimate_loss():
 
 # -----------------------------------------------------------------------------
 # 准备训练集
-train_batch_iter = iter_batches(split="train")
-X, Y = next(train_batch_iter)  # fetch the very first batch
-# 如果resume，需要跳过前面的iter
-if resume or iter_num != 0:
-    _ = logger.info(f"Skipping {iter_num} iters ({iter_num * gradient_accumulation_steps} batches)") if master_process else None
-    skip_data_time = time.time()
-    for _ in range(iter_num * gradient_accumulation_steps):  # 这里假设实验配置还是resume之前的
-        X, Y = next(train_batch_iter)
-    skip_data_time = time.time() - skip_data_time
-    _ = logger.info(f"Skipped  {iter_num} iters ({iter_num * gradient_accumulation_steps} batches), {skip_data_time:.4f}s") if master_process else None
+skip_batches = iter_num * gradient_accumulation_steps  # 跳过的batch数
+skip_data_time = time.time()
+_ = logger.info(f"Skipping {iter_num} iters ({skip_batches} batches)") if master_process else None
+
+train_batch_iter = iter_batches(split="train", skip_batches=skip_batches)
+X, Y = next(train_batch_iter)  # 在里面跳过skip_batches
+
+_ = logger.info(f"Skipped  {iter_num} iters ({skip_batches} batches), {time.time() - skip_data_time:.4f}s") if master_process else None
+
 
 # 同步一下
 if ddp:
