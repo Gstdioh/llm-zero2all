@@ -21,6 +21,7 @@
     * 构建了一个简单的**实验过程可视化**（通过ssh远程获取文件来可视化）。
     * 训练可以从**断点重新训练**，且重新训练时结果与之前一致（可复现），保存的方式更加稳定（保存最优和次优的文件，防止保存失败导致文件损坏）
     * 实现训练进程的监控，当进程异常中断时，监控进程可以**自动重新启动进程**（monitor_process.py）
+    * 实现**SFT微调**，也在train_my_ddp.py中
 
 5. 其他，提供[docker镜像](#10-docker镜像)，包含实验所需的所有环境
 
@@ -29,27 +30,32 @@
 ```txt
 README.md, 说明文档
 
+requirements.txt，环境
+
 hfd.sh, 下载huggingface中的模型和数据集（见：https://hf-mirror.com/）
 
 train_tokenizer.py, 训练自己的分词器
 
 pretokenize_data_more.py, 预处理数据集为bin文件，用于训练
 
-dataset.py, 数据读取的类，构建DataLoader
-build_sample_index_map.py, 构建数据集的索引
-dataset_with_index.py, 使用索引来取数据的数据集，需要先通过build_sample_index_map.py构建索引
+build_sample_index_map.py, 构建pretrain数据集的索引
+dataset_pretrain.py, 用于pretrain的数据集
+dataset_sft.py, 用于sft的数据集
+dataset_task.py, 用于训练时的任务构建，可以无限生成训练需要的iter_batches
 
-pretrain_my_ddp.py, 自己实现的DDP的预训练脚本，版本最新
-pretrain.py, PyTorch的DDP的预训练脚本，版本较老（不包含各种计算通信重叠等新功能）
+train_my_ddp.py, 自己实现的DDP的训练脚本，支持（pretrain, sft），版本最新
 configurator.py, 解析训练脚本的命令行
 
-monitor_pretrain_my_ddp.sh，运行monitor_process.py的脚本
+monitor_train_my_ddp.sh，运行monitor_process.py的脚本例子
 monitor_process.py，监控训练进程，当进程异常中断时，能够自动重新启动进程
+
+dataset_legacy.py, 之前数据集的构建方法，用于pretrain.py（因为该代码没有不断的更新）
+pretrain_legacy.py, PyTorch的DDP的预训练脚本，版本较老（不包含各种计算通信重叠、SFT等新功能）
 ```
 
 #### 其他说明
 
-单卡训练脚本也可以看pretrain_my_ddp.py（就没用到分布式训练，不过分布式训练的实现代码算是这个项目的重要内容）
+单卡训练脚本也可以看train_my_ddp.py（就没用到分布式训练，不过分布式训练的实现代码算是这个项目的重要内容）
 
 不用分布式训练的话（其实流程差不多，只是预训练脚本稍有不同），流程应该只有数据集的构建（还没实现数据清洗）、分词器的构建、llm经典结构的构建（llama2，使用融合算子）、预训练阶段
 
@@ -60,7 +66,7 @@ monitor_process.py，监控训练进程，当进程异常中断时，能够自�
 ## 00 环境配置
 我的环境：cuda11.4, pytorch1.12.1
 
-见 requirements.txt，融合算子相应库的具体安装可以看[03-融合算子小节](#融合算子)
+见 requirements.txt（我的conda环境，pip list生成，有点冗余），融合算子相应库的具体安装可以看[03-融合算子小节](#融合算子)
 
 ### Docker
 我自己构建了docker镜像（dockerhub和阿里的容器镜像），包含了所需要的环境（安装了融合算子相应的库）

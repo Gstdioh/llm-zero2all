@@ -7,13 +7,13 @@ class Z2allConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=64000,
+        vocab_size=64320,
         hidden_dim=4096,
         intermediate_size=None,  # FFN中间层的大小, 不为None, 则mutiple_of参数无效；为None这通过hidden_dim和mutiple_of计算，即8/3*hidden_dim
         multiple_of=256,  # make SwiGLU hidden layer size multiple of large power of 2, 256的倍数, 影响intermediate_size（见llama.c）
-        n_layers=32,
-        n_heads=32,
-        n_kv_heads=None,  # 用于GQA
+        n_layers=28,
+        n_heads=16,
+        n_kv_heads=8,  # 用于GQA
         max_seq_len=2048,
         initializer_range=0.02,  # 参数初始化时的标准差
         rms_norm_eps=1e-5,  # 防止除0的小数
@@ -22,7 +22,7 @@ class Z2allConfig(PretrainedConfig):
         rope_theta=10000.0,
         rope_scaling=None,  # 缩放方法，用于长度外推
         rope_interleaved=False,  # rope使用交错方式计算
-        attention_bias=False,  # attention中的project是否加bias
+        attention_bias=True,  # attention中的project是否加bias
         attention_dropout=0.0,
         dropout1=0.0,
         # drop_path1=0.0,  # 通常LLM中不会用到droppath

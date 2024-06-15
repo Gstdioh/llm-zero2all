@@ -50,8 +50,13 @@ class MyHFTokenizer(PreTrainedTokenizer):
         self.vocab.update(self.special_tokens)
         self.vocab_r = {v: k for k, v in self.vocab.items()}
         
-        super().__init__(**kwargs)
+        # 添加一个my的前缀，防止和PreTrainedTokenizer冲突
+        self.my_begin_token_id = self.special_tokens["<|beginoftext|>"]
+        self.my_end_token_id = self.special_tokens["<|endoftext|>"]
+        self.my_pad_token_id = self.special_tokens["<|PAD|>"]
         
+        super().__init__(**kwargs)
+    
     def __len__(self):
         return len(self.vocab)
         

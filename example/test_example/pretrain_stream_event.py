@@ -71,6 +71,7 @@ from dataset import Task
 from model import Z2allConfig, Z2allForCausalLM
 from transformers import AutoTokenizer
 import utils
+from utils import print_rank0
 from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config
 
 
@@ -267,7 +268,7 @@ best_val_loss = 1e9
 powerSGD_state = None  # 看是否使用了PowerSGD
 if not resume:
     # init a new model from scratch
-    _ = logger.info("Initializing a new model from scratch") if master_process else None  # 通过这种方式可以避免在非master进程中打印
+    print_rank0(logger.info, "Initializing a new model from scratch")  # 通过这种方式可以避免在非master进程中打印
     model_config = Z2allConfig(**exp_config)
     model = Z2allForCausalLM(model_config)
     if master_process:
@@ -278,7 +279,7 @@ if not resume:
         # 复制Z2allConfig所在的文件到out_dir
         shutil.copy(file_path, out_dir)
 else:  # resume
-    _ = logger.info(f"Resuming training from {out_dir}") if master_process else None
+    print_rank0(logger.info, f"Resuming training from {out_dir}")
     
     best1_prefix = "best1_"
     
@@ -379,7 +380,7 @@ if compile and torch.__version__ >= "2.0":
 # wrap model into DDP container, 只有在从头开始训练时才会进行包裹
 if ddp:
     # model.bfloat16()
-    _ = logger.info(f"wrapping model into DDP container") if master_process else None
+    print_rank0(logger.info, f"wrapping model into DDP container")
     model = DDP(model, device_ids=[ddp_local_rank],
                 gradient_as_bucket_view=True, static_graph=False)  # 有梯度累加时，static_graph=True有问题?
 
@@ -393,7 +394,7 @@ if resume:
     skip_data_time = time.time()
     for _ in range(iter_num):
         X, Y = next(train_batch_iter)
-    _ = logger.info(f"skip {iter_num} iters time: {time.time() - skip_data_time:.4f}s") if master_process else None
+    print_rank0(logger.info, f"skip {iter_num} iters time: {time.time() - skip_data_time:.4f}s")
 
 # -----------------------------------------------------------------------------
 # 预热
@@ -417,7 +418,7 @@ if ddp:
         else:
             optimizer.zero_grad(set_to_none=True)
     torch.distributed.barrier()
-    _ = logger.info(f"warm_for_bucket_rebuilt_time: {time.time() - warm_for_bucket_rebuilt_time:.4f}s") if master_process else None
+    print_rank0(logger.info, f"warm_for_bucket_rebuilt_time: {time.time() - warm_for_bucket_rebuilt_time:.4f}s")
 
 # -----------------------------------------------------------------------------
 # 预热后，设置ddp com hook，还是会取world_size的平均值
@@ -451,7 +452,7 @@ train_time0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
-_ = logger.info(f"start training loop") if master_process else None
+print_rank0(logger.info, f"start training loop")
 while True:
     # 根据iter，调整学习率
     # determine and set the learning rate for this iteration

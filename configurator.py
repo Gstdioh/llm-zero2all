@@ -20,13 +20,8 @@ import os
 import sys
 from ast import literal_eval
 
+from utils import print_rank0
 
-# 主进程才会输出信息
-ddp = int(os.environ.get("RANK", -1)) != -1
-master_process = True
-if ddp:
-    ddp_rank = int(os.environ["RANK"])
-    master_process = ddp_rank == 0
 
 for arg in sys.argv[1:]:  # 对于python main.py "123 123" sys.argv 结果是 ['main.py', '123 123'] 双引号被视为一个整体
     # 可以--resume=True或者--resume
@@ -36,7 +31,7 @@ for arg in sys.argv[1:]:  # 对于python main.py "123 123" sys.argv 结果是 ['
             # --resume, means resume=True
             key = arg[2:]
             if key in globals():
-                _ = print(f"Overriding: {key} = True") if master_process else None
+                print_rank0(print, f"Overriding: {key} = True")
                 globals()[key] = True
             else:
                 raise ValueError(f"Unknown config key: {key}")
@@ -54,7 +49,7 @@ for arg in sys.argv[1:]:  # 对于python main.py "123 123" sys.argv 结果是 ['
                 # ensure the types match ok
                 assert type(attempt) == type(globals()[key])
                 # cross fingers
-                _ = print(f"Overriding: {key} = {attempt}") if master_process else None
+                print_rank0(print, f"Overriding: {key} = {attempt}")
                 globals()[key] = attempt
             else:
                 raise ValueError(f"Unknown config key: {key}")
@@ -62,7 +57,7 @@ for arg in sys.argv[1:]:  # 对于python main.py "123 123" sys.argv 结果是 ['
         # assume it's the name of a config file
         assert not arg.startswith('--')
         config_file = arg
-        _ = print(f"Overriding config with {config_file}:") if master_process else None
+        print_rank0(print, f"Overriding config with {config_file}:")
         with open(config_file) as f:
-            _ = print(f.read()) if master_process else None
+            print_rank0(print, f.read())
         exec(open(config_file).read())

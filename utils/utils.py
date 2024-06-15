@@ -5,6 +5,22 @@ import regex as re
 import unicodedata
 
 
+# 主进程才会输出信息
+_ddp = int(os.environ.get("RANK", -1)) != -1
+_master_process = True
+_ddp_rank = 0
+if _ddp:
+    _ddp_rank = int(os.environ["RANK"])
+    _master_process = _ddp_rank == 0
+    
+    
+def print_rank0(print_fn, message=None):
+    """
+    只在主进程打印信息
+    """
+    _ = print_fn(message) if _master_process else None
+
+
 # 解析命令行参数
 def kwargs_parse():
     kwargs = {}
@@ -102,15 +118,14 @@ def get_file_paths(file_dir: str, file_type=["json"], start_text:str = "") -> li
     '''
     获取当前文件夹下某种类型的所有文件的绝对路径，要递归遍历所有子文件夹
     '''
+    # 如果给的是文件，则直接返回文件列表
+    if os.path.isfile(file_dir):
+        return [file_dir]
+    
     if isinstance(file_type, str):
         file_type = [file_type]
     
     file_abspaths = []
-    
-    # for root, dirs, files in os.walk(file_dir):  # os.walk能遍历所有的子文件夹，递归遍历
-    #     for file in files:
-    #         if file.endswith(file_type):
-    #             file_abspaths.append(os.path.join(root, file))
                 
     def dfs_get_file_paths(file_dir: str):
         for file in sorted(os.listdir(file_dir)):

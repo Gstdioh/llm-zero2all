@@ -37,6 +37,11 @@ class MySPTokenizer(PreTrainedTokenizer):
         self._update_special_tokens()
         self.first_not_special_id = self.get_first_not_special_id()  # 第一个不是control的id，从1开始，0是<unk>，<unk>不是 CONTROL，是 UNKNOW
         
+        # 添加一个my的前缀，防止和PreTrainedTokenizer冲突
+        self.my_begin_token_id = self.special_tokens["<|beginoftext|>"]
+        self.my_end_token_id = self.special_tokens["<|endoftext|>"]
+        self.my_pad_token_id = self.special_tokens["<|PAD|>"]
+        
         super().__init__(**kwargs)
     
     # 获取模型的proto结构

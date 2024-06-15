@@ -1,8 +1,66 @@
 import os
 import sys
 import logging
+from logging import LogRecord, StreamHandler
 import time
 from datetime import datetime
+
+
+BLACKLISTED_MODULES = ["torch.distributed", "parallel", "model"]
+
+
+class CustomHandler(StreamHandler):
+    """
+    Custom StreamHandler to filter out logging from code outside of
+    main code, and dump to stdout.
+    """
+
+    def __init__(self):
+        super().__init__(stream=sys.stdout)
+        console_formatter = logging.Formatter('[%(asctime)s - %(levelname)s - %(name)s]: %(message)s')
+        console_formatter.converter = time.localtime  # 使用本地时间
+        self.setFormatter(console_formatter)
+
+    def filter(self, record: LogRecord) -> bool:
+        # Prevent log entries that come from the blacklisted modules
+        # through (e.g., PyTorch Distributed).
+        for blacklisted_module in BLACKLISTED_MODULES:
+            if record.name.startswith(blacklisted_module):
+                return False
+        return True
+
+
+class CustomFileHandler(logging.FileHandler):
+    """
+    Custom FileHandler to filter out logging from code outside of
+    main code, and dump to stdout.
+    """
+
+    def __init__(self, filename, mode='a', encoding=None, delay=False, errors=None):
+        super().__init__(filename, mode, encoding, delay, errors)
+        console_formatter = logging.Formatter('[%(asctime)s - %(levelname)s - %(name)s]: %(message)s')
+        console_formatter.converter = time.localtime  # 使用本地时间
+        self.setFormatter(console_formatter)
+
+    def filter(self, record: LogRecord) -> bool:
+        # Prevent log entries that come from the blacklisted modules
+        # through (e.g., PyTorch Distributed).
+        for blacklisted_module in BLACKLISTED_MODULES:
+            if record.name.startswith(blacklisted_module):
+                return False
+        return True
+
+
+def get_all_handlers(log_dir="./"):
+    """
+    获取所有的handler
+    """
+    custom_handler = CustomHandler()
+    
+    log_filename = f'info_{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}.log'
+    custom_file_handler = CustomFileHandler(os.path.join(log_dir, log_filename))
+
+    return [custom_handler, custom_file_handler]
 
 
 def get_logger(log_dir, name, log_filename='info.log', level=logging.INFO):

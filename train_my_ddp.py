@@ -25,7 +25,11 @@ $ python pretrain_my_ddp.py --batch_size=2 --gradient_accumulation_steps=16
 # 看显存占用
 $ python pretrain_my_ddp.py --batch_size=16 --gradient_accumulation_steps=2
 
+pretrain
 OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --gradient_accumulation_steps=12
+
+sft
+OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --task_type=sft --train_data_dir=data/03_sft_data --valid_data_dir=data/03_sft_data --gradient_accumulation_steps=12
 
 # gpu4
 $ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py
@@ -55,6 +59,7 @@ import time
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
+import logging
 
 import torch
 from torch.distributed import destroy_process_group, init_process_group
@@ -63,8 +68,8 @@ import torch.distributed
 from transformers import AutoConfig, AutoTokenizer
 
 from model import Z2allConfig, Z2allForCausalLM
-import utils
-from utils import get_logger, estimate_mfu, configure_optimizers, ResLog, save_run_exp_config, copy_tensor_to_device_in_object, save_checkpoint
+from utils import my_logging, print_rank0
+from utils import estimate_mfu, configure_optimizers, ResLog, save_run_exp_config, copy_tensor_to_device_in_object, save_checkpoint
 
 from parallel.distributed_data_parallel import DistributedDataParallelConfig
 from parallel.distributed_data_parallel import DistributedDataParallel as MyDDP
@@ -73,6 +78,8 @@ from parallel.distributed_optimizer import DistributedOptimizer
 from parallel.distributed_data_parallel.ddp_comm_hooks.default_hooks import all_reduce_hook, reduce_scatter_hook, bf16_compress_wrapper, stream_wrapper
 from parallel.distributed_data_parallel.ddp_comm_hooks.overlap_optim_step_hooks import overlap_optim_step_wrapper
 from parallel.distributed_data_parallel.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
+
+from dataset_task import Task
 
 
 # 前两个多节点需要，第三个多卡需要
@@ -104,11 +111,13 @@ use_reslog = True  # wandb用起来有问题，改为自己的日志和画图工
 reslog_dir = "reslog"
 reslog_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 reslog_save_interval = 10  # 想快速看结果，可以用小点的数
-# data
-train_bin_dir = "data/02_train_data_more/01_bin_for_train_hf"
-valid_bin_dir = "data/02_train_data_more/02_bin_for_valid_hf"
+# data, task
+task_type = "pretrain"  # pretrain|sft
+train_data_dir = "data/02_train_data_more/01_bin_for_train_hf"
+valid_data_dir = "data/02_train_data_more/02_bin_for_valid_hf"
 num_workers = 0  # 数据加载器的工作进程数
 use_dataset_with_index = False  # 是否使用索引来遍历数据集，需要先通过build_sample_index_map.py构建sample的索引
+tokenizer_dir = "tokenizer/hf_bbpe_tokenizer"
 ## global_batch_size = batch_size * gradient_accumulation_steps * ddp_world_size
 batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 2048
@@ -198,15 +207,9 @@ exec(open("configurator.py").read())  # 根据命令行或者配置文件来覆�
 exp_config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
-# 删除tokenizer，后面不会用到了
-tokenizer = None
-
 # -----------------------------------------------------------------------------
-# 是否使用索引来遍历数据集，需要先通过build_sample_index_map.py构建sample的索引
-if use_dataset_with_index:
-    from dataset_with_index import Task
-else:
-    from dataset import Task
+# 判断是否使用了DDP
+ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run? 使用torchrun才会自动设置环境变量，即正常运行python文件不会开启ddp
 
 # -----------------------------------------------------------------------------
 # 不能一起使用的参数配置
@@ -227,6 +230,9 @@ assert use_reslog, "必须使用reslog，因为还会被用来判断文件是否
 if overlap_param_gather:
     assert use_distributed_optimizer, "需要和DistibutedOptimizer一起使用"
 
+if not ddp:
+    assert not use_bf16_compress_hook and not use_powerSGD_hook and not use_distributed_optimizer, "非DDP下不能使用bf16_compress_hook, powerSGD_hook, distributed_optimizer等"
+
 # -----------------------------------------------------------------------------
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters * 0.9  # should be ~= max_iters per Chinchilla 开始停止学习率衰减的step
@@ -235,7 +241,6 @@ min_lr = learning_rate / 10  # 衰减到的最小学习率
 
 # -----------------------------------------------------------------------------
 # 设置ddp，判断是否是主进程
-ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run? 使用torchrun才会自动设置环境变量，即正常运行python文件不会开启ddp
 if ddp:
     process_group = init_process_group(backend=ddp_backend)  # 或者通过dist.group.WORLD来获得初始化后的process_group
     ddp_rank = int(os.environ["RANK"])
@@ -275,12 +280,10 @@ if master_process:
 # 运行日志
 # 创建logger，__name__表示运行文件名
 # 如果存在log文件就删除
-logger = None
+logger = logging.getLogger(__name__)
 if master_process:
-    log_path = os.path.join(out_dir, 'info.log')
-    if os.path.exists(log_path):
-        os.remove(log_path)
-    logger = get_logger(log_dir=out_dir, name=__name__, log_filename='info.log', level="INFO")
+    # 设置一些handle，如过滤、输出到文件等
+    logging.basicConfig(handlers=my_logging.get_all_handlers(out_dir), level=logging.INFO)
 # 实验结果日志
 if ddp_local_rank == 0 and use_reslog:
     # import wandb
@@ -290,9 +293,8 @@ if ddp_local_rank == 0 and use_reslog:
 
 # 每次迭代所训练的token数，2M = 16 * 8 * 8 * 2048
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * max_seq_len
-if master_process:
-    logger.info(f"tokens per iteration will be: {tokens_per_iter:,}")
-    logger.info(f"breaks down as: {gradient_accumulation_steps} grad accum steps * {ddp_world_size} processes * {batch_size} batch size * {max_seq_len} max seq len")
+print_rank0(logger.info, f"tokens per iteration will be: {tokens_per_iter:,}")
+print_rank0(logger.info, f"breaks down as: {gradient_accumulation_steps} grad accum steps * {ddp_world_size} processes * {batch_size} batch size * {max_seq_len} max seq len")
 
 # -----------------------------------------------------------------------------
 # 设置随机种子
@@ -317,7 +319,7 @@ ctx = (
 
 # -----------------------------------------------------------------------------
 # 初始化设置
-_ = logger.info("Initializing model and optimizer") if master_process else None  # 通过这种方式可以避免在非master进程中打印
+print_rank0(logger.info, "Initializing model and optimizer")  # 通过这种方式可以避免在非master进程中打印
 init_mode_optim_time = time.time()
 # -----------------------------------------------------------------------------
 # 实验过程中的信息
@@ -342,14 +344,14 @@ if master_process:
 # 梯度缩放器，优化器
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 # optimizer
-optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type, logger, master_process)
+optimizer = configure_optimizers(model, weight_decay, learning_rate, (beta1, beta2), device_type)
 init_mode_optim_time = time.time() - init_mode_optim_time
-_ = logger.info(f"Initialized  model and optimizer, {init_mode_optim_time:.4f}s") if master_process else None
+print_rank0(logger.info, f"Initialized  model and optimizer, {init_mode_optim_time:.4f}s")
 # -----------------------------------------------------------------------------
 # 使用自己的DDP和DistributedOptimizer包裹模型和优化器
 # 只有在从头开始训练时才会进行包裹
 if ddp:
-    _ = logger.info(f"Wrapping model into DDP container") if master_process else None
+    print_rank0(logger.info, f"Wrapping model into DDP container")
     
     warp_model_optim_time = time.time()
     
@@ -386,7 +388,7 @@ if ddp:
     
     warp_model_optim_time = time.time() - warp_model_optim_time
     
-    _ = logger.info(f"Wrapped  model into DDP container, {warp_model_optim_time:.4f}s") if master_process else None
+    print_rank0(logger.info, f"Wrapped  model into DDP container, {warp_model_optim_time:.4f}s")
 
 # -----------------------------------------------------------------------------
 # resume，加载模型参数和优化器状态等，先加载到rank0上，然后进行广播
@@ -399,7 +401,7 @@ if resume:
     ckpt_out_dir = os.path.join(out_dir, "ckpt")
     os.makedirs(ckpt_out_dir, exist_ok=True)
     
-    _ = logger.info(f"Resuming training from {out_dir} ({best1_prefix})") if master_process else None
+    print_rank0(logger.info, f"Resuming training from {out_dir} ({best1_prefix})")
     
     resume_time = time.time()
     
@@ -502,7 +504,7 @@ if resume:
         reslog.load(os.path.join(ckpt_out_dir, best1_prefix + "reslog.pkl"))  # 读取中止的实验日志
         
     resume_time = time.time() - resume_time
-    _ = logger.info(f"Resumed  training from {out_dir} ({best1_prefix}), {resume_time:.4f}s") if master_process else None
+    print_rank0(logger.info, f"Resumed  training from {out_dir} ({best1_prefix}), {resume_time:.4f}s")
 
 # 同步一下
 if ddp:
@@ -569,15 +571,26 @@ def get_lr(it):
 
 # -----------------------------------------------------------------------------
 # 任务构造器，用于生成训练和验证数据，不同进程会有不同的rng种子
-iter_batches = partial(
-    Task.iter_batches,
-    batch_size=batch_size,
+# pretrian下已经预先进行了toeknize，所以不需要tokenizer
+if task_type == "pretrain":
+    tokenizer = None
+elif task_type == "sft":
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
+else:
+    raise ValueError(f"Unknown task_type: {task_type}")
+task_same_kwargs = dict(
+    task_type=task_type,
     max_seq_len=max_seq_len,
-    train_bin_dir=train_bin_dir,
-    valid_bin_dir=valid_bin_dir,
+    batch_size=batch_size,
     device=device,
-    num_workers=0,
+    num_workers=num_workers,
+    use_dataset_with_index=use_dataset_with_index,
+    tokenizer=tokenizer
 )
+task = {
+    "train": Task(data_dir=train_data_dir, **task_same_kwargs),
+    "valid": Task(data_dir=valid_data_dir, **task_same_kwargs)
+}
 
 # -----------------------------------------------------------------------------
 # 测试函数，只在rank0上进行验证
@@ -586,12 +599,12 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ["train", "valid"]:
-        batch_iter = iter_batches(split=split)
+        batch_iter = task[split].iter_batches()
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
-            X, Y = next(batch_iter)
+            cur_batch = next(batch_iter)
             with ctx:
-                model_outputs = model(X, Y)
+                model_outputs = model(cur_batch["input_ids"], cur_batch["labels"])
                 loss = model_outputs["loss"]
             if loss_reduction == "none":
                 loss = torch.mean(loss.view(-1))
@@ -604,12 +617,12 @@ def estimate_loss():
 # 准备训练集
 skip_batches = iter_num * gradient_accumulation_steps  # 跳过的batch数
 skip_data_time = time.time()
-_ = logger.info(f"Skipping {iter_num} iters ({skip_batches} batches)") if master_process else None
+print_rank0(logger.info, f"Skipping {iter_num} iters ({skip_batches} batches)")
 
-train_batch_iter = iter_batches(split="train", skip_batches=skip_batches)
-X, Y = next(train_batch_iter)  # 在里面跳过skip_batches
+train_batch_iter = task["train"].iter_batches(skip_batches=skip_batches)
+cur_batch = next(train_batch_iter)  # 在里面跳过skip_batches
 
-_ = logger.info(f"Skipped  {iter_num} iters ({skip_batches} batches), {time.time() - skip_data_time:.4f}s") if master_process else None
+print_rank0(logger.info, f"Skipped  {iter_num} iters ({skip_batches} batches), {time.time() - skip_data_time:.4f}s")
 
 
 # 同步一下
@@ -623,7 +636,7 @@ train_time0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
-_ = logger.info(f"Start training loop") if master_process else None
+print_rank0(logger.info, f"Start training loop")
 while True:
     # -----------------------------------------------------------------------------
     # 根据iter，调整学习率
@@ -675,7 +688,7 @@ while True:
         save_checkpoint(globals(), prefix="last")
             
         save_checkpoint_time = time.time() - save_checkpoint_time
-        _ = logger.info(f"save last checkpoint to {out_dir}, {save_checkpoint_time:.4f}s") if master_process else None
+        print_rank0(logger.info, f"save last checkpoint to {out_dir}, {save_checkpoint_time:.4f}s")
         
     # -----------------------------------------------------------------------------
     # 看看是否需要保存最优checkpoint，resume后的第一个不需要保存，因为还是原来的
@@ -688,7 +701,7 @@ while True:
             save_checkpoint(globals(), prefix="best")
                 
             save_checkpoint_time = time.time() - save_checkpoint_time
-            _ = logger.info(f"save best checkpoint to {out_dir}, {save_checkpoint_time:.4f}s") if master_process else None
+            print_rank0(logger.info, f"save best checkpoint to {out_dir}, {save_checkpoint_time:.4f}s")
     if iter_num % eval_interval == 0:
         # 验证过了，重置下训练的开始时间
         train_time0 = time.time()
@@ -718,7 +731,7 @@ while True:
         for micro_step in range(gradient_accumulation_steps - 1):
             micro_time = time.time()  #! 1
             with ctx:
-                model_outputs = model(X, Y)
+                model_outputs = model(cur_batch["input_ids"], cur_batch["labels"])
                 loss = model_outputs["loss"]
                 if loss_reduction == "mean":
                     loss = loss / gradient_accumulation_steps
@@ -727,7 +740,7 @@ while True:
                     loss = torch.sum(loss.view(-1))
             train_loss += loss.clone().detach()
             # 立刻异步预取下一个batch的数据，与forward并行
-            X, Y = next(train_batch_iter)
+            cur_batch = next(train_batch_iter)
             # scaler和反向传播
             # overlap_grad_reduce时会自动进行梯度的all-reduce，并且取所有的word_size的平均值
             scaler.scale(loss).backward()
@@ -744,7 +757,7 @@ while True:
     
     # last_microbatch，需要同步了，backward中会进行梯度的通信（overlap_optim_step下还会进行optim.step()）
     with ctx:
-        model_outputs = model(X, Y)
+        model_outputs = model(cur_batch["input_ids"], cur_batch["labels"])
         loss = model_outputs["loss"]
         if loss_reduction == "mean":
             loss = loss / gradient_accumulation_steps
@@ -753,7 +766,7 @@ while True:
             loss = torch.sum(loss.view(-1))
     train_loss += loss.clone().detach()
     # 立刻异步预取下一个batch的数据，与forward并行
-    X, Y = next(train_batch_iter)
+    cur_batch = next(train_batch_iter)
     # scaler和反向传播
     # overlap_grad_reduce时会自动进行梯度的all-reduce，并且取所有的word_size的平均值
     scaler.scale(loss).backward()
@@ -805,7 +818,7 @@ while True:
                     "lr": lr,
                     "mfu": running_mfu * 100,
                 }, name="train", step=iter_num)
-        logger.info(
+        print_rank0(logger.info, 
             f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}% | micro_time0: {micro_times[0]:.4f}s | micro_time1: {micro_times[1]:.4f}s | last_micro_time: {micro_times[-1]:.4f}s | optim_step_time: {optim_step_time:.4f}s"
         )
     iter_num += 1
