@@ -3,52 +3,52 @@ This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
 To run on a single GPU small debug run, example:
-$ python -m pretrain_my_ddp.py --compile=False --eval_iters=10 --batch_size=8
+$ python -m train_my_ddp.py --compile=False --eval_iters=10 --batch_size=8
 
 To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py
+$ torchrun --standalone --nproc_per_node=4 train_my_ddp.py
 
 To run with DDP on 4 gpus across 2 nodes, example:
 - Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 pretrain_my_ddp.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train_my_ddp.py
 - Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 pretrain_my_ddp.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train_my_ddp.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 $ export NCCL_IB_DISABLE=1
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 pretrain_my_ddp.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train_my_ddp.py
 
 my_run
 # single
-$ python pretrain_my_ddp.py --batch_size=2 --gradient_accumulation_steps=2
+$ python train_my_ddp.py --batch_size=2 --gradient_accumulation_steps=2
 # 看速度，不用flash可能会超显存，所以使用小的batch_size
-$ python pretrain_my_ddp.py --batch_size=2 --gradient_accumulation_steps=16
+$ python train_my_ddp.py --batch_size=2 --gradient_accumulation_steps=16
 # 看显存占用
-$ python pretrain_my_ddp.py --batch_size=16 --gradient_accumulation_steps=2
+$ python train_my_ddp.py --batch_size=16 --gradient_accumulation_steps=2
 
 pretrain
-OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --gradient_accumulation_steps=12
+OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --gradient_accumulation_steps=12
 
 sft
-OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --task_type=sft --train_data_dir=data/03_sft_data --valid_data_dir=data/03_sft_data --gradient_accumulation_steps=12
+OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --task_type=sft --train_data_dir=data/03_sft_data --valid_data_dir=data/03_sft_data --gradient_accumulation_steps=12
 
 # gpu4
-$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py
 # test
-$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --ddp_backend=gloo  # gloo
-$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py --ddp_backend=nccl  # nccl
-$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 NCCL_BUFFLE_SIZE=16777216 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py
-$ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py # error
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --ddp_backend=gloo  # gloo
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --ddp_backend=nccl  # nccl
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 NCCL_BUFFLE_SIZE=16777216 torchrun --standalone --nproc_per_node=4 train_my_ddp.py
+$ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standalone --nproc_per_node=4 train_my_ddp.py # error
 
 # gpu4, gpu4_2
 - gpu4
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp.py
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 train_my_ddp.py
 # resume
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 pretrain_my_ddp.py --resume --out_dir=out/2024_06_06_22_23_57
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 train_my_ddp.py --resume --out_dir=out/2024_06_06_22_23_57
 
 - gpu4_2
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp.py
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 train_my_ddp.py
 # resume
-$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 pretrain_my_ddp.py --resume --out_dir=out/2024_06_06_22_23_57
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 train_my_ddp.py --resume --out_dir=out/2024_06_06_22_23_57
 """
 
 import math
