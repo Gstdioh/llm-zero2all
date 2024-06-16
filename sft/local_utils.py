@@ -148,13 +148,13 @@ def _make_w_io_base(f, mode: str):
         f_dirname = os.path.dirname(f)
         if f_dirname != "":
             os.makedirs(f_dirname, exist_ok=True)
-        f = open(f, mode=mode)
+        f = open(f, mode=mode, encoding='utf-8')
     return f
 
 
 def _make_r_io_base(f, mode: str):
     if not isinstance(f, io.IOBase):
-        f = open(f, mode=mode)
+        f = open(f, mode=mode, encoding='utf-8')
     return f
 
 
@@ -170,7 +170,7 @@ def jdump(obj, f, mode="w", indent=4, default=str):
     """
     f = _make_w_io_base(f, mode)
     if isinstance(obj, (dict, list)):
-        json.dump(obj, f, indent=indent, default=default)
+        json.dump(obj, f, indent=indent, default=default, ensure_ascii=False)
     elif isinstance(obj, str):
         f.write(obj)
     else:
