@@ -16,15 +16,6 @@ from utils import get_file_paths, print_rank0
 logger = logging.getLogger(__name__)
 
 
-# 主进程才会输出信息
-ddp = int(os.environ.get("RANK", -1)) != -1
-master_process = True
-ddp_rank = 0
-if ddp:
-    ddp_rank = int(os.environ["RANK"])
-    master_process = ddp_rank == 0
-
-
 class PretokDataset(torch.utils.data.IterableDataset):
     """
     Loads pretokenized examples from disk and yields them as PyTorch tensors.

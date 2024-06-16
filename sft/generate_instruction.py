@@ -59,6 +59,10 @@ def encode_prompt(prompt_path, prompt_instructions):
 
 
 def post_process_gpt3_response(num_prompt_instructions, response):
+    """
+    从GPT-3.5的response中提取instruction, input, output
+    """
+    
     if response is None:
         return []
     raw_instructions = f"<|{num_prompt_instructions+1}|>. Instruction:" + response.message.content
@@ -87,7 +91,7 @@ def post_process_gpt3_response(num_prompt_instructions, response):
         # filter out too short or too long instructions
         if inst_len <= 3 or inst_len > 150:
             continue
-        # filter based on keywords that are not suitable for language models.
+        # 指令中不能包含以下关键词，因为LLM无法处理这些关键词
         blacklist = [
             "image",
             "images",
@@ -110,6 +114,7 @@ def post_process_gpt3_response(num_prompt_instructions, response):
             "图像",
             "图表",
             "图片",
+            "照片",
             "文件",
             "地图",
             "绘制",
@@ -117,9 +122,46 @@ def post_process_gpt3_response(num_prompt_instructions, response):
             "音频",
             "音乐",
             "流程图",
+            "链接",
         ]
         blacklist += []
         if any(find_word_in_string(word, inst) for word in blacklist):
+            continue
+        all_blacklist = [
+            "图片]",
+            "图表]",
+            "照片]",
+            "文件]",
+            "地图]",
+            "视频]",
+            "音频]",
+            "音乐]",
+            "流程图]",
+            "内容]",
+            "接]",
+            "方法]",
+            "字]",
+            "述]",
+            "图>",
+            "图片>",
+            "图表>",
+            "照片>",
+            "文件>",
+            "地图>",
+            "视频>",
+            "音频>",
+            "音乐>",
+            "流程图>",
+            "内容>",
+            "图>",
+            "接>",
+            "方法>",
+            "字>",
+            "述>",
+        ]
+        example = inst + input + output
+        # 去除"input": "[文字内容]"这种情况
+        if any([word in example for word in all_blacklist]):
             continue
         # We found that the model tends to add "write a program" to some existing instructions, which lead to a lot of such instructions.
         # And it's a bit comfusing whether the model need to write a program or directly output the result.
@@ -138,6 +180,9 @@ def post_process_gpt3_response(num_prompt_instructions, response):
 
 
 def find_word_in_string(w, s):
+    if contains_chinese(w):
+        return w in s
+    # 英文单词才需要考虑单词的边界
     return re.compile(r"\b({0})\b".format(w), flags=re.IGNORECASE).search(s)
 
 

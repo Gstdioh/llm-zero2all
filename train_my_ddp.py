@@ -604,7 +604,7 @@ def estimate_loss():
         for k in range(eval_iters):
             cur_batch = next(batch_iter)
             with ctx:
-                model_outputs = model(cur_batch["input_ids"], cur_batch["labels"])
+                model_outputs = model(**cur_batch)
                 loss = model_outputs["loss"]
             if loss_reduction == "none":
                 loss = torch.mean(loss.view(-1))
@@ -731,7 +731,7 @@ while True:
         for micro_step in range(gradient_accumulation_steps - 1):
             micro_time = time.time()  #! 1
             with ctx:
-                model_outputs = model(cur_batch["input_ids"], cur_batch["labels"])
+                model_outputs = model(**cur_batch)
                 loss = model_outputs["loss"]
                 if loss_reduction == "mean":
                     loss = loss / gradient_accumulation_steps
@@ -757,7 +757,7 @@ while True:
     
     # last_microbatch，需要同步了，backward中会进行梯度的通信（overlap_optim_step下还会进行optim.step()）
     with ctx:
-        model_outputs = model(cur_batch["input_ids"], cur_batch["labels"])
+        model_outputs = model(**cur_batch)
         loss = model_outputs["loss"]
         if loss_reduction == "mean":
             loss = loss / gradient_accumulation_steps

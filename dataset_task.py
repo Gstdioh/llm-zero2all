@@ -21,15 +21,6 @@ import dataset_sft
 logger = logging.getLogger(__name__)
 
 
-# 主进程才会输出信息
-ddp = int(os.environ.get("RANK", -1)) != -1
-master_process = True
-ddp_rank = 0
-if ddp:
-    ddp_rank = int(os.environ["RANK"])
-    master_process = ddp_rank == 0
-
-
 class Task:
     """
     生成训练时所需要的迭代器

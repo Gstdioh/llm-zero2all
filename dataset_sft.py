@@ -15,14 +15,6 @@ from utils import print_rank0
 
 logger = logging.getLogger(__name__)
 
-# 主进程才会输出信息
-ddp = int(os.environ.get("RANK", -1)) != -1
-master_process = True
-ddp_rank = 0
-if ddp:
-    ddp_rank = int(os.environ["RANK"])
-    master_process = ddp_rank == 0
-
 
 IGNORE_INDEX = -100
 PROMPT_DICT = {
