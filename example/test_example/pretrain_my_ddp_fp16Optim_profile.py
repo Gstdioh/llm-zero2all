@@ -58,7 +58,7 @@ import torch.distributed as dist
 import torch.distributed
 from transformers import AutoConfig, AutoTokenizer
 
-from dataset import Task
+from dataset_legacy import Task
 from model import Z2allConfig, Z2allForCausalLM
 import utils
 from utils import print_rank0

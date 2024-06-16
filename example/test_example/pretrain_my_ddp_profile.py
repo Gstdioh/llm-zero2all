@@ -66,7 +66,7 @@ from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compr
 from torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook import PowerSGDState, powerSGD_hook
 from transformers import AutoConfig, AutoTokenizer
 
-from dataset import Task
+from dataset_legacy import Task
 from model import Z2allConfig, Z2allForCausalLM
 import utils
 from utils import print_rank0
