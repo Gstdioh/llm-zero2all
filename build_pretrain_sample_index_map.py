@@ -67,14 +67,14 @@ def build_sample_index_map(file_list, max_seq_len, sample_index_map_path):
         sample_index_map = sample_index_map[:-1]
 
     # 转换为np.array
-    sample_index_map = np.array(sample_index_map, dtype=np.uint32)
+    sample_index_map = np.array(sample_index_map, dtype=np.uint32)  # 因为每个文件的token数不会超过2^32（100MB左右大小）
 
     # 保存np文件
     with open(sample_index_map_path, "wb") as f:
         f.write(sample_index_map.tobytes())
         
-    num_samples = len(sample_index_map) // 2
-    print(f"Build {sample_index_map_path} done, num_samples: {num_samples}")
+    num_samples = sample_index_map.shape[0]
+    print(f"Build {sample_index_map_path} done, num_samples: {num_samples:,}")
 
 
 max_seq_len = 2048
@@ -84,4 +84,4 @@ valid_data_path = "data/02_train_data_more/02_bin_for_valid_hf"
 for data_path in [train_data_path, valid_data_path]:
     file_list = utils.get_file_paths(data_path, file_type="bin")
 
-    build_sample_index_map(file_list, max_seq_len, f"{data_path}/0_sample_index_map_{max_seq_len}.ibin")
+    build_sample_index_map(file_list, max_seq_len, f"{data_path}/all_sample_index_map_{max_seq_len}.ibin")

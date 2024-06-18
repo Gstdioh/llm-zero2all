@@ -16,6 +16,8 @@ __pycache__
 *.ibin
 *.pkl
 *.npy
+*.json
+*.ijson
 /data/zhihu
 /data/Zhihu-KOL
 /data/ZZ_others_wikipedia

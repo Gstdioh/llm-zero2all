@@ -26,7 +26,7 @@ $ python train_my_ddp.py --batch_size=2 --gradient_accumulation_steps=16
 $ python train_my_ddp.py --batch_size=16 --gradient_accumulation_steps=2
 
 pretrain
-OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --gradient_accumulation_steps=12
+OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py
 
 sft
 OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --task_type=sft --train_data_dir=data/03_sft_data --valid_data_dir=data/03_sft_data --gradient_accumulation_steps=12
@@ -113,9 +113,11 @@ reslog_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 reslog_save_interval = 10  # 想快速看结果，可以用小点的数
 # data, task
 task_type = "pretrain"  # pretrain|sft
+sft_type = "conversation"  # sft任务的类型，"conversation"（多轮），"instruction"（单轮指令）
 train_data_dir = "data/02_train_data_more/01_bin_for_train_hf"
 valid_data_dir = "data/02_train_data_more/02_bin_for_valid_hf"
 num_workers = 0  # 数据加载器的工作进程数
+skip_scaling_factor = 1.0  # 跳过的数据集数可能需要乘的数，因为非index的pretrain_dataset构造方式有点不同，GPU个数变化的时候需要设置
 use_dataset_with_index = False  # 是否使用索引来遍历数据集，需要先通过build_sample_index_map.py构建sample的索引
 tokenizer_dir = "tokenizer/hf_bbpe_tokenizer"
 ## global_batch_size = batch_size * gradient_accumulation_steps * ddp_world_size
@@ -171,14 +173,14 @@ ddp_backend = "nccl"  # ddp backend, can be 'nccl', 'gloo'
 # 梯度通信优化
 use_bf16_compress_hook = False
 # powerSGD相关参数
-use_powerSGD_hook = True
+use_powerSGD_hook = False
 matrix_approximation_rank = 32  # 用于PowerSGD的矩阵近似秩，如矩阵m * n -> m * rank, rank * n
 warm_start = False  # Q是否沿用上一次iter的值
 use_error_feedback = True  # 是否使用error feedback，即将error传递给下一次iter
 start_powerSGD_iter = 2  # 从第几个iter开始使用PowerSGD，至少为2
 min_compression_rate = 2  # 能压缩多少才进行压缩，如为2，则表示能压缩到原来的1/2的矩阵才压缩，不能则为uncompress_tensor
 orthogonalization_epsilon = 1e-6  # 正交时的epsilon，防止除以0，float16和bfloat16下会用到
-grad_buffer_is_powerSGD_error = True  # 将grad_buffer和error_dict的内存空间共享，可以节省模型梯度大小的内存
+grad_buffer_is_powerSGD_error = True and use_powerSGD_hook  # 将grad_buffer和error_dict的内存空间共享，可以节省模型梯度大小的内存
 orthogonalize_in_float32 = True  # 设置正交化操作在float32上进行，可以提高精度
 use_fixed_Q = True  # 是否使用固定的Q矩阵，不再更新Q矩阵，参考：DALL-E: Zero-Shot Text-to-Image Generation
 # DistributedDataParallelConfig
@@ -193,7 +195,7 @@ precision_dtype = dtype  # 使用的精度，若不为float32，则表示开启�
 grad_scaling_before_comm = False if grad_div_total_tokens else True  # 是否在通信前进行梯度缩放，建议bfloat16下设为False，在最后除以值，减少精度损失
 overlap_optim_step = True  # 某个bucket的梯度算完后（通信后），立刻进行优化器的step，有梯度通信的情况下会计算与通信重叠
 overlap_zero_grad_buffer = True  # overlap_optim_step后立刻对模型的grad_buffer清零，注意在powerSGD的grad_buffer_is_powerSGD_error下不会清零，而是计算为error
-grad_buffer_is_powerSGD_error = grad_buffer_is_powerSGD_error  # 梯度缓冲区是否是PowerSGD的error缓冲区，如果是，则不需要清零，这样可以节省内存
+grad_buffer_is_powerSGD_error = grad_buffer_is_powerSGD_error # 梯度缓冲区是否是PowerSGD的error缓冲区，如果是，则不需要清零，这样可以节省内存
 use_distributed_optimizer = False  # 是否使用DistributedOptimizer
 overlap_param_gather = False  # 和DistibutedOptimizer一起使用，在forward时提前发起后面bucket的参数gather，实现计算和通信重叠
 # -----------------------------------------------------------------------------
@@ -281,9 +283,8 @@ if master_process:
 # 创建logger，__name__表示运行文件名
 # 如果存在log文件就删除
 logger = logging.getLogger(__name__)
-if master_process:
-    # 设置一些handle，如过滤、输出到文件等
-    logging.basicConfig(handlers=my_logging.get_all_handlers(out_dir), level=logging.INFO)
+# 设置一些handle，如过滤、输出到文件等
+logging.basicConfig(handlers=my_logging.get_all_handlers(out_dir), level=logging.INFO)
 # 实验结果日志
 if ddp_local_rank == 0 and use_reslog:
     # import wandb
@@ -578,18 +579,21 @@ elif task_type == "sft":
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
 else:
     raise ValueError(f"Unknown task_type: {task_type}")
-task_same_kwargs = dict(
+task_kwargs = dict(
     task_type=task_type,
-    max_seq_len=max_seq_len,
     batch_size=batch_size,
     device=device,
     num_workers=num_workers,
+    # same
+    max_seq_len=max_seq_len,
     use_dataset_with_index=use_dataset_with_index,
-    tokenizer=tokenizer
+    # sft
+    tokenizer=tokenizer,
+    sft_type=sft_type,
 )
 task = {
-    "train": Task(data_dir=train_data_dir, **task_same_kwargs),
-    "valid": Task(data_dir=valid_data_dir, **task_same_kwargs)
+    "train": Task(data_dir=train_data_dir, **task_kwargs),
+    "valid": Task(data_dir=valid_data_dir, **task_kwargs)
 }
 
 # -----------------------------------------------------------------------------
@@ -615,15 +619,14 @@ def estimate_loss():
 
 # -----------------------------------------------------------------------------
 # 准备训练集
-skip_batches = iter_num * gradient_accumulation_steps  # 跳过的batch数
+skip_batches_per_device = int(iter_num * gradient_accumulation_steps * skip_scaling_factor)  # 每个设备跳过的batch数
 skip_data_time = time.time()
-print_rank0(logger.info, f"Skipping {iter_num} iters ({skip_batches} batches)")
+print_rank0(logger.info, f"Skipping {iter_num} iters ({skip_batches_per_device} skip_batches_per_device)")
 
-train_batch_iter = task["train"].iter_batches(skip_batches=skip_batches)
+train_batch_iter = task["train"].iter_batches(skip_batches=skip_batches_per_device)
 cur_batch = next(train_batch_iter)  # 在里面跳过skip_batches
 
-print_rank0(logger.info, f"Skipped  {iter_num} iters ({skip_batches} batches), {time.time() - skip_data_time:.4f}s")
-
+print_rank0(logger.info, f"Skipped  {iter_num} iters ({skip_batches_per_device} skip_batches_per_device), {time.time() - skip_data_time:.4f}s")
 
 # 同步一下
 if ddp:

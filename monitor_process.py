@@ -56,6 +56,8 @@ rank0_resume_command = rank0_resume_command.split(" ")
 # -----------------------------------------------------------------------------
 # 远程服务器需要执行的命令，注意需要切换到对应的目录，激活对应的conda环境，然后才能执行命令
 # 远程服务器的命令，预先设好命令的绝对路径
+remote_start_command = None
+remote_resume_command = None
 if args.remote:
     remote_torchrun = args.remote_torchrun
     remote_workspace = args.remote_workspace

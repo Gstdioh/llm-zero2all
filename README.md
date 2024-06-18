@@ -4,7 +4,9 @@
 
 1. [构建数据集](#01-数据集)，使用多个公开数据集，构建文本文件来训练分词器，通过分词器构建bin文件用于训练，能从多个文件中挑选出部分内容作为验证集。
 
-    * 数据集的读取**使用索引**，节省内存，使用`build_sample_index_map.py`构建数据集的索引。
+    * 可以**预先构建tokenized**的bin文件，然后**使用索引**读取数据集，节省内存，
+        * pretrain使用`pretokenize_data_more.py`和`build_pretrain_sample_index_map.py`构建数据集的bin文件和索引。
+        * sft使用`pretokenize_sft_data.py`构建数据集的bin文件和索引。
 
 2. [分词器](#02-分词器tokenizer)，两个，huggingface的`tokenizers`，`sentencepiece`，最后构建出的类可以通过`save_pretrained(dir)`保存，通过`AutoTokenizer.from_pretrained(dir)`导入。
 
@@ -26,7 +28,8 @@
 5. [微调](#05-sft有监督微调)，实现**SFT（有监督微调，指令微调）**，通过自己构建的指令数据集来微调。
     * **训练脚本**见：`train_my_ddp.py`，更改部分实验参数即可。
     * 提供**指令数据集的构建**代码，见`./sft`目录。
-    * 实现sft数据集的**加载和预处理**，见：`dataset_sft.py`。
+    * 实现sft数据集的**加载和预处理**（包括单轮指令数据集和多轮对话数据集conversation），见：`dataset_sft.py`。
+    * 提供多轮对话数据集的预处理，包括构建**pretokenize**的bin文件和用于**索引**样本的sample_index_map索引文件，包括多轮对话模板的构建（见：pretokenize_sft_data.py），见：sft/conversation.py
 
 6. [Docker镜像](#10-docker镜像)，提供已经构建好的docker镜像，包含实验所需的所有环境。
 
@@ -43,7 +46,7 @@ train_tokenizer.py, 训练自己的分词器
 
 pretokenize_data_more.py, 预处理数据集为bin文件，用于训练
 
-build_sample_index_map.py, 构建pretrain数据集的索引
+build_pretrain_sample_index_map.py, 构建pretrain数据集的索引
 dataset_pretrain.py, pretrain数据集的dataset和dataloader
 dataset_sft.py, sft数据集的dataset和dataloader
 dataset_task.py, 用于训练时的任务构建，可以无限生成训练需要的iter_batches

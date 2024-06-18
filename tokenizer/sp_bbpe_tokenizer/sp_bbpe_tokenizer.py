@@ -15,6 +15,8 @@ SAVE_FILE_NAME = "sp_bbpe_tokenizer.model"
 # 特殊token：0-14，<unk>不是 CONTROL，是 UNKNOW
 SPECIAL_TUPLE = ('<unk>', '<s>', '</s>', '<|beginoftext|>', '<|endoftext|>', '<|endofprompt|>', '<|im_start|>', '<|im_end|>', '<|UNK|>', '<|PAD|>', '<|CLS|>', '<|SEP|>', '<|MASK|>', '<|BOS|>', '<|EOS|>')
 
+ADD_SPEACIAL_TUPLE = ('<|role_end|>',)
+
 
 class MySPTokenizer(PreTrainedTokenizer):
     """
@@ -37,12 +39,21 @@ class MySPTokenizer(PreTrainedTokenizer):
         self._update_special_tokens()
         self.first_not_special_id = self.get_first_not_special_id()  # 第一个不是control的id，从1开始，0是<unk>，<unk>不是 CONTROL，是 UNKNOW
         
-        # 添加一个my的前缀，防止和PreTrainedTokenizer冲突
-        self.my_begin_token_id = self.special_tokens["<|beginoftext|>"]
-        self.my_end_token_id = self.special_tokens["<|endoftext|>"]
-        self.my_pad_token_id = self.special_tokens["<|PAD|>"]
+        self.add_special_tokens(ADD_SPEACIAL_TUPLE)
         
         super().__init__(**kwargs)
+    
+    @property
+    def begin_token_id(self):
+        return self.special_tokens["<|beginoftext|>"]
+    
+    @property
+    def end_token_id(self):
+        return self.special_tokens["<|endoftext|>"]
+    
+    @property
+    def pad_token_id(self):
+        return self.special_tokens["<|PAD|>"]
     
     # 获取模型的proto结构
     def _get_sp_model_proto(self):

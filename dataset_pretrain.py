@@ -37,7 +37,7 @@ class PretokDataset(torch.utils.data.IterableDataset):
         # combine the worker_id and worker_rank to create a unique seed for rng
         seed = 42 + worker_id + 1337 * rank
         rng = random.Random(seed)
-        print(f"rank {ddp_rank} created a PretokDataset with rng seed {seed}")
+        logger.info(f"rank {rank} created a PretokDataset with rng seed {seed}")
         
         shard_filenames = get_file_paths(self.data_dir, file_type="bin")
         assert len(shard_filenames) > 0, f"No bin files found in {self.data_dir}"
@@ -52,13 +52,13 @@ class PretokDataset(torch.utils.data.IterableDataset):
                 try:
                     m = np.memmap(shard, dtype=np.uint16, mode="r")
                 except:
-                    print(f"file {shard} is empty, skipping")
+                    logger.info(f"file {shard} is empty, skipping")
                     continue
                 num_tokens = len(m)  # 这个shard的总token数
                 num_batches = num_tokens // self.max_seq_len  # 向下取整
                 # 太小不足以构成一个样本，跳过
                 if num_batches <= 0:
-                    print(f"file {shard} is too small, skipping")
+                    logger.info(f"file {shard} is too small, skipping")
                     continue
                 # assert num_batches > 0, "this shard is way too small? investigate."
                 ixs = list(range(num_batches))
@@ -95,9 +95,9 @@ class PretokDatasetWithIndex(torch.utils.data.IterableDataset):
         self.max_seq_len = max_seq_len
         self.random_seed = random_seed
         
-        self.file_path_list = get_file_paths(self.data_dir, file_type="bin")
+        file_paths = get_file_paths(self.data_dir, file_type="bin")
         self.file_memmaps = []
-        for file_path in self.file_path_list:
+        for file_path in file_paths:
             # 文件可能为空，要考虑下
             try:
                 file_m = np.memmap(file_path, dtype=np.uint16, mode="r")
@@ -106,13 +106,13 @@ class PretokDatasetWithIndex(torch.utils.data.IterableDataset):
                 file_m = np.array([], dtype=np.uint16)
             self.file_memmaps.append(file_m)
         
-        self.sample_index_map_path = os.path.join(self.data_dir, f"0_sample_index_map_{max_seq_len}.ibin")
+        all_sample_index_map_path = os.path.join(self.data_dir, f"all_sample_index_map_{max_seq_len}.ibin")
         
-        assert os.path.exists(self.sample_index_map_path), f"{self.sample_index_map_path} not exists, need to run build_sample_index_map.py first."
+        assert os.path.exists(all_sample_index_map_path), f"{all_sample_index_map_path} not exists, need to run build_sample_index_map.py first."
         
         # [(file_start_id, sample_start_offset), ...]
         # 保证每个样本的后面还有一个token可以取
-        self.sample_index_map = np.memmap(self.sample_index_map_path, dtype=np.uint32, mode="r")
+        self.sample_index_map = np.memmap(all_sample_index_map_path, dtype=np.uint32, mode="r")
         
         # 样本数，样本的索引，通过索引来取数，对索引进行打乱
         self.num_samples = len(self.sample_index_map) // 2
@@ -173,7 +173,14 @@ class PretokDatasetWithIndex(torch.utils.data.IterableDataset):
             shuffle_time = time.time()
             rng.shuffle(sample_index_list)
             shuffle_time = time.time() - shuffle_time
-            print(f"worker_id {worker_id} ddp_rank {ddp_rank} shuffled {self.data_dir} sample_index_list, {shuffle_time:.4f}s")
+            logger.info(f"worker_id {worker_id} ddp_rank {ddp_rank} shuffled {self.data_dir} sample_index_list, {shuffle_time:.4f}s")
 
             # 索引从头开始，即开始一个新的epoch
             cur_index %= self.num_samples
+
+
+def get_pretrain_dataset(use_dataset_with_index=False, **kwargs):
+    if use_dataset_with_index:
+        return PretokDatasetWithIndex(**kwargs)
+    else:
+        return PretokDataset(**kwargs)

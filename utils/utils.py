@@ -3,6 +3,7 @@ import sys
 import json
 import regex as re
 import unicodedata
+import subprocess
 
 
 # 主进程才会输出信息
@@ -114,9 +115,11 @@ def get_training_iterator(files_for_train_tokenizer: list, buffer_bytes="2M", ma
         yield buffer_data
 
 
-def get_file_paths(file_dir: str, file_type=["json"], start_text:str = "") -> list:
+def get_file_paths(file_dir: str, file_type=["json"], startswith: str = "", endswith: str = "") -> list:
     '''
     获取当前文件夹下某种类型的所有文件的绝对路径，要递归遍历所有子文件夹
+    
+    若file_type is None, 则返回所有文件
     '''
     # 如果给的是文件，则直接返回文件列表
     if os.path.isfile(file_dir):
@@ -132,12 +135,38 @@ def get_file_paths(file_dir: str, file_type=["json"], start_text:str = "") -> li
             file_path = os.path.join(file_dir, file)
             if os.path.isdir(file_path):
                 dfs_get_file_paths(file_path)
-            elif file.split(".")[-1] in file_type and file.startswith(start_text):
+            elif file_type is None or (file.split(".")[-1] in file_type and file.startswith(startswith) and file.endswith(endswith)):
                 file_abspaths.append(file_path)
                 
     dfs_get_file_paths(file_dir)
-                
+
     return file_abspaths
+
+
+def find_file_path(file_dir, file_basename, allow_multi=False):
+    """"
+    根据文件基本名，在目录中找到该文件的绝对路径
+    
+    allow_multi=False下，若找到多个文件，则报错，默认不允许多个文件
+    """
+    # 首先找到file_dir下的所有文件
+    file_paths = get_file_paths(file_dir, file_type=None)
+    
+    found_file_paths = []
+    for file_path in file_paths:
+        if os.path.basename(file_path) == file_basename:
+            found_file_paths.append(file_path)
+            if not allow_multi and len(found_file_paths) > 1:
+                raise ValueError(f"找到多个文件：{found_file_paths}，请检查！")
+            
+    return found_file_paths
+
+def get_file_line_count(file_path):
+    """
+    通过命令行快速获取文件的行数
+    """
+    result = subprocess.run(["wc", "-l", file_path], stdout=subprocess.PIPE)
+    return int(result.stdout.split()[0])
 
 
 # 注意：这里的清洗方法只是简单的清洗，不一定适用于所有的数据集
