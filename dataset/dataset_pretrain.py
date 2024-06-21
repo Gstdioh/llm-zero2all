@@ -23,10 +23,16 @@ class PretokDataset(torch.utils.data.IterableDataset):
     两个地方随机打乱，文件名和每个文件内部的一个样本
     """
 
-    def __init__(self, data_dir, max_seq_len, **kwargs):
+    def __init__(self, data_dir, max_seq_len, split=None, valid_ratio=None, **kwargs):
+        """
+        这个dataset不能划分数据集，需要预先进行划分，然后传入对应的数据集
+        """
+        assert split is None, "PretokDataset下use_dataset_with_index=False时，不支持自动对数据集进行划分，需要提供两个数据文件夹（train_data_dir, valid_data_dir），或者使用use_dataset_with_index=True"
+        
         super().__init__()
         self.data_dir = data_dir
         self.max_seq_len = max_seq_len
+        self.num_samples = None
 
     def __iter__(self):
         # get worker info within a DataLoader
@@ -89,9 +95,11 @@ class PretokDatasetWithIndex(torch.utils.data.IterableDataset):
     注意，要考虑到num_workers和ddp的影响
     """
 
-    def __init__(self, data_dir, max_seq_len, random_seed=42, **kwargs):
+    def __init__(self, data_dir, max_seq_len, split="train", valid_ratio=0.01, random_seed=42, **kwargs):
         super().__init__()
         self.data_dir = data_dir
+        self.split = split
+        self.valid_ratio = valid_ratio
         self.max_seq_len = max_seq_len
         self.random_seed = random_seed
         
@@ -118,9 +126,36 @@ class PretokDatasetWithIndex(torch.utils.data.IterableDataset):
         self.num_samples = len(self.sample_index_map) // 2
         self.sample_index_list = list(range(self.num_samples))
         
+        # 进行数据集的划分
+        self.split_index = int(self.num_samples * (1 - self.valid_ratio))
+        if self.split == "train":
+            self.sample_index_list = self.sample_index_list[:self.split_index]
+        elif self.split == "valid":
+            self.sample_index_list = self.sample_index_list[self.split_index:]
+            
+        # 更新样本数
+        self.num_samples = len(self.sample_index_list)
+        
         # 提前进行一次打乱
         rng = random.Random(self.random_seed)
         rng.shuffle(self.sample_index_list)
+
+        print_rank0(logger.info, f"Loaded {self.data_dir} {self.split} PretokDatasetWithIndex, num_samples: {self.num_samples:,}")
+        
+        # 初始的模式
+        self.mode = self.split
+
+    def restore_mode(self):
+        """
+        恢复原来的模式
+        """
+        self.mode = self.split
+    
+    def eval(self):
+        """
+        设置为eval模式，batch就不会按照ddp_world_size跳过了
+        """
+        self.mode = "valid"
         
     def __len__(self):
         return self.num_samples
@@ -136,6 +171,11 @@ class PretokDatasetWithIndex(torch.utils.data.IterableDataset):
         
         rng = random.Random(self.random_seed + 1)
         sample_index_list = copy.deepcopy(self.sample_index_list)
+        
+        if self.mode == "valid":
+            # 验证模式下，不需要考虑ddp的影响
+            ddp_rank = 0
+            ddp_world_size = 1
         
         cur_index = 0 + ddp_world_size * worker_id + ddp_rank  # 因为num_workers的数量可能大于batch_size，所以worker_id要在外层，ddp_rank要在内层
         all_index_len = num_workers * ddp_world_size  # cur_index每次应该跳过的长度
@@ -168,6 +208,10 @@ class PretokDatasetWithIndex(torch.utils.data.IterableDataset):
                     input_ids=x,
                     labels=y
                 )
+                
+            if self.split == "valid":
+                # valid数据集只读取一次
+                break
                 
             # 下一个epoch，进行索引的打乱
             shuffle_time = time.time()

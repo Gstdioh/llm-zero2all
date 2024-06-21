@@ -1,62 +1,54 @@
 """
-### train_my_ddp.py 训练脚本
+This training script can be run both on a single gpu in debug mode,
+and also in a larger training run with distributed data parallel (ddp).
 
-1. 支持pretrain, sft, dpo任务
-2. 支持单卡，单节点多卡，多节点多卡
-3. 支持resume，需要添加 --resume --out_dir=out/2024_06_06_22_23_57
+To run on a single GPU small debug run, example:
+$ python -m train_my_ddp.py --compile=False --eval_iters=10 --batch_size=8
 
-会自动搜索对应目录中的相应文件
+To run with DDP on 4 gpus on 1 node, example:
+$ torchrun --standalone --nproc_per_node=4 train_my_ddp.py
 
-多卡下会有警告，可以添加 OMP_NUM_THREADS=8 环境变量解决
+To run with DDP on 4 gpus across 2 nodes, example:
+- Run on the first (master) node with example IP 123.456.123.456:
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train_my_ddp.py
+- Run on the worker node:
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train_my_ddp.py
+(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+$ export NCCL_IB_DISABLE=1
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train_my_ddp.py
 
-运行快点用于测试，添加参数（注意gradient_accumulation_steps要能被ddp_world_size整除）：--train_batch_size=2 --gradient_accumulation_steps=3
+my_run
+# single
+$ python train_my_ddp.py --batch_size=2 --gradient_accumulation_steps=2
+# 看速度，不用flash可能会超显存，所以使用小的batch_size
+$ python train_my_ddp.py --batch_size=2 --gradient_accumulation_steps=16
+# 看显存占用
+$ python train_my_ddp.py --batch_size=16 --gradient_accumulation_steps=2
 
-#### pretrain
+pretrain
+OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py
 
-```bash
-# 1. pretokenize, [".parquet", ".json", ".jsonl"] -> [".bin"]
-python -m data_preprocess.pretokenize_train_data --data_dir=data/02_train_data_more --tokenizer_dir=tokenizer/hf_bbpe_tokenizer
+sft
+OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --task_type=sft --train_data_dir=data/03_sft_data --valid_data_dir=data/03_sft_data --gradient_accumulation_steps=12
 
-# 2. 预处理，构建索引, [".bin"] -> [".ibin"]
-python -m data_preprocess.build_pretrain_sample_index_map --data_dir=data/02_train_data_more --max_seq_len=2048
+# gpu4
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py
+# test
+$ OMP_NUM_THREADS=8 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --ddp_backend=gloo  # gloo
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 torchrun --standalone --nproc_per_node=4 train_my_ddp.py --ddp_backend=nccl  # nccl
+$ OMP_NUM_THREADS=8 NCCL_P2P_DISABLE=1 NCCL_BUFFLE_SIZE=16777216 torchrun --standalone --nproc_per_node=4 train_my_ddp.py
+$ OMP_NUM_THREADS=8 NCCL_BUFFLE_SIZE=16777216 NCCL_P2P_LEVEL=5 torchrun --standalone --nproc_per_node=4 train_my_ddp.py # error
 
-# 3. train
-# 单卡
-python train_my_ddp.py --task_type=pretrain --data_dir=data/02_train_data_more
+# gpu4, gpu4_2
+- gpu4
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 train_my_ddp.py
+# resume
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 train_my_ddp.py --resume --out_dir=out/2024_06_06_22_23_57
 
-# 单节点多卡
-torchrun --standalone --nproc_per_node=4 train_my_ddp.py --task_type=pretrain --data_dir=data/02_train_data_more
-
-# 多节点多卡
-# - master
-torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 train_my_ddp.py --task_type=pretrain --data_dir=data/02_train_data_more
-# - remote
-torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 train_my_ddp.py --task_type=pretrain --data_dir=data/02_train_data_more
-```
-
-#### sft
-
-```bash
-1. pretokenize，且构建索引（可不进行这一步，在线构建也可以，然后会自动保存为cache）
-python -m data_preprocess.pretokenize_sft_data --data_dir=data/04_sft_conversation_data --tokenizer_dir=tokenizer/hf_bbpe_tokenizer
-
-2. train
-# 单卡
-
-# - 使用pretokenize后的bin文件，只支持 sft_type=["conversation"]
-python train_my_ddp.py --task_type=sft --data_dir=data/04_sft_conversation_data/01_bin_for_sft --sft_type=conversation
-
-# - 使用原始的json，支持 sft_type=["conversation", "instruction"]
-python train_my_ddp.py --task_type=sft --data_dir=data/03_sft_data --sft_type=instruction --use_dataset_with_index=False
-python train_my_ddp.py --task_type=sft --data_dir=data/04_sft_conversation_data/train_3.5M_CN --sft_type=conversation --use_dataset_with_index=False
-```
-
-#### dpo
-
-```bash
-# 1. train，不支持pretokenize，会进行在线构建，然后会自动保存为cache，只支持conversation格式
-python train_my_ddp.py --task_type=dpo --data_dir=data/05_dpo_data/DPO-En-Zh-20k
-```
+- gpu4_2
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 train_my_ddp.py
+# resume
+$ OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 train_my_ddp.py --resume --out_dir=out/2024_06_06_22_23_57
 """
 
 import math
@@ -66,8 +58,8 @@ import shutil
 import time
 from contextlib import nullcontext
 from datetime import datetime
+from functools import partial
 import logging
-from typing import Optional
 
 import torch
 from torch.distributed import destroy_process_group, init_process_group
@@ -76,11 +68,8 @@ import torch.distributed
 from transformers import AutoConfig, AutoTokenizer
 
 from model import Z2allConfig, Z2allForCausalLM
-from utils import my_logging, ResLog
-from utils import print_rank0, save_run_exp_config
-from utils.checkpoint import save_checkpoint, copy_tensor_to_device_in_object
-from utils.train import configure_optimizers, estimate_mfu, forward_step
-from utils.dpo import DPOConfig, create_reference_model
+from utils import my_logging, print_rank0
+from utils import estimate_mfu, configure_optimizers, ResLog, save_run_exp_config, copy_tensor_to_device_in_object, save_checkpoint
 
 from parallel.distributed_data_parallel import DistributedDataParallelConfig
 from parallel.distributed_data_parallel import DistributedDataParallel as MyDDP
@@ -104,107 +93,73 @@ os.environ["NCCL_P2P_DISABLE"] = "1"  # disable p2p
 
 # 用于找到pad的id
 # tokenizer = AutoTokenizer.from_pretrained("tokenizer/hf_bbpe_tokenizer", trust_remote_code=True)
-# pad_token_id = tokenizer.pad_token_id
 
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
 iter_num = 0  # 从该iter开始训练
-log_interval = 1  # 每log_interval个step打印一次信息
+eval_interval = 200  # 每eval_interval个step验证一次，这里设置大点（先不测试，因为我还没测试好MyDDP的保存）
+log_interval = 1
+eval_iters = 100  # 每次验证的step数
+eval_only = False  # if True, script exits right after the first eval
 resume = False  # if True, resume training from the last checkpoint
 resume_from = "last"  # ["best", "last"] 从哪个开始resume
 sync_for_true_time = False  # 是否同步以获取mirco的真实耗费的时间，测试时用
-# -----------------------------------------------------------------------------
 # my logging
 use_reslog = True  # wandb用起来有问题，改为自己的日志和画图工具，这个必须为True，因为还会被用来判断文件是否保存成功
 reslog_dir = "reslog"
 reslog_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 reslog_save_interval = 10  # 想快速看结果，可以用小点的数
-# -----------------------------------------------------------------------------
-# data，要么使用data_dir，要么使用（train_data_dir, valid_data_dir）
-data_dir = "data/02_train_data_more"
-valid_ratio = 1e-4  # 从data_dir中自动划分出来的验证集的比例，pretrain下可以设小点，如共有13_000个iters，1e-4即约1个iters，sft和dpo可以设置为1e-2
-# 若分别提供train_data_dir和valid_data_dir，则不会从data_dir中划分验证集
-train_data_dir = None
-valid_data_dir = None
-# train
-train_batch_size = 8  # 每个step的train_batch_size
-gradient_accumulation_steps = 128  # used to simulate larger batch sizes，后面会//ddp_world_size
-# valid
-valid_interval = 200  # 每valid_interval个step验证一次
-valid_batch_size = 8  # 用于验证的batch_size
-valid_iters = None  # 每次验证的step数，若没有提供，则验证完整的数据集，train也会验证相同数量的样本
-valid_only = False  # 只进行验证一次就退出
-# 其他
-max_seq_len = 2048  # 每个样本的最大长度
-grad_div_total_tokens = False  # 是否在计算梯度时除以总的token数，设置reduction="none" and grad_scaling_before_comm=False，使用PowerSGD时不能使用（loss不好，可能因为PowerSGD对数大的压缩不好，有正交化操作）
-num_workers = 0  # 数据加载器的工作进程数
-skip_scaling_factor = 1.0  # 跳过的数据集数可能需要乘的数，因为非index的pretrain_dataset构造方式有点不同，GPU个数变化的时候需要设置，正常设置1.0即可
-# -----------------------------------------------------------------------------
-# dataset的设置
-# dataset, task
-task_type = "pretrain"  # pretrain|sft|dpo
-# pretrain, sft
-use_dataset_with_index = True  # pretrain和sft下可用，是否使用索引来遍历数据集，需要先通过build_sample_index_map.py构建sample的索引，建议使用True！pretrain下False的话后续更改gpu数量再训练会很麻烦（需要调整跳过的iter数）
-# sft, dpo
-tokenizer_dir = "tokenizer/hf_bbpe_tokenizer"
-user_name = "human"
-assistant_name = "gpt"
-# sft
+# data, task
+task_type = "pretrain"  # pretrain|sft
 sft_type = "conversation"  # sft任务的类型，"conversation"（多轮），"instruction"（单轮指令）
-# dpo
-max_prompt_len = None  # 默认为max_seq_len//2
-prompt_truncation_mode = "keep_end"  # prompt保留的方式，"keep_end"（保留后面），"keep_start"（保留前面）
-num_cpus = 0  # dpo预处理时使用的进程数，并行处理的进程数（>= 2则会启动多进程），太大可能会卡住，设置为2还是会报错（不清楚为什么。。。）, RuntimeError: unable to mmap 704 bytes from file <filename not specified>: Cannot allocate memory (12)
-# -----------------------------------------------------------------------------
-# peft
-use_peft = False
-# dpo_config
-ignore_index = -100
-dpo_loss_type = "sigmoid"
-dpo_beta = 0.01
-dpo_label_smoothing = 0.0
-reference_free = False
-# -----------------------------------------------------------------------------
+train_data_dir = "data/02_train_data_more/01_bin_for_train_hf"
+valid_data_dir = "data/02_train_data_more/02_bin_for_valid_hf"
+num_workers = 0  # 数据加载器的工作进程数
+skip_scaling_factor = 1.0  # 跳过的数据集数可能需要乘的数，因为非index的pretrain_dataset构造方式有点不同，GPU个数变化的时候需要设置
+use_dataset_with_index = False  # 是否使用索引来遍历数据集，需要先通过build_sample_index_map.py构建sample的索引
+tokenizer_dir = "tokenizer/hf_bbpe_tokenizer"
+## global_batch_size = batch_size * gradient_accumulation_steps * ddp_world_size
+batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
+max_seq_len = 2048
+grad_div_total_tokens = False  # 是否在计算梯度时除以总的token数，设置reduction="none" and grad_scaling_before_comm=False，使用PowerSGD时不能使用（loss不好，可能因为PowerSGD对数大的压缩不好，有正交化操作）
 # model
 vocab_size = 64320  # 实际是64012个，写大点方便扩展，注意最好是8的倍数，见指导：https://docs.nvidia.com/deeplearning/performance/dl-performance-fully-connected/index.html#tc-guidelines-padding
 hidden_dim = 2048
 intermediate_size = 5632
-n_layers = 32
+n_layers = 28
 n_heads = 16
 n_kv_heads = 8  # 用于GQA
 max_seq_len = max_seq_len
 initializer_range = 0.02  # 参数初始化时的标准差
 rms_norm_eps = 1e-5  # 防止除0的小数
-pad_token_id = 64006  # tokenizer.pad_token_id  # pad token 64006
+pad_token_id = 64006  # tokenizer.special_tokens["<|PAD|>"]  # pad token 64006
 tie_word_embeddings = False  # 是否共享word embedding和word prediction的参数
 rope_theta = 10000.0
 rope_scaling = None  # 缩放方法，用于长度外推
 attention_bias = True  # attention中的project是否加bias，Qwen中加了
-attention_dropout = 0.05  # TODO: 或许不用设置dropout
-dropout1 = 0.05
-dropout2 = 0.05
+attention_dropout = 0.1  # TODO: 或许不用设置dropout
+dropout1 = 0.1
+dropout2 = 0.1
 residual_in_fp32 = True  # 残差连接是否使用fp32
 loss_reduction = "none" if grad_div_total_tokens else "mean"  # 损失函数的reduction方式，"mean" or "none"，使用"none"可以和grad_scaling_before_comm=False配合使用，减少精度损失
-# -----------------------------------------------------------------------------
 # adamw optimizer
+## gradient_accumulation_steps=gradient_accumulation_steps*ddp_world_size
+gradient_accumulation_steps = 128  # used to simulate larger batch sizes
 learning_rate = 3e-4  # max learning rate，参考Qwen
-epoch = 2.2  # 我训练共有26B个token，token batch大小为2M，即一个epoch共有13_000个iters，max_iters=epoch*13_000，max_seq_len为2048，即一个epoch共有13M个samples
+max_iters = 80_000  # total number of training iterations，我共有26B的token，token batch大小为2M，即一个epoch共有13000个iter，即大概跑6个epoch
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
-# -----------------------------------------------------------------------------
 # learning rate decay settings
-decay_lr = True  # 是否进行学习率的衰减
-warmup_ratio = 0.03  # warmup所占max_iters的比例
-# -----------------------------------------------------------------------------
+decay_lr = True  # whether to decay the learning rate
+warmup_iters = 2000  # how many steps to warm up for
 # system
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
 compile = False  # use PyTorch 2.0 to compile the model to be faster
-# -----------------------------------------------------------------------------
 # 分布式配置
 # 通信后端
 # 见：https://huggingface.co/docs/transformers/perf_train_gpu_many
@@ -280,8 +235,11 @@ if overlap_param_gather:
 if not ddp:
     assert not use_bf16_compress_hook and not use_powerSGD_hook and not use_distributed_optimizer, "非DDP下不能使用bf16_compress_hook, powerSGD_hook, distributed_optimizer等"
 
-if task_type == "dpo":
-    assert grad_div_total_tokens is False, "dpo任务下grad_div_total_tokens必须为False"
+# -----------------------------------------------------------------------------
+# fixing some hyperparams to sensible defaults
+lr_decay_iters = max_iters * 0.9  # should be ~= max_iters per Chinchilla 开始停止学习率衰减的step
+# min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = learning_rate / 10  # 衰减到的最小学习率
 
 # -----------------------------------------------------------------------------
 # 设置ddp，判断是否是主进程
@@ -312,7 +270,6 @@ if ddp:
     torch.distributed.broadcast_object_list(object_list, src=0)  # 广播out_dir
     out_dir = object_list[0]
 
-# -----------------------------------------------------------------------------
 # 创建out_dir，并保存最终的配置文件信息
 # 只有每个节点的local rank0需要创建out_dir（考虑powerSGD状态保存，每个rank有自己的powerSGD的error_dict状态）
 if ddp_local_rank == 0:
@@ -320,9 +277,6 @@ if ddp_local_rank == 0:
 if master_process:
     # 保存最终的配置文件信息
     save_run_exp_config(os.path.join(out_dir, "exp_config.py"), exp_config)
-
-if ddp:
-    torch.distributed.barrier()  # 等待所有进程都创建好out_dir
 
 # -----------------------------------------------------------------------------
 # 运行日志
@@ -338,11 +292,10 @@ if ddp_local_rank == 0 and use_reslog:
     # wandb用起来有问题，改为自己的日志和画图工具
     reslog = ResLog(reslog_run_name, reslog_dir, reslog_save_interval)
 
-# -----------------------------------------------------------------------------
 # 每次迭代所训练的token数，2M = 16 * 8 * 8 * 2048
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * train_batch_size * max_seq_len
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * max_seq_len
 print_rank0(logger.info, f"tokens per iteration will be: {tokens_per_iter:,}")
-print_rank0(logger.info, f"breaks down as: {gradient_accumulation_steps} grad_accum_steps * {ddp_world_size} processes * {train_batch_size} train_batch_size * {max_seq_len} max_seq_len")
+print_rank0(logger.info, f"breaks down as: {gradient_accumulation_steps} grad accum steps * {ddp_world_size} processes * {batch_size} batch size * {max_seq_len} max seq len")
 
 # -----------------------------------------------------------------------------
 # 设置随机种子
@@ -556,6 +509,7 @@ if resume:
 
 # 同步一下
 if ddp:
+    torch.cuda.synchronize()
     torch.distributed.barrier()
 
 # -----------------------------------------------------------------------------
@@ -602,62 +556,8 @@ if ddp:
                              grad_scaling_factor=grad_scaling_factor, grad_scaling_before_comm=grad_scaling_before_comm)
 
 # -----------------------------------------------------------------------------
-# 任务构造器，用于生成训练和验证数据，不同进程会有不同的rng种子
-# pretrian下已经预先进行了toeknize，所以不需要tokenizer
-if task_type == "pretrain":
-    tokenizer = None
-elif task_type == "sft" or task_type == "dpo":
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
-else:
-    raise ValueError(f"Unknown task_type: {task_type}")
-task_kwargs = dict(
-    task_type=task_type,
-    device=device,
-    num_workers=num_workers,
-    # same
-    max_seq_len=max_seq_len,
-    use_dataset_with_index=use_dataset_with_index,
-    # sft, dpo
-    tokenizer=tokenizer,
-    user_name=user_name,
-    assistant_name=assistant_name,
-    # sft
-    sft_type=sft_type,
-    # dpo
-    max_prompt_len=max_prompt_len,
-    prompt_truncation_mode=prompt_truncation_mode,
-    num_cpus=num_cpus,
-)
-if train_data_dir is not None and valid_data_dir is not None:
-    # 按照文件夹划分好了数据集，每次取所有数据，valid_ratio设置为0
-    task = {
-        "train": Task(data_dir=train_data_dir, split="train", valid_ratio=0, batch_size=train_batch_size, **task_kwargs),
-        "valid": Task(data_dir=valid_data_dir, split="valid", valid_ratio=0, batch_size=valid_batch_size, **task_kwargs),
-    }
-else:
-    # 只有一个文件夹，dataset类中自动进行划分
-    task = {
-        "train": Task(data_dir=data_dir, split="train", valid_ratio=valid_ratio, batch_size=train_batch_size, **task_kwargs),
-        "valid": Task(data_dir=data_dir, split="valid", valid_ratio=valid_ratio, batch_size=valid_batch_size, **task_kwargs),
-    }
-
-# -----------------------------------------------------------------------------
-# 根据创建的数据集，计算一个epoch的iter数
-train_num_samples_per_epoch = task["train"].num_samples  # 一个epoch总共的样本数
-global_train_batch_size = train_batch_size * gradient_accumulation_steps * ddp_world_size  # 全局的train_batch_size
-train_num_iters_per_epoch = train_num_samples_per_epoch // global_train_batch_size  # 一个epoch总共的iter数
-# 计算本次训练需要训练的iter数
-max_iters = epoch * train_num_iters_per_epoch
-# 设置学习率衰减策略参数
-lr_decay_iters = max_iters * 0.9  # should be ~= max_iters per Chinchilla 开始停止学习率衰减的step
-min_lr = learning_rate / 10  # 衰减到的最小学习率，~= learning_rate/10 per Chinchilla
-warmup_iters = int(warmup_ratio * max_iters)  # warmup的step数
-
-# -----------------------------------------------------------------------------
 # 学习率衰减策略 (cosine with warmup)
 def get_lr(it):
-    global learning_rate, warmup_iters, lr_decay_iters, min_lr
-    
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
         return learning_rate * it / warmup_iters
@@ -671,63 +571,54 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # -----------------------------------------------------------------------------
+# 任务构造器，用于生成训练和验证数据，不同进程会有不同的rng种子
+# pretrian下已经预先进行了toeknize，所以不需要tokenizer
+if task_type == "pretrain":
+    tokenizer = None
+elif task_type == "sft":
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
+else:
+    raise ValueError(f"Unknown task_type: {task_type}")
+task_kwargs = dict(
+    task_type=task_type,
+    batch_size=batch_size,
+    device=device,
+    num_workers=num_workers,
+    # same
+    max_seq_len=max_seq_len,
+    use_dataset_with_index=use_dataset_with_index,
+    # sft
+    tokenizer=tokenizer,
+    sft_type=sft_type,
+)
+task = {
+    "train": Task(data_dir=train_data_dir, **task_kwargs),
+    "valid": Task(data_dir=valid_data_dir, **task_kwargs)
+}
+
+# -----------------------------------------------------------------------------
 # 测试函数，只在rank0上进行验证
 @torch.no_grad()
 def estimate_loss():
-    global dpo_config
-    
-    # 计算valid数据集需要验证的样本数
-    valid_num_samples_per_epoch = task["valid"].num_samples  # 一个epoch总共的样本数
-    valid_num_samples = valid_iters * valid_batch_size if valid_iters is not None else valid_num_samples_per_epoch  # 设置下的要验证的样本数
-    
-    assert valid_num_samples_per_epoch is not None or valid_num_samples is not None, "PretokDataset下，valid_iters必须设置，因为构建方法和index不太一样，不知道总共有多少个sample"
-    
-    # 应该验证的样本数
-    cur_valid_num_samples = None
-    if valid_num_samples_per_epoch is not None and valid_num_samples is not None:
-        cur_valid_num_samples = min(valid_num_samples_per_epoch, valid_num_samples)
-    elif valid_num_samples_per_epoch is not None:
-        cur_valid_num_samples = valid_num_samples_per_epoch
-    elif valid_num_samples is not None:
-        cur_valid_num_samples = valid_num_samples
-
     out = {}
     model.eval()
     for split in ["train", "valid"]:
-        # 根据要验证的样本数，确定需要验证的iter数
-        # 即train和valid验证的样本数一样，向下取整，至少验证一个iter
-        cur_valid_iters = cur_valid_num_samples // task[split].batch_size
-
-        assert cur_valid_iters > 0, f"valid样本太少，一个valid_batch_size都不能构建"
-        
-        print_rank0(logger.info, f"Estimating loss, split={split}, {split}_batch_size={task[split].batch_size}, num_iters={cur_valid_iters}")
-        
-        # task任务也需要转换到eval状态
-        # 因为在DDP下，train会受到影响，导致取得batch不是按顺序取的，而是按ddp_world_size跳着取
-        # 设置的结果：  step 0: train loss 11.4743, valid loss 11.4742
-        # 不设置的结果：step 0: train loss 11.4735, valid loss 11.4742
-        # 所以证明了train在ddp下会受到影响，严谨点，应该设置，记得恢复
-        task[split].eval()
-        
         batch_iter = task[split].iter_batches()
-        losses = torch.zeros(cur_valid_iters)  # keep on CPU
-        for k in range(cur_valid_iters):
+        losses = torch.zeros(eval_iters)  # keep on CPU
+        for k in range(eval_iters):
             valid_batch = next(batch_iter)
             with ctx:
-                loss = forward_step(model, valid_batch, task_type=task_type, dpo_config=dpo_config)
+                model_outputs = model(**valid_batch)
+                loss = model_outputs["loss"]
             if loss_reduction == "none":
                 loss = torch.mean(loss.view(-1))
             losses[k] = loss.item()
         out[split] = losses.mean().item()
-        
-        # task任务恢复为原来的模式，即设置回split
-        task[split].restore_mode()
-        
     model.train()
     return out
 
 # -----------------------------------------------------------------------------
-# 准备训练集，跳过训练过的样本
+# 准备训练集
 skip_batches_per_device = int(iter_num * gradient_accumulation_steps * skip_scaling_factor)  # 每个设备跳过的batch数
 skip_data_time = time.time()
 print_rank0(logger.info, f"Skipping {iter_num} iters ({skip_batches_per_device} skip_batches_per_device)")
@@ -739,6 +630,7 @@ print_rank0(logger.info, f"Skipped  {iter_num} iters ({skip_batches_per_device} 
 
 # 同步一下
 if ddp:
+    torch.cuda.synchronize()
     torch.distributed.barrier()
 
 # -----------------------------------------------------------------------------
@@ -746,24 +638,6 @@ if ddp:
 train_time0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
-# dpo_config
-dpo_config = None
-if task_type == "dpo":
-    if use_peft:
-        ref_model = None
-    else:
-        ref_model = create_reference_model(raw_model).to(device)
-    dpo_config = DPOConfig(
-        ref_model=ref_model,
-        use_peft=use_peft,
-        pad_token_id=tokenizer.pad_token_id,
-        ignore_index=ignore_index,
-        loss_type=dpo_loss_type,
-        beta=dpo_beta,
-        label_smoothing=dpo_label_smoothing,
-        reference_free=reference_free,
-    )
-# mfu
 running_mfu = -1.0
 print_rank0(logger.info, f"Start training loop")
 while True:
@@ -786,7 +660,7 @@ while True:
     # 验证，只在rank0上验证和保存
     # 但是其他rank也需要知道该信息，用于保存powerSGD的状态（每个rank都需要保存自己的error_dict）
     valid_loss = torch.tensor([-1.0], dtype=torch.float32, device=device)  # 初始为-1，若验证过了，则必为正数，这样可以判断是否验证过了
-    if iter_num % valid_interval == 0 and master_process:
+    if iter_num % eval_interval == 0 and master_process:
         valid_t0 = time.time()
         losses = estimate_loss()
         valid_dt = time.time() - valid_t0
@@ -804,13 +678,13 @@ while True:
         valid_loss = torch.tensor(losses["valid"], dtype=torch.float32, device=device)
         
     # 将valid_loss广播给其他rank
-    if iter_num % valid_interval == 0 and ddp:
+    if iter_num % eval_interval == 0 and ddp:
         torch.distributed.broadcast(valid_loss, src=0, async_op=False)
         
     valid_loss = valid_loss.item()  # 没有验证的话，则值为-1.0
     
     # 保存最新状态，第一次iter不保存，resume后的第一次验证也不保存
-    if iter_num % valid_interval == 0 and iter_num > 0 and not resume:
+    if iter_num % eval_interval == 0 and iter_num > 0 and not resume:
         save_checkpoint_time = time.time()
         
         # 保存状态
@@ -821,7 +695,7 @@ while True:
         
     # -----------------------------------------------------------------------------
     # 看看是否需要保存最优checkpoint，resume后的第一个不需要保存，因为还是原来的
-    if iter_num % valid_interval == 0 and valid_loss < best_val_loss and not resume:
+    if iter_num % eval_interval == 0 and valid_loss < best_val_loss and not resume:
         best_val_loss = valid_loss
         if iter_num > 0:
             save_checkpoint_time = time.time()
@@ -831,16 +705,17 @@ while True:
                 
             save_checkpoint_time = time.time() - save_checkpoint_time
             print_rank0(logger.info, f"save best checkpoint to {out_dir}, {save_checkpoint_time:.4f}s")
-    if iter_num % valid_interval == 0:
+    if iter_num % eval_interval == 0:
         # 验证过了，重置下训练的开始时间
         train_time0 = time.time()
     resume = False  # resume后的第一个不需要保存，因为还是原来的
     
-    if iter_num == 0 and valid_only:
+    if iter_num == 0 and eval_only:
         break
     
     # 同步一下，防止验证太久，其他进行完成forward后，会在backward时等待通信，等待时间过长可能会报错
     if ddp:
+        torch.cuda.synchronize()
         torch.distributed.barrier()
     
     # 记录每个micro所耗费的时间
@@ -859,7 +734,8 @@ while True:
         for micro_step in range(gradient_accumulation_steps - 1):
             micro_time = time.time()  #! 1
             with ctx:
-                loss = forward_step(model, train_batch, task_type=task_type, dpo_config=dpo_config)
+                model_outputs = model(**train_batch)
+                loss = model_outputs["loss"]
                 if loss_reduction == "mean":
                     loss = loss / gradient_accumulation_steps
                 else:
@@ -874,6 +750,7 @@ while True:
     
             # 同步以获取真实的耗时
             if ddp and sync_for_true_time:
+                torch.cuda.synchronize()
                 torch.distributed.barrier()
                 
             micro_time = time.time() - micro_time  #! 1
@@ -883,7 +760,8 @@ while True:
     
     # last_microbatch，需要同步了，backward中会进行梯度的通信（overlap_optim_step下还会进行optim.step()）
     with ctx:
-        loss = forward_step(model, train_batch, task_type=task_type, dpo_config=dpo_config)
+        model_outputs = model(**train_batch)
+        loss = model_outputs["loss"]
         if loss_reduction == "mean":
             loss = loss / gradient_accumulation_steps
         else:
@@ -903,6 +781,7 @@ while True:
     
     # 同步一下
     if ddp:
+        torch.cuda.synchronize()
         torch.distributed.barrier()
 
     last_micro_time = time.time() - last_micro_time  #! 2
@@ -928,18 +807,12 @@ while True:
         # 调用.item()方法会导致CPU等待GPU计算完成，因为需要将数据从GPU内存复制到CPU内存。
         lossf = train_loss.item()
         if local_iter_num >= 5:  # 过几个iter再计算mfu（Model FLOPs Utilization）
-            num_samples = train_batch_size * gradient_accumulation_steps
-            
-            # 注意sft和dpo下，每个样本的最大长度不一定为max_seq_len，所以mfu计算出来的不准
-            if task_type == "dpo":
-                num_samples *= 2  # dpo下每个样本都会进行两次forward，因为有chosen和rejected两个
-                
-            mfu = estimate_mfu(raw_model, num_samples, dt)
+            mfu = estimate_mfu(raw_model, batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
             # 前几个step不准，因为模型还没有稳定下来
             # 防止不准的数值对坐标轴的影响
             # 同时不保存测试时训练的实验结果，因为时间计算的是测试+训练的时间
-            if use_reslog and master_process and iter_num % valid_interval != 0:
+            if use_reslog and master_process and iter_num % eval_interval != 0:
                 reslog.log({
                     "iter": iter_num,
                     "tokens": iter_num * tokens_per_iter,

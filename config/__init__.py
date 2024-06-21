@@ -1,1 +1,0 @@
-from .my_config import *

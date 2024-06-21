@@ -633,6 +633,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_idx, model_chunk in enumerate(self.model_chunks):
             if hasattr(model_chunk, 'buffers'):
                 self.per_model_buffers[model_idx] = model_chunk.buffers
+        # self.buffers中只包含requires_grad=True的参数
         self.buffers = list(itertools.chain(*self.per_model_buffers.values()))
         
         # 构建param到bucket的映射

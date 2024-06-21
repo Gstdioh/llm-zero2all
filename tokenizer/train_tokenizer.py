@@ -10,7 +10,7 @@ from tokenizers.trainers import BpeTrainer
 
 from transformers import PreTrainedTokenizerFast
 
-from config import TrainTokenizerConfig
+from .train_config import TrainTokenizerConfig
 from utils import kwargs_parse
 
 

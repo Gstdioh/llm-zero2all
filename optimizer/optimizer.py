@@ -288,40 +288,42 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             fp32_from_float16_params_this_group = []
             # For all the parameters in this group:
             for i, model_param in enumerate(param_group['params']):
-                if model_param.requires_grad:
+                # 跳过不需要优化的参数
+                if not model_param.requires_grad:
+                    continue
 
-                    # float16 params:
-                    if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
-                        float16_params_this_group.append(model_param)
-                        # 创建fp32的拷贝
-                        main_param = model_param.detach().clone().float()
-                        # 将参数的属性复制下，这个shared表示共享的参数，如ebedding和最后的layer层
-                        if hasattr(model_param, 'shared'):
-                            main_param.shared = model_param.shared
-                            
-                        # 将optim中要优化的参数换为fp32的，并保存起来
-                        param_group['params'][i] = main_param
-                        fp32_from_float16_params_this_group.append(main_param)
+                # float16 params
+                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                    float16_params_this_group.append(model_param)
+                    # 创建fp32的拷贝
+                    main_param = model_param.detach().clone().float()
+                    # 将参数的属性复制下，这个shared表示共享的参数，如ebedding和最后的layer层
+                    if hasattr(model_param, 'shared'):
+                        main_param.shared = model_param.shared
                         
-                        # Reset existing state dict key to the new main param.
-                        # 重新映射下参数的状态
-                        if model_param in self.optimizer.state:
-                            self.optimizer.state[main_param] = self.optimizer.state.pop(model_param)
-                    # fp32 params.
-                    elif model_param.type() == 'torch.cuda.FloatTensor':
-                        # 模型参数本身就是fp32的，直接引用即可
-                        main_param = model_param
-                        fp32_params_this_group.append(main_param)
-                        param_group['params'][i] = main_param
+                    # 将optim中要优化的参数换为fp32的，并保存起来
+                    param_group['params'][i] = main_param
+                    fp32_from_float16_params_this_group.append(main_param)
+                    
+                    # Reset existing state dict key to the new main param.
+                    # 重新映射下参数的状态
+                    if model_param in self.optimizer.state:
+                        self.optimizer.state[main_param] = self.optimizer.state.pop(model_param)
+                # fp32 params
+                elif model_param.type() == 'torch.cuda.FloatTensor':
+                    # 模型参数本身就是fp32的，直接引用即可
+                    main_param = model_param
+                    fp32_params_this_group.append(main_param)
+                    param_group['params'][i] = main_param
 
-                    else:
-                        raise TypeError(
-                            'Wrapped parameters must be one of '
-                            'torch.cuda.FloatTensor,  '
-                            'torch.cuda.HalfTensor, or '
-                            'torch.cuda.BFloat16Tensor. '
-                            'Received {}'.format(model_param.type())
-                        )
+                else:
+                    raise TypeError(
+                        'Wrapped parameters must be one of '
+                        'torch.cuda.FloatTensor,  '
+                        'torch.cuda.HalfTensor, or '
+                        'torch.cuda.BFloat16Tensor. '
+                        'Received {}'.format(model_param.type())
+                    )
 
                 # overlap_optim_step下，才会构建bucket_to_optim_param_groups_map
                 if self.optim_config.overlap_optim_step:

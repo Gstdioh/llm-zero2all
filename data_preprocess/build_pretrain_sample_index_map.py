@@ -1,5 +1,6 @@
 import tqdm
 import logging
+import argparse
 
 import numpy as np
 
@@ -77,11 +78,15 @@ def build_sample_index_map(file_list, max_seq_len, sample_index_map_path):
     print(f"Build {sample_index_map_path} done, num_samples: {num_samples:,}")
 
 
-max_seq_len = 2048
-train_data_path = "data/02_train_data_more/01_bin_for_train_hf"
-valid_data_path = "data/02_train_data_more/02_bin_for_valid_hf"
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default="data/02_train_data_more", help="data dir，搜索目录中的所有bin文件，构建sample的索引")
+    parser.add_argument("--max_seq_len", type=int, default=2048, help="max sequence length")
+    args = parser.parse_args()
 
-for data_path in [train_data_path, valid_data_path]:
-    file_list = utils.get_file_paths(data_path, file_type="bin")
+    data_dir = args.data_dir
+    max_seq_len = args.max_seq_len
 
-    build_sample_index_map(file_list, max_seq_len, f"{data_path}/all_sample_index_map_{max_seq_len}.ibin")
+    file_list = utils.get_file_paths(data_dir, file_type="bin")
+
+    build_sample_index_map(file_list, max_seq_len, f"{data_dir}/all_sample_index_map_{max_seq_len}.ibin")

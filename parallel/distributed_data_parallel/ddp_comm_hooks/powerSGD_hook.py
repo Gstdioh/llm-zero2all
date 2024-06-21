@@ -719,12 +719,6 @@ def powerSGD_hook(
             for i, original_tensor in enumerate(original_tensors):
                 original_tensor.copy_(tensor[i])
 
-    #* 删除，不阻塞
-    #* 但是删除后，会导致结果不准确，损失不怎么降，奇怪
-    #* 改为自己的stream_wrapper后，可以删除了
-    # if torch.cuda.is_available():
-    #     torch.cuda.synchronize(device)
-
     # state.grad_buffer_is_powerSGD_error=True时，grad_buffer和error_dict的内存空间共享，可以节省模型梯度大小的内存
     # error的值在后面overlap_optim_step时计算，所以需要和overlap_optim_step一起用
     if state.use_error_feedback and not state.grad_buffer_is_powerSGD_error:

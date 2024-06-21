@@ -6,7 +6,9 @@ try:
     from apex.optimizers import FusedAdam
 except ImportError:
     FusedAdam = None
-from utils import print_rank0
+from .utils import print_rank0
+from .dpo import dpo_forward
+
 
 logger = logging.getLogger(__name__)
 
@@ -67,3 +69,19 @@ def estimate_mfu(model, fwdbwd_per_iter, dt):
     flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
     mfu = flops_achieved / flops_promised
     return mfu
+
+
+def forward_step(model, batch, task_type="pretrain", dpo_config=None):
+    """
+    进行一次前向传播，返回loss
+    
+    DPO下会有不同的行为
+    """
+    if task_type == "pretrain" or task_type == "sft":
+        model_outputs = model(**batch)
+        loss = model_outputs["loss"]
+    elif task_type == "dpo":
+        assert dpo_config is not None, "dpo_config must be provided for DPO task"
+        loss, metrics = dpo_forward(model, batch, dpo_config)
+    
+    return loss

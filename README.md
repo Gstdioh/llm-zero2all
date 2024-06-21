@@ -36,29 +36,63 @@
 根目录下的文件如下：
 
 ```txt
+- config/, 训练tokenizer时的配置文件
+
+- cuda/, 使用PyTorch的profiler测试cuda的stream和event的代码
+
+- data/, 存放训练数据，包括一些数据预处理，如划分训练集和验证集，提取wikipedia的数据，获取原始文件的所有text用于tokenizer的训练
+
+- data_preprocess/, 数据集的一些预处理，如pretokenize，和预先构建索引（用于pretrain和sft）
+
+- dataset/, 三种数据集类的构建（pretrain, sft, dpo）
+
+- distributed/, 实现get_global_rank，因为PyTorch1.12下没有这个函数
+
+- docker/, 包括build_docker_image.md，说明了docker的构建过程
+
+- example/, example/test_example 之前进行的一些测试代码
+
+- model/, 模型结构的实现，包括一些融合算子的代码（复制过来的）
+
+- optimizer/, 优化器的包裹类，有Float16OptimizerWithFloat16Params等，实现混合精度
+
+- parallel/, 分布式训练的实现
+    - distributed_data_parallel/, 实现DDP，提供ddp_comm_hooks，可以自定义梯度通信函数，实现PowerSGD算法
+    - distributed_optimizer/, 实现DistributedOptimizer，分布式优化器，目前还没有对保存函数进行测试
+
+- sft/, 使用self-instruct构建指令数据集的代码
+
+- tokenizer/, 包括tokenizer类的代码（huggingface和sentencepiece），训练tokenizer的代码
+
+- utils/, 工具模块
+    - checkpoint.py, 状态保存
+    - conversation.py, 多轮对话模板构建，可以进行prompt的tokenize，并且生成对应的掩码后的labels
+    - dpo.py, dpo的实现，基于model、ref_model、batch（包括chosen, rejected）计算得到dpo_loss
+    - my_logging.py, 实现不同的logger.handler，包括输出到文件中，过滤不想输出的内容，设置合适的输出格式
+    - reslog.py 和 resplot.py, 两个一起使用，reslog.py用于在训练脚本中保存实验结果，resplot.py用于将保存的实验结果可视化出来
+    - tensor.py, tensor相关的一些函数，如pad_to_length()，将tensor的某个维度进行扩展
+    - train.py, 训练相关的一些函数，如优化器的配置、mfu的计算、forward_step函数（pretrain, sft, dpo）
+    - utils.py, 一些通用的工具函数
+
+configurator.py, 解析训练脚本的命令行
+
+hfd.sh, 下载huggingface中的模型和数据集（见：https://hf-mirror.com/）
+
+monitor_process.py，监控训练进程，当进程异常中断时，能够自动重新启动进程
+
+monitor_train_my_ddp.sh，运行monitor_process.py的脚本例子
+
+pretrain_legacy.py, PyTorch的DDP的预训练脚本，版本较老（不包含各种计算通信重叠、SFT等新功能）
+
 README.md, 说明文档
 
 requirements.txt，环境
 
-hfd.sh, 下载huggingface中的模型和数据集（见：https://hf-mirror.com/）
+train_my_ddp_legacy.py, 自己实现的DDP的训练脚本，支持（pretrain, sft），版本较老
 
-train_tokenizer.py, 训练自己的分词器
+train_my_ddp.py, 自己实现的DDP的训练脚本，支持（pretrain, sft, dpo），版本最新
 
-pretokenize_data_more.py, 预处理数据集为bin文件，用于训练
-
-build_pretrain_sample_index_map.py, 构建pretrain数据集的索引
-dataset_pretrain.py, pretrain数据集的dataset和dataloader
-dataset_sft.py, sft数据集的dataset和dataloader
-dataset_task.py, 用于训练时的任务构建，可以无限生成训练需要的iter_batches
-
-train_my_ddp.py, 自己实现的DDP的训练脚本，支持（pretrain, sft），版本最新
-configurator.py, 解析训练脚本的命令行
-
-monitor_process.py，监控训练进程，当进程异常中断时，能够自动重新启动进程
-monitor_train_my_ddp.sh，运行monitor_process.py的脚本例子
-
-dataset_legacy.py, 之前数据集的构建方法，用于pretrain.py（因为该代码没有不断的更新）
-pretrain_legacy.py, PyTorch的DDP的预训练脚本，版本较老（不包含各种计算通信重叠、SFT等新功能）
+train_task.py, 用于训练时的任务构建，可以无限生成训练需要的iter_batches
 ```
 
 #### 其他说明
@@ -330,9 +364,68 @@ Qwen使用tiktoken，其自己管理特殊token，https://huggingface.co/Qwen/Qw
 
 有两个训练脚本：
 
-1. `pretrain.py`，使用PyTorch版本的DDP
+1. `pretrain_legacy.py`，使用PyTorch版本的DDP
 
-2. `pretrain_my_ddp.py`，使用自己的DDP，支持分布式优化器，支持自定义comm_hook，目前这个版本最新
+2. `train_my_ddp.py`，使用自己的DDP，支持分布式优化器，支持自定义comm_hook，目前这个版本最新
+
+### train_my_ddp.py 训练脚本
+
+1. 支持pretrain, sft, dpo任务
+2. 支持单卡，单节点多卡，多节点多卡
+3. 支持resume，需要添加 --resume --out_dir=out/2024_06_06_22_23_57
+
+会自动搜索对应目录中的相应文件
+
+多卡下会有警告，可以添加 OMP_NUM_THREADS=8 环境变量解决
+
+运行快点用于测试，添加参数（注意gradient_accumulation_steps要能被ddp_world_size整除）：--train_batch_size=2 --gradient_accumulation_steps=3
+
+#### pretrain
+
+```bash
+# 1. pretokenize, [".parquet", ".json", ".jsonl"] -> [".bin"]
+python -m data_preprocess.pretokenize_train_data --data_dir=data/02_train_data_more --tokenizer_dir=tokenizer/hf_bbpe_tokenizer
+
+# 2. 预处理，构建索引, [".bin"] -> [".ibin"]
+python -m data_preprocess.build_pretrain_sample_index_map --data_dir=data/02_train_data_more --max_seq_len=2048
+
+# 3. train
+# 单卡
+python train_my_ddp.py --task_type=pretrain --data_dir=data/02_train_data_more
+
+# 单节点多卡
+torchrun --standalone --nproc_per_node=4 train_my_ddp.py --task_type=pretrain --data_dir=data/02_train_data_more
+
+# 多节点多卡
+# - master
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 --master_addr=localhost --master_port=9527 train_my_ddp.py --task_type=pretrain --data_dir=data/02_train_data_more
+# - remote
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 --master_addr=10.10.24.107 --master_port=30846 train_my_ddp.py --task_type=pretrain --data_dir=data/02_train_data_more
+```
+
+#### sft
+
+```bash
+1. pretokenize，且构建索引（可不进行这一步，在线构建也可以，然后会自动保存为cache）
+python -m data_preprocess.pretokenize_sft_data --data_dir=data/04_sft_conversation_data --tokenizer_dir=tokenizer/hf_bbpe_tokenizer
+
+2. train
+# 单卡
+
+# - 使用pretokenize后的bin文件，只支持 sft_type=["conversation"]
+python train_my_ddp.py --task_type=sft --data_dir=data/04_sft_conversation_data/01_bin_for_sft --sft_type=conversation
+
+# - 使用原始的json，支持 sft_type=["conversation", "instruction"]
+python train_my_ddp.py --task_type=sft --data_dir=data/03_sft_data --sft_type=instruction --use_dataset_with_index=False
+python train_my_ddp.py --task_type=sft --data_dir=data/04_sft_conversation_data/train_3.5M_CN --sft_type=conversation --use_dataset_with_index=False
+```
+
+#### dpo
+
+```bash
+# 1. train，不支持pretokenize，会进行在线构建，然后会自动保存为cache，只支持conversation格式
+python train_my_ddp.py --task_type=dpo --data_dir=data/05_dpo_data/DPO-En-Zh-20k
+```
 
 ### 参数设置
 

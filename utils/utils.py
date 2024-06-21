@@ -10,9 +10,13 @@ import subprocess
 _ddp = int(os.environ.get("RANK", -1)) != -1
 _master_process = True
 _ddp_rank = 0
+_ddp_local_rank = 0
+_ddp_world_size = 1
 if _ddp:
     _ddp_rank = int(os.environ["RANK"])
     _master_process = _ddp_rank == 0
+    _ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    _ddp_world_size = int(os.environ["WORLD_SIZE"])
     
     
 def print_rank0(print_fn, message=None):
@@ -20,6 +24,27 @@ def print_rank0(print_fn, message=None):
     只在主进程打印信息
     """
     _ = print_fn(message) if _master_process else None
+
+
+def is_master_process():
+    """
+    是否是主进程
+    """
+    return _master_process
+
+
+def is_local_rank0():
+    """
+    是否是本地的第一个进程
+    """
+    return _ddp_local_rank == 0
+
+
+def is_ddp():
+    """
+    是否是分布式训练
+    """
+    return _ddp
 
 
 # 解析命令行参数
@@ -169,6 +194,36 @@ def get_file_line_count(file_path):
     return int(result.stdout.split()[0])
 
 
+def is_json_file(file_path):
+    """
+    判断是否是json文件，主要用来和jsonl区分
+    
+    通过简单判断，后缀为.json且第一个字符为[，则认为是json文件
+    """
+    with open(file_path, "r") as f:
+        if f.read(1) == "[" and file_path.endswith(".json"):
+            return True
+    return False
+
+
+def split_list_avg(data_list, split_num):
+    """
+    将列表平均分为split_num份
+    """
+    block_size = len(data_list) // split_num
+    
+    if block_size == 0:
+        return data_list
+    
+    ret_list = []
+    for block_id in range(0, split_num - 1):
+        ret_list.append(data_list[block_id * block_size : (block_id + 1) * block_size])
+    # 最后一个block取所有数据
+    ret_list.append(data_list[(split_num - 1) * block_size:])
+
+    return ret_list
+
+
 # 注意：这里的清洗方法只是简单的清洗，不一定适用于所有的数据集
 # 对中文使用0, 1, 2, 3, 4
 # 对英文使用0, 1, 2, 3, 4
@@ -246,3 +301,13 @@ def save_run_exp_config(save_path, exp_config):
 
     with open(save_path, "w", encoding="utf-8") as f:
         f.write(exp_config_text)
+
+
+def unwrap_model(model):
+    """
+    递归地将模型的嵌套模型解开，返回一个模型列表
+    """
+    if hasattr(model, "module"):
+        return unwrap_model(model.module)
+    else:
+        return model

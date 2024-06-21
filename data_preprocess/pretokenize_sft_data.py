@@ -14,31 +14,11 @@ import random
 
 import numpy as np
 import ijson
-import pandas as pd
-from pyarrow.parquet import ParquetFile
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from utils import get_file_paths, get_file_line_count
-from sft import Conversation
-
-
-TRAIN_DATA_DIR = "./data/04_sft_conversation_data"  # 在这个文件夹中找到所有的数据文件
-FILE_TYPE = ["json"]  # 文件类型
-SAVE_DIR = os.path.join(TRAIN_DATA_DIR, "01_bin_for_sft_")  # bin保存的目录
-
-input_ids_suffix = "_input_ids.bin"
-labels_suffix = "_labels.bin"
-sample_index_map_suffix = "_sample_index_map.ijson"  # ijson表示用于index的json文件
-
-USER_NAME = "human"
-ASSISTANT_NAME = "assistant"
-IGNORE_INDEX = -100
-
-SAVE_DTYPE = np.uint16
-
-MAX_WORKERS = 8
-START_TEXT = ""
+from utils import get_file_paths, get_file_line_count, is_json_file, split_list_avg
+from utils.conversation import Conversation
 
 
 def stream_json(file_path):
@@ -49,7 +29,7 @@ def stream_json(file_path):
 
 
 def stream_jsonl(file_path):
-    # test_count = 5000
+    # test_count = 5000  # 测试用
     with open(file_path, 'r') as f:
         for line in f:
             obj = json.loads(line)
@@ -63,14 +43,8 @@ def file_data_generator(file_path):
     """
     流式生成文件中每一行的数据
     """
-    # 判断是json还是jsonl文件
-    is_json = False
-    with open(file_path, "r") as f:
-        if f.read(1) == "[":
-            is_json = True
-    
     # 开始流式读取
-    if is_json:
+    if is_json_file(file_path):
         return stream_json(file_path)
     else:
         return stream_jsonl(file_path)
@@ -121,7 +95,6 @@ def process_file(args, tokenizer_dir):
     }
     
     process_id, file_paths = args
-    file_paths = file_paths.tolist()
     
     for file_path in file_paths:
         # 新的基本文件名：data/04_sft_conversation_data/01_bin_for_sft_hf_2048/train_3.5M_CN
@@ -164,7 +137,7 @@ def process_file(args, tokenizer_dir):
                 conv.append_message(role, sentence["value"])
             
             # 构建prompt，并且进行tokenize，会对labels进行掩码
-            output = conv.get_tokenized_prompt(return_type="np", ignore_index=IGNORE_INDEX, add_begin=True)
+            output = conv.get_tokenized_conversations(return_type="np", ignore_index=IGNORE_INDEX, add_begin=True)
             
             # 这里进行max_seq_len的截断，后面读取数据集的时候再根据需求截断
             input_ids = output["input_ids"]
@@ -214,7 +187,7 @@ def pretokenize_sft_data(tokenizer_dir):
     max_workers = min(MAX_WORKERS, len(file_paths))
     
     # 将file_paths列表平均分为MAX_WORKERS份
-    file_paths_list = np.array_split(file_paths, max_workers)
+    file_paths_list = split_list_avg(file_paths, max_workers)
     
     # 在单个进程中测试下
     # process_file((0, file_paths_list[0]), tokenizer_dir)
@@ -224,6 +197,7 @@ def pretokenize_sft_data(tokenizer_dir):
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         executor.map(fun, enumerate(file_paths_list))
 
+    # 聚合所有索引
     gather_all_samlpe_index_map(file_paths)
         
     print("Done.")
@@ -231,13 +205,31 @@ def pretokenize_sft_data(tokenizer_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-t", "--tokenizer_type", type=str, default="hf", help="hf or sp")
+    parser.add_argument("--data_dir", type=str, default="./data/04_sft_conversation_data", help="要pretokenize的文件目录，将其中的所有文件tokenize后保存到bin目录中，可以识别jsonl文件，注意字段可能不同，需要自己设置")
+    parser.add_argument("--tokenizer_dir", "--tokenizer_type", type=str, default="tokenizer/hf_bbpe_tokenizer", help="tokenizer的路径")
     args = parser.parse_args()
     
-    tokenizer_dir = f"./tokenizer/{args.tokenizer_type}_bbpe_tokenizer"
+    data_dir = args.data_dir
+    tokenizer_dir = args.tokenizer_dir
+    
+    TRAIN_DATA_DIR = data_dir  # 在这个文件夹中找到所有的数据文件
+    FILE_TYPE = ["json"]  # 文件类型
+    SAVE_DIR = os.path.join(TRAIN_DATA_DIR, "01_bin_for_sft")  # bin保存的目录
+
+    input_ids_suffix = "_input_ids.bin"
+    labels_suffix = "_labels.bin"
+    sample_index_map_suffix = "_sample_index_map.ijson"  # ijson表示用于index的json文件
+
+    USER_NAME = "human"
+    ASSISTANT_NAME = "assistant"
+    IGNORE_INDEX = -100
+
+    SAVE_DTYPE = np.uint16
+
+    MAX_WORKERS = 8
+    START_TEXT = ""
     
     # tokenize后的bin目录
-    SAVE_DIR = SAVE_DIR + args.tokenizer_type
     os.makedirs(SAVE_DIR, exist_ok=True)
     
     pretokenize_sft_data(tokenizer_dir)

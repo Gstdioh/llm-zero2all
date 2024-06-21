@@ -1000,6 +1000,7 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
         use_cache=True,
         past_key_values: Optional[Dict[str, Any]] = None,
         loss_fn=None,
+        only_last_token=False,
     ) -> Dict:
         """模型的前向传播
         kv缓存的格式: {"key_states_layers": [], "value_states_layers": [], "seen_tokens": 0}
@@ -1010,6 +1011,7 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
             use_cache (bool): 是否使用kv缓存. Defaults to False.
             past_key_values (_type_, optional): kv缓存. Defaults to None.
             loss_fn=None, 用于计算损失的函数
+            only_last_token, 是否只返回最后一个token的输出
 
         Returns:
             CausalLMOutputWithPast(loss, logits, past_key_values)
@@ -1032,7 +1034,7 @@ class Z2allForCausalLM(Z2allPreTrainedModel):
         
         # last_hidden_state (seq_len, bsz, hidden_dim) -> (1, bsz, hidden_dim)
         # 推理时，只需要最后一个位置的输出，loss为None
-        if labels is None:
+        if labels is None and only_last_token:
             last_hidden_state = last_hidden_state[[-1], :, :]
         
         # labels is None，    logits (1, bsz, vocab_size)

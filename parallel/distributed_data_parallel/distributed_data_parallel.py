@@ -79,6 +79,7 @@ class DistributedDataParallel(nn.Module):
         self.param_to_buffer = {}
 
         # Group parameters by their gradient type.
+        # 只添加需要梯度的参数
         self.param_to_name = {}
         dense_params = []
         for name, param in self.module.named_parameters():

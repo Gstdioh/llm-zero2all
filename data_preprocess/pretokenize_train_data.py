@@ -19,17 +19,7 @@ from pyarrow.parquet import ParquetFile
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from utils import get_file_paths
-
-
-TRAIN_DATA_DIR = "./data/02_train_data_more"  # 在这个文件夹中找到所有的数据文件
-FILE_TYPE = ["json", "parquet"]  # 文件类型
-SAVE_DIR = os.path.join(TRAIN_DATA_DIR, "01_bin_for_train_")  # bin保存的目录
-
-FILE_BYTES = 100 * 1024 * 1024  # 每个文件的字节数, 100MB
-ELEMENT_SIZE = 2  # 每个元素的字节数
-MAX_WORKERS = 16
-START_TEXT = ""
+from utils import get_file_paths, is_json_file
 
 
 def stream_json(file_path):
@@ -65,14 +55,8 @@ def file_text_generator(file_path):
                 text = text.strip()  # 去除首尾空格
                 yield text
     elif file_path.endswith(".json") or file_path.endswith(".jsonl"):
-        # 判断是json还是jsonl文件
-        is_json = False
-        with open(file_path, "r") as f:
-            if f.read(1) == "[":
-                is_json = True
-        
         # 开始流式读取
-        if is_json:
+        if is_json_file(file_path):
             lines = stream_json(file_path)
         else:
             lines = stream_jsonl(file_path)
@@ -174,13 +158,23 @@ def pretokenize_data(tokenizer_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-t", "--tokenizer_type", type=str, default="hf", help="hf or sp")
+    parser.add_argument("--data_dir", type=str, default="./data/02_train_data_more", help="要pretokenize的文件目录，将其中的所有文件tokenize后保存到bin目录中，可以识别parquet、json和jsonl文件，注意字段可能不同，需要自己设置")
+    parser.add_argument("--tokenizer_dir", "--tokenizer_type", type=str, default="tokenizer/hf_bbpe_tokenizer", help="tokenizer的路径")
     args = parser.parse_args()
     
-    tokenizer_dir = f"./tokenizer/{args.tokenizer_type}_bbpe_tokenizer"
+    data_dir = args.data_dir
+    tokenizer_dir = args.tokenizer_dir
+    
+    TRAIN_DATA_DIR = data_dir  # 在这个文件夹中找到所有的数据文件
+    FILE_TYPE = ["parquet", "json", "jsonl"]  # 文件类型
+    SAVE_DIR = os.path.join(TRAIN_DATA_DIR, "01_bin_for_train")  # bin保存的目录
+
+    FILE_BYTES = 100 * 1024 * 1024  # 每个文件的字节数, 100MB
+    ELEMENT_SIZE = 2  # 每个元素的字节数
+    MAX_WORKERS = 16
+    START_TEXT = ""
     
     # tokenize后的bin目录
-    SAVE_DIR = SAVE_DIR + args.tokenizer_type
     os.makedirs(SAVE_DIR, exist_ok=True)
     
     pretokenize_data(tokenizer_dir)

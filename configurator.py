@@ -46,8 +46,8 @@ for arg in sys.argv[1:]:  # 对于python main.py "123 123" sys.argv 结果是 ['
                 except (SyntaxError, ValueError):
                     # if that goes wrong, just use the string
                     attempt = val
-                # ensure the types match ok
-                assert type(attempt) == type(globals()[key])
+                # ensure the types match ok，不用进行确定
+                # assert type(attempt) == type(globals()[key]), f"Type mismatch! {key} = {attempt} vs {globals()[key]}"
                 # cross fingers
                 print_rank0(print, f"Overriding: {key} = {attempt}")
                 globals()[key] = attempt
