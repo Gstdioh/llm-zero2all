@@ -14,65 +14,111 @@
 
 4. [训练](#04-训练)，使用自己实现的DDP和分布式优化器（基于Megatron-LM源码，简化）来训练，代码实现更易懂
 
-    * PyTorch的DDP的预训练脚本：`pretrain.py`，版本较老（不包含各种计算通信重叠、SFT等新功能），只能进行预训练。
-    * 自己实现的**DDP和分布式优化器**，基于Megatron-LM源码，简化实现代码，添加部分新功能，脚本见：`train_my_ddp.py`。
+    * PyTorch的DDP的预训练脚本：`pretrain_legacy.py`，版本较老（不包含各种计算通信重叠、SFT等新功能），只能进行预训练。
+    * 自己实现的**DDP和分布式优化器**，参考Megatron-LM源码，简化实现代码，添加部分新功能，脚本见：**`train_my_ddp.py`**。
         * 实现**混合精度优化器**
         * 可以使用register_comm_hook来**自定义梯度通信**
         * 实现**三种通信和计算重叠**（overlap_grad_reduce, overlap_param_gather, overlap_optim_step）
         * `train_my_ddp.py`包括**预训练和微调**。
-    * **PowerSGD**的实现，压缩需要通信的梯度大大加快了训练速度，基于PyTorch源码，通过cuda的stream和event实现了powerSGD_hook的异步，能与grad_reduce并行。同时添加了多个优化（`powerSGD_hook.py`）
+    * **PowerSGD**的实现，压缩需要通信的梯度大大加快了训练速度，基于PyTorch源码，通过cuda的stream和event实现了powerSGD_hook的异步，能与grad_reduce并行。同时添加了多个优化（`parallel/distributed_data_parallel/ddp_comm_hooks/powerSGD_hook.py`）
     * 简单的**实验过程可视化**代码（通过ssh远程获取文件来可视化）。
     * 训练可以从**断点重新训练**，且重新训练时结果与之前一致（可复现），保存的方式更加稳定（保存最优和次优的文件，防止保存失败导致文件损坏）
     * 实现训练进程的监控，当进程异常中断时，监控进程可以**自动重新启动进程**（`monitor_process.py`）
 
-5. [微调](#05-sft有监督微调)，实现**SFT（有监督微调，指令微调）**，通过自己构建的指令数据集来微调。
+5. [微调](#05-sft有监督微调指令微调)，实现**SFT（有监督微调，指令微调）**，通过自己构建的指令数据集来微调。
     * **训练脚本**见：`train_my_ddp.py`，更改部分实验参数即可。
     * 提供**指令数据集的构建**代码，见`./sft`目录。
-    * 实现sft数据集的**加载和预处理**（包括单轮指令数据集和多轮对话数据集conversation），见：`dataset_sft.py`。
-    * 提供多轮对话数据集的预处理，包括构建**pretokenize**的bin文件和用于**索引**样本的sample_index_map索引文件，包括多轮对话模板的构建（见：pretokenize_sft_data.py），见：sft/conversation.py
+    * 实现SFT数据集的**加载和预处理**（包括单轮指令数据集和多轮对话数据集conversation），见：`dataset/dataset_sft.py`。
+    * 提供多轮对话数据集的预处理，包括构建**pretokenize**的bin文件和用于**索引**样本的sample_index_map索引文件，包括多轮对话模板的构建（见：`dataset_preprocess/pretokenize_sft_data.py`），见：`utils/conversation.py`
 
-6. [Docker镜像](#10-docker镜像)，提供已经构建好的docker镜像，包含实验所需的所有环境。
+6. [DPO](#06-dpodirect-preference-optimization)，实现**DPO（Direct Preference Optimization）**，参考trl库，自己构建的DPODataset。
+    * **训练脚本**见：`train_my_ddp.py`，更改部分实验参数即可。
+    * 实现DPO数据集的**加载和预处理**（目前只支持conversation格式的数据集），见：`dataset/dataset_dpo.py`。
 
-根目录下的文件如下：
+7. [Docker镜像](#10-docker镜像)，提供已经构建好的docker镜像，包含实验所需的所有环境。
+
+项目所有文件的描述如下：
 
 ```txt
-- config/, 训练tokenizer时的配置文件
-
 - cuda/, 使用PyTorch的profiler测试cuda的stream和event的代码
 
-- data/, 存放训练数据，包括一些数据预处理，如划分训练集和验证集，提取wikipedia的数据，获取原始文件的所有text用于tokenizer的训练
+- data/, 存放训练数据，一些简单的数据预处理，如划分训练集和验证集，提取wikipedia的数据，获取原始文件的所有text用于tokenizer的训练
+    get_train_data_json.md, 通过GPT提示，编写提取文件的脚本
+    get_train_data_json.sh, 数据集过大时可能不想取所有文件，如只想取10G用于tokenizer的训练，这个脚本可以指定不同数据集的文件个数，然后提取文件，进行了随机打乱
+    get_txt_for_train_tokenizer.py, 从get_train_data_json提取后的文件夹中的json文件提取出text内容，用于tokenizer的训练
+    get_valid_data.py, 对pretokenize后的bin文件预先进行数据集的划分，（这里建议不进行划分，后续dataset中会根据索引自动划分，更加方便）
+    data/max_sentence_length.py, 获取文件夹下的文本文件所有行的最大长度
+    wikipedia_cn_extract_json.py, 提取wikipedia原始数据为json文件
+    wikipedia_cn_extract_parquet.py, 提取wikipedia原始数据为parquet文件
 
 - data_preprocess/, 数据集的一些预处理，如pretokenize，和预先构建索引（用于pretrain和sft）
+    build_pretrain_sample_index_map.py, 基于bin文件，构建对应pretrain的数据索引，这样可以不用将整个数据集读入内存
+    pretokenize_pretrain_data.py, pretokenize，将[".parquet", ".json", ".jsonl"]类型文件tokenize为[".bin"]文件，用于后续的pretrain
+    pretokenize_sft_data.py, 对原始conversation格式的sft数据集，进行pretokenize和构建索引
 
-- dataset/, 三种数据集类的构建（pretrain, sft, dpo）
+- dataset/, 三种数据集类的构建（ pretrain, sft, dpo ）
+    dataset_dpo.py, DPODataset类，支持conversation格式的数据集，内部会进行preprocess
+    dataset_legacy.py, 老版本的pretrain数据集构建，用于pretrain_legacy.py脚本
+    dataset_pretrainpy, PretokDataset类，还有一个PretokDatasetWithIndex类（推荐使用，需要通过build_pretrain_sample_index_map.py构建索引）
+    dataset_sft.py, SupervisedDataset类，支持conversation和instruction格式的数据集，内部会进行preprocess（也可以使用pretokenize_sft_data.py预先构建索引）
 
-- distributed/, 实现get_global_rank，因为PyTorch1.12下没有这个函数
+- distributed/, 分布式工具模块
+    distributed_c10d.py, 实现get_global_rank，因为PyTorch1.12下没有这个函数
 
-- docker/, 包括build_docker_image.md，说明了docker的构建过程
+- docker/, docker容器
+    build_docker_image.md, 详细描述了docker的构建过程
 
-- example/, example/test_example 之前进行的一些测试代码
+- example/, 例子
+    - test_example/, 之前进行的一些测试代码
+        - test_sft_dpo/, 测试sft和dpo
+        ...
 
 - model/, 模型结构的实现，包括一些融合算子的代码（复制过来的）
+    configuration_z2all.py, 模型配置类
+    fused_cross_entropy.py, fused_rotary_embedding.py, 融合算子函数，方便调用，从flash-attn仓库复制过来
+    modeling_z2all.py, 模型结构代码，包括各种融合算子，实现kv-cache
+    README.md, 说明文档
 
 - optimizer/, 优化器的包裹类，有Float16OptimizerWithFloat16Params等，实现混合精度
+    optimizer_config.py, 优化器配置文件（注意只是简单的配置参数，不包括具体优化器的超参数）
+    optimizer.py, 混合精度优化器的基类：MixedPrecisionOptimizer，Float16OptimizerWithFloat16Params类（包括fp16, bf16），FP32Optimizer类（fp32）
 
 - parallel/, 分布式训练的实现
     - distributed_data_parallel/, 实现DDP，提供ddp_comm_hooks，可以自定义梯度通信函数，实现PowerSGD算法
+        - ddp_comm_hooks/, 包含所有实现的comm_hook
+            default_hooks.py, 常用hook，包括all_reduce, reduce_scatter, stream_wrapper等
+            overlap_optim_step_hooks.py, 梯度通信后，立刻进行异步的优化器优化，可以和下一个梯度通信重叠
+            powerSGD_hook.py, PowerSGD算法的实现，hook形式，修改梯度通信的过程
+        distributed_data_parallel_config.py, DDP配置类
+        distributed_data_parallel.py, DDP的实现，自己管理模型参数和梯度的内存，划分为bucket用于梯度通信，考虑多个计算通信重叠
+        param_and_grad_buffer.py, 模型参数和梯度的buffer，即自己管理其内存，一个buffer中有多个bucket
     - distributed_optimizer/, 实现DistributedOptimizer，分布式优化器，目前还没有对保存函数进行测试
-
-- sft/, 使用self-instruct构建指令数据集的代码
+        distributed_optimizer.py， ZeRO1，DistributedOptimizer类，继承混合精度基类，构建模型参数与buffer位置的对应关系
+    README.md, 说明文件
 
 - tokenizer/, 包括tokenizer类的代码（huggingface和sentencepiece），训练tokenizer的代码
+    - hf_bbpe_tokenizer/, 自己构建好的tokenizer，使用tokenizers库训练10G文本（中英对半）得到，可使用AutoTokenizer保存和加载，自己来管理special_tokens
+    - sp_bbpe_tokenizer/, 自己构建好的tokenizer，使用sentencepiece库训练20G文本（中英对半）得到，可使用AutoTokenizer保存和加载，自己来管理special_tokens
+    train_config.py, 训练tokenizer时的配置文件
+    train_tokenizer.py, 训练tokenizer的脚本
 
 - utils/, 工具模块
-    - checkpoint.py, 状态保存
-    - conversation.py, 多轮对话模板构建，可以进行prompt的tokenize，并且生成对应的掩码后的labels
-    - dpo.py, dpo的实现，基于model、ref_model、batch（包括chosen, rejected）计算得到dpo_loss
-    - my_logging.py, 实现不同的logger.handler，包括输出到文件中，过滤不想输出的内容，设置合适的输出格式
-    - reslog.py 和 resplot.py, 两个一起使用，reslog.py用于在训练脚本中保存实验结果，resplot.py用于将保存的实验结果可视化出来
-    - tensor.py, tensor相关的一些函数，如pad_to_length()，将tensor的某个维度进行扩展
-    - train.py, 训练相关的一些函数，如优化器的配置、mfu的计算、forward_step函数（pretrain, sft, dpo）
-    - utils.py, 一些通用的工具函数
+    - sft/, 使用self-instruct构建指令数据集的代码
+        generate_instruction.py, self-instruct生成指令数据集
+        local_utils.py, 工具模块
+        prompt_cn.txt, 翻译后的提示
+        prompy.txt, Alpaca原始的提示文件
+        README.md， 说明文件
+        seed_tasks_cn.jsonl, gpt-4o翻译后的种子指令
+        seed_tasks.jsonl, Alpaca原始的种子文件
+    checkpoint.py, 状态保存
+    conversation.py, 多轮对话模板构建，可以进行prompt的tokenize，并且生成对应的掩码后的labels
+    dpo.py, dpo的实现，基于model、ref_model、batch（包括chosen, rejected）计算得到dpo_loss
+    my_logging.py, 实现不同的logger.handler，包括输出到文件中，过滤不想输出的内容，设置合适的输出格式
+    reslog.py 和 resplot.py, 一起使用，reslog.py在训练脚本中保存实验结果，resplot.py将保存的实验结果可视化
+    tensor.py, tensor相关的一些函数，如pad_to_length()，将tensor的某个维度进行扩展
+    train.py, 训练相关的一些函数，如优化器的配置、mfu的计算、forward_step函数（pretrain, sft, dpo）
+    utils.py, 一些通用的工具函数
 
 configurator.py, 解析训练脚本的命令行
 
@@ -384,7 +430,7 @@ Qwen使用tiktoken，其自己管理特殊token，https://huggingface.co/Qwen/Qw
 
 ```bash
 # 1. pretokenize, [".parquet", ".json", ".jsonl"] -> [".bin"]
-python -m data_preprocess.pretokenize_train_data --data_dir=data/02_train_data_more --tokenizer_dir=tokenizer/hf_bbpe_tokenizer
+python -m data_preprocess.pretokenize_pretrain_data --data_dir=data/02_train_data_more --tokenizer_dir=tokenizer/hf_bbpe_tokenizer
 
 # 2. 预处理，构建索引, [".bin"] -> [".ibin"]
 python -m data_preprocess.build_pretrain_sample_index_map --data_dir=data/02_train_data_more --max_seq_len=2048
@@ -480,11 +526,50 @@ torchrun --standalone --nproc_per_node=4 pretrain_my_ddp.py "out/2024_06_05_20_2
 
 ## 05 SFT（有监督微调，指令微调）
 
+对训练脚本基本不改动，只需要在数据集构建的时候，将prompt部分进行掩码得到`labels`，并且根据`pad_token_id`得到`attention_mask`
+
+一个batch的内容如下：
+
+```txt
+{
+    "input_ids": tensor,
+    "labels": tensor,
+    "attenrion_mask": tensor,
+}
+```
+
 指令数据集的构建见：[指令数据集的构建](./sft/README.md)，使用self-instruct方法构建。
 
-sft数据集的加载和预处理见：dataset_sft.py
+sft数据集的加载和预处理见：`dataset/dataset_sft.py`，支持conversation和instruction格式的数据集。
 
-sft训练过程同样见：train_my_ddp.py，修改实验参数`task_type`、指令数据集路径、tokenizer路径即可。
+提供数据集的预处理（pretokenize），如果数据集太大可以使用，见：`data_preprocess/pretokenize_sft_data.py`，后续读取使用np.memmap()，不需要将数据集完整读入内存。
+
+sft训练脚本同样使用：`train_my_ddp.py`，修改实验参数`task_type`、数据集路径`data_dir`、tokenizer路径`tokenizer_dir`。
+
+## 06 DPO（Direct Preference Optimization）
+
+参考trl库
+
+对训练脚本添加一个方法forward_step，表示一次前向计算，方便兼容三种任务（pretrain, sft, dpo），样本也需要进行掩码得到相应的labels
+
+一个batch的内容如下：
+
+```txt
+{
+    "chosen_input_ids": tensor,
+    "chosen_labels": tensor,
+    "chosen_attenrion_mask": tensor,
+    "rejected_input_ids": tensor,
+    "rejected_labels": tensor,
+    "rejected_attenrion_mask": tensor,
+}
+```
+
+具体来说，使用`ref_model = copy.deepcopy(model)`来获取reference的模型，然后forward的时候不进行更新。
+
+DPO数据集的加载和预处理见：`dataset/dataset_dpo.py`，目前只支持conversation格式的数据集，instruction格式的可以自行进行格式的转换。
+
+DPO训练脚本同样使用：`train_my_ddp.py`，修改实验参数`task_type`、数据集路径`data_dir`、tokenizer路径`tokenizer_dir`。
 
 ## 10 Docker镜像
 

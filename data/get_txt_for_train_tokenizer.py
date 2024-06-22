@@ -19,12 +19,12 @@ def get_file_abspaths(file_dir: str) -> list:
     return file_abspaths
 
 
-file_type = "txt"
-save_dir = "./00_txt_for_train_tokenizer"
+file_type = "txt"  # 保存类型
+save_dir = "./00_txt_for_train_tokenizer"  # 保存位置
 
 os.makedirs(save_dir, exist_ok=False)
 
-data_dir = "./"
+data_dir = "./"  # 数据文件夹，需要是jsonl类型，一行一个json对象
 dir_list = get_dir_abspaths(data_dir)
 
 # 获取所有文件

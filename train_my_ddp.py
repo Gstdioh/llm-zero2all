@@ -15,7 +15,7 @@
 
 ```bash
 # 1. pretokenize, [".parquet", ".json", ".jsonl"] -> [".bin"]
-python -m data_preprocess.pretokenize_train_data --data_dir=data/02_train_data_more --tokenizer_dir=tokenizer/hf_bbpe_tokenizer
+python -m data_preprocess.pretokenize_pretrain_data --data_dir=data/02_train_data_more --tokenizer_dir=tokenizer/hf_bbpe_tokenizer
 
 # 2. 预处理，构建索引, [".bin"] -> [".ibin"]
 python -m data_preprocess.build_pretrain_sample_index_map --data_dir=data/02_train_data_more --max_seq_len=2048
@@ -67,11 +67,9 @@ import time
 from contextlib import nullcontext
 from datetime import datetime
 import logging
-from typing import Optional
 
 import torch
 from torch.distributed import destroy_process_group, init_process_group
-import torch.distributed as dist
 import torch.distributed
 from transformers import AutoConfig, AutoTokenizer
 

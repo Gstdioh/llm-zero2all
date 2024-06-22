@@ -1,6 +1,8 @@
 """
 generate_instruction.py
 
+sft/下
+
 run:
 python -m generate_instruction generate_instruction_following_data \
   --output_dir ./ \
