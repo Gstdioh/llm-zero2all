@@ -277,42 +277,36 @@ class DPODataset(torch.utils.data.IterableDataset):
         # 样本数，样本的索引，通过索引来取数，对索引进行打乱
         self.num_samples = len(self.data_dict["chosen_input_ids"])
             
-        # 样本索引列表
+        # 完整的样本索引列表
         self.sample_index_list = list(range(self.num_samples))
         
         # 进行数据集的划分
-        self.split_index = int(self.num_samples * (1 - self.valid_ratio))
-        if self.split == "train":
-            self.sample_index_list = self.sample_index_list[:self.split_index]
-        elif self.split == "valid":
-            self.sample_index_list = self.sample_index_list[self.split_index:]
-            
-        # 更新样本数
-        self.num_samples = len(self.sample_index_list)
-        
-        # 提前进行一次打乱
+        self.train_num_samples = int(self.num_samples * (1 - self.valid_ratio))
+        self.valid_num_samples = self.num_samples - self.train_num_samples
+
+        # 提前进行一次打乱，打乱后再进行的划分
         rng = random.Random(self.random_seed)
         rng.shuffle(self.sample_index_list)
 
-        print_rank0(logger.info, f"Loaded {self.data_dir} {self.split} DPODataset, num_samples: {self.num_samples:,}")
+        print_rank0(logger.info, f"Loaded {self.data_dir} DPODataset, train_num_samples: {self.train_num_samples:,}, valid_num_samples: {self.valid_num_samples:,}")
         
-        # 初始的模式
-        self.mode = self.split
+        # 初始划分，用于判断当前使用的数据集
+        self.split = "train"
+        
+        # 模式，["train", "eval"]，eval下不考虑DDP的影响
+        self.mode = "eval"
 
-    def restore_mode(self):
+    def train(self):
         """
         恢复原来的模式
         """
-        self.mode = self.split
+        self.mode = "train"
     
     def eval(self):
         """
         设置为eval模式，batch就不会按照ddp_world_size跳过了
         """
-        self.mode = "valid"
-
-    def __len__(self):
-        return len(self.input_ids)
+        self.mode = "eval"
 
     def get_single_sample(self, index):
         # 已经进行了截断，最大长度为max_seq_len + 1，这里进行截断，input_ids[i][:-1]，labels[i][1:]
@@ -324,21 +318,27 @@ class DPODataset(torch.utils.data.IterableDataset):
         )
 
     def __iter__(self):
-        # get worker info within a DataLoader
+        # 若有多个worker（dataloader中的num_workers），则获取下信息
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1
-        # get DDP rank info
+        # 获取DDP信息
         ddp_rank = int(os.environ.get("RANK", 0))
         ddp_world_size = int(os.environ.get("WORLD_SIZE", 1))
         
-        rng = random.Random(self.random_seed + 1)
-        sample_index_list = copy.deepcopy(self.sample_index_list)
-        
-        if self.mode == "valid":
-            # 验证模式下，不需要考虑ddp的影响
+        # 考虑数据集的划分
+        if self.split == "train":
+            sample_index_list = copy.deepcopy(self.sample_index_list[:self.train_num_samples])
+        elif self.split == "valid":
+            sample_index_list = copy.deepcopy(self.sample_index_list[self.train_num_samples:])
+            
+        # 验证模式下，不需要考虑ddp的影响，因为只有主进程会进行测试
+        if self.mode == "eval":
             ddp_rank = 0
             ddp_world_size = 1
+        
+        # 后续打乱的随机种子
+        rng = random.Random(self.random_seed + 1)
         
         cur_index = 0 + ddp_world_size * worker_id + ddp_rank  # 因为num_workers的数量可能大于batch_size，所以worker_id要在外层，ddp_rank要在内层
         all_index_len = num_workers * ddp_world_size  # cur_index每次应该跳过的长度
@@ -346,7 +346,7 @@ class DPODataset(torch.utils.data.IterableDataset):
         # 无限循环，是否结束由外部控制
         while True:
             # 进行一个epoch的数据读取
-            while cur_index < self.num_samples:
+            while cur_index < len(sample_index_list):
                 sample_index = sample_index_list[cur_index]
                 cur_index += all_index_len
                 
@@ -363,7 +363,7 @@ class DPODataset(torch.utils.data.IterableDataset):
             print_rank0(logger.info, f"worker_id {worker_id} ddp_rank {ddp_rank} shuffled {self.data_dir} sample_index_list, {shuffle_time:.4f}s")
 
             # 索引从头开始，即开始一个新的epoch
-            cur_index %= self.num_samples
+            cur_index %= len(sample_index_list)
             
 
 class DataCollatorForDPODataset:

@@ -637,21 +637,24 @@ task_kwargs = dict(
     num_cpus=num_cpus,
 )
 if train_data_dir is not None and valid_data_dir is not None:
-    # 按照文件夹划分好了数据集，每次取所有数据，valid_ratio设置为0
+    # 按照文件夹划分好了数据集，每次取所有数据，train下valid_ratio设置为0，valid下设置为1
     task = {
-        "train": Task(data_dir=train_data_dir, split="train", valid_ratio=0, batch_size=train_batch_size, **task_kwargs),
-        "valid": Task(data_dir=valid_data_dir, split="valid", valid_ratio=0, batch_size=valid_batch_size, **task_kwargs),
+        "train": Task(data_dir=train_data_dir, valid_ratio=0, train_batch_size=train_batch_size, **task_kwargs),
+        "valid": Task(data_dir=valid_data_dir, valid_ratio=1, valid_batch_size=valid_batch_size, **task_kwargs),
     }
 else:
     # 只有一个文件夹，dataset类中自动进行划分
+    # 同时构建train和valid数据集，只需要构建一个task类，通过iter_batches(split="train")中指定split来构建对应数据集的迭代器
     task = {
-        "train": Task(data_dir=data_dir, split="train", valid_ratio=valid_ratio, batch_size=train_batch_size, **task_kwargs),
-        "valid": Task(data_dir=data_dir, split="valid", valid_ratio=valid_ratio, batch_size=valid_batch_size, **task_kwargs),
+        "train": Task(data_dir=data_dir, valid_ratio=valid_ratio,
+                      train_batch_size=train_batch_size, valid_batch_size=valid_batch_size,
+                      **task_kwargs),
     }
+    task["valid"] = task["train"]  # 共用一个task类
 
 # -----------------------------------------------------------------------------
 # 根据创建的数据集，计算一个epoch的iter数
-train_num_samples_per_epoch = task["train"].num_samples  # 一个epoch总共的样本数
+train_num_samples_per_epoch = task["train"].train_num_samples  # 一个epoch总共的样本数
 global_train_batch_size = train_batch_size * gradient_accumulation_steps * ddp_world_size  # 全局的train_batch_size
 train_num_iters_per_epoch = train_num_samples_per_epoch // global_train_batch_size  # 一个epoch总共的iter数
 # 计算本次训练需要训练的iter数
@@ -682,33 +685,43 @@ def get_lr(it):
 # 测试函数，只在rank0上进行验证
 @torch.no_grad()
 def estimate_loss():
-    global dpo_config
+    """
+    对train和valid数据集进行测试
+    """
+    global dpo_config, task
     
+    # 测试样本数按照valid数据集来设置
     # 计算valid数据集需要验证的样本数
-    valid_num_samples_per_epoch = task["valid"].num_samples  # 一个epoch总共的样本数
+    valid_num_samples_per_epoch = task["valid"].valid_num_samples  # valid数据集一个epoch总共的样本数
     valid_num_samples = valid_iters * valid_batch_size if valid_iters is not None else valid_num_samples_per_epoch  # 设置下的要验证的样本数
     
     assert valid_num_samples_per_epoch is not None or valid_num_samples is not None, "PretokDataset下，valid_iters必须设置，因为构建方法和index不太一样，不知道总共有多少个sample"
     
-    # 应该验证的样本数
-    cur_valid_num_samples = None
+    # 应该测试的样本数
+    cur_eval_num_samples = None
     if valid_num_samples_per_epoch is not None and valid_num_samples is not None:
-        cur_valid_num_samples = min(valid_num_samples_per_epoch, valid_num_samples)
+        cur_eval_num_samples = min(valid_num_samples_per_epoch, valid_num_samples)
     elif valid_num_samples_per_epoch is not None:
-        cur_valid_num_samples = valid_num_samples_per_epoch
+        cur_eval_num_samples = valid_num_samples_per_epoch
     elif valid_num_samples is not None:
-        cur_valid_num_samples = valid_num_samples
+        cur_eval_num_samples = valid_num_samples
 
-    out = {}
     model.eval()
+    
+    out = {"train": -1, "valid": -1}
     for split in ["train", "valid"]:
         # 根据要验证的样本数，确定需要验证的iter数
         # 即train和valid验证的样本数一样，向下取整，至少验证一个iter
-        cur_valid_iters = cur_valid_num_samples // task[split].batch_size
+        split_batch_size = None
+        if split == "train":
+            split_batch_size = task[split].train_batch_size
+        else:
+            split_batch_size = task[split].valid_batch_size
+        cur_eval_iters = cur_eval_num_samples // split_batch_size
 
-        assert cur_valid_iters > 0, f"valid样本太少，一个valid_batch_size都不能构建"
+        assert cur_eval_iters > 0, f"valid样本太少，一个valid_batch_size都不能构建"
         
-        print_rank0(logger.info, f"Estimating loss, split={split}, {split}_batch_size={task[split].batch_size}, num_iters={cur_valid_iters}")
+        print_rank0(logger.info, f"Estimating loss, split={split}, {split}_batch_size={split_batch_size}, num_iters={cur_eval_iters}")
         
         # task任务也需要转换到eval状态
         # 因为在DDP下，train会受到影响，导致取得batch不是按顺序取的，而是按ddp_world_size跳着取
@@ -717,21 +730,24 @@ def estimate_loss():
         # 所以证明了train在ddp下会受到影响，严谨点，应该设置，记得恢复
         task[split].eval()
         
-        batch_iter = task[split].iter_batches()
-        losses = torch.zeros(cur_valid_iters)  # keep on CPU
-        for k in range(cur_valid_iters):
-            valid_batch = next(batch_iter)
+        # 构建对应数据集的迭代器
+        batch_iter = task[split].iter_batches(split=split)
+
+        losses = torch.zeros(cur_eval_iters)  # keep on CPU
+        for k in range(cur_eval_iters):
+            eval_batch = next(batch_iter)
             with ctx:
-                loss = forward_step(model, valid_batch, task_type=task_type, dpo_config=dpo_config)
-            if loss_reduction == "none":
-                loss = torch.mean(loss.view(-1))
+                loss = forward_step(model, eval_batch, task_type=task_type, dpo_config=dpo_config)
+                if loss_reduction == "none":
+                    loss = torch.mean(loss.view(-1))
             losses[k] = loss.item()
         out[split] = losses.mean().item()
         
-        # task任务恢复为原来的模式，即设置回split
-        task[split].restore_mode()
-        
+        # task任务设置回train模式
+        task[split].train()
+    
     model.train()
+    
     return out
 
 # -----------------------------------------------------------------------------
@@ -740,7 +756,7 @@ skip_batches_per_device = int(iter_num * gradient_accumulation_steps * skip_scal
 skip_data_time = time.time()
 print_rank0(logger.info, f"Skipping {iter_num} iters ({skip_batches_per_device} skip_batches_per_device)")
 
-train_batch_iter = task["train"].iter_batches(skip_batches=skip_batches_per_device)
+train_batch_iter = task["train"].iter_batches(split="train", skip_batches=skip_batches_per_device)
 train_batch = next(train_batch_iter)  # 在里面跳过skip_batches
 
 print_rank0(logger.info, f"Skipped  {iter_num} iters ({skip_batches_per_device} skip_batches_per_device), {time.time() - skip_data_time:.4f}s")

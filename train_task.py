@@ -15,7 +15,7 @@ class Task:
     生成训练时所需要的迭代器
     """
     
-    def __init__(self, task_type, batch_size, device, num_workers=0, **dataset_kwargs):
+    def __init__(self, task_type, device, train_batch_size=None, valid_batch_size=None, num_workers=0, **dataset_kwargs):
         """
         dataset_kwargs: 传递给dataset的参数
             for pretrain:
@@ -25,8 +25,9 @@ class Task:
         """
         
         self.task_type = task_type
-        self.batch_size = batch_size
         self.device = device
+        self.train_batch_size = train_batch_size
+        self.valid_batch_size = valid_batch_size
         self.num_workers = num_workers
         
         # pin_memory: 如果是cpu则不需要pin_memory，其和non_blocking=True一块使用
@@ -44,20 +45,26 @@ class Task:
             collect_fn = dataset_dpo.DataCollatorForDPODataset(**dataset_kwargs)
         else:
             raise ValueError(f"Invalid task_type: {task_type}")
-        
-        # dataloader
-        dataloader = torch.utils.data.DataLoader(dataset, collate_fn=collect_fn, batch_size=batch_size, num_workers=num_workers, pin_memory=self.pin_memory)
-        
         self.dataset = dataset
-        self.dataloader = dataloader
         
-        self.num_samples = self.dataset.num_samples
+        # dataloader，两个dataloader共用一个dataset
+        self.train_dataloader = None
+        self.valid_dataloader = None
+        if self.train_batch_size is not None:
+            self.train_dataloader = torch.utils.data.DataLoader(self.dataset, collate_fn=collect_fn, batch_size=train_batch_size,
+                                                                num_workers=num_workers, pin_memory=self.pin_memory)
+        if self.valid_batch_size is not None:
+            self.valid_dataloader = torch.utils.data.DataLoader(self.dataset, collate_fn=collect_fn, batch_size=valid_batch_size,
+                                                                num_workers=num_workers, pin_memory=self.pin_memory)
+        
+        self.train_num_samples = self.dataset.train_num_samples
+        self.valid_num_samples = self.dataset.valid_num_samples
 
-    def restore_mode(self):
+    def train(self):
         """
-        恢复原来的模式
+        设置为train模式，batch就会按照ddp_world_size跳过了
         """
-        self.dataset.restore_mode()
+        self.dataset.train()
     
     def eval(self):
         """
@@ -65,12 +72,24 @@ class Task:
         """
         self.dataset.eval()
         
-    def iter_batches(self, skip_batches=0):
+    def iter_batches(self, split, skip_batches=0):
         """
         根据dataloader生成迭代器，dataloader使用的dataset会无限生成样本
+        
+        split: 使用的数据集划分，确定当前生成器对应的划分
+        skip_batches: 跳过的batch数量
         """
+        # 设置数据集的划分，确保迭代数据集时用的是对应的索引列表
+        # 如：train下：self.sample_index_list[:self.train_num_samples]
+        self.dataset.split = split
+        
+        if split == "train":
+            dataloader = self.train_dataloader
+        else:
+            dataloader = self.valid_dataloader
+        
         # PyTorch会正确地在内部处理必要的同步，确保在计算操作（如线性层的计算）开始之前数据已经被传输完成。
-        for batch in self.dataloader:
+        for batch in dataloader:
             # resume时，跳过已经训练过的batch
             if skip_batches > 0:
                 skip_batches -= 1
