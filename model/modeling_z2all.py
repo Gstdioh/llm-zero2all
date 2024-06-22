@@ -458,6 +458,10 @@ class Z2allAttention(nn.Module):
             softmax_scale (`float`, *optional*):
                 The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
         """
+        # 记得验证时取消dropout
+        if not self.training:
+            dropout = 0.0
+        
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
             batch_size = query_states.shape[0]

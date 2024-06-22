@@ -53,11 +53,3 @@ for arg in sys.argv[1:]:  # 对于python main.py "123 123" sys.argv 结果是 ['
                 globals()[key] = attempt
             else:
                 raise ValueError(f"Unknown config key: {key}")
-    else:
-        # assume it's the name of a config file
-        assert not arg.startswith('--')
-        config_file = arg
-        print_rank0(print, f"Overriding config with {config_file}:")
-        with open(config_file) as f:
-            print_rank0(print, f.read())
-        exec(open(config_file).read())

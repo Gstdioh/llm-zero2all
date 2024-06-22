@@ -105,6 +105,7 @@ os.environ["NCCL_P2P_DISABLE"] = "1"  # disable p2p
 # pad_token_id = tokenizer.pad_token_id
 
 # -----------------------------------------------------------------------------
+exp_config_file = None  # 实验配置文件
 # I/O
 out_dir = "out"
 out_dir = os.path.join(out_dir, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
@@ -180,7 +181,7 @@ tie_word_embeddings = False  # 是否共享word embedding和word prediction的�
 rope_theta = 10000.0
 rope_scaling = None  # 缩放方法，用于长度外推
 attention_bias = True  # attention中的project是否加bias，Qwen中加了
-attention_dropout = 0.05  # TODO: 或许不用设置dropout
+attention_dropout = 0.05  # TODO: 或许不用设置dropout，因为LLM一般只会训练1、2个epoch
 dropout1 = 0.05
 dropout2 = 0.05
 residual_in_fp32 = True  # 残差连接是否使用fp32
@@ -242,12 +243,22 @@ grad_buffer_is_powerSGD_error = grad_buffer_is_powerSGD_error # 梯度缓冲区�
 use_distributed_optimizer = False  # 是否使用DistributedOptimizer
 overlap_param_gather = False  # 和DistibutedOptimizer一起使用，在forward时提前发起后面bucket的参数gather，实现计算和通信重叠
 # -----------------------------------------------------------------------------
+# 实验参数名
 config_keys = [
     k
     for k, v in globals().items()
     if not k.startswith("_") and isinstance(v, (int, float, bool, str))
 ]
-exec(open("configurator.py").read())  # 根据命令行或者配置文件来覆盖参数
+exec(open("configurator.py").read())  # 根据命令行来覆盖参数
+# 可能从exp_config_file中覆盖参数
+if exp_config_file is not None:
+    # 若提供了exp_config_file，则根据配置文件来覆盖参数
+    exec(open(exp_config_file).read())
+else:
+    if resume and os.path.isfile(os.path.join(out_dir, "exp_config.py")):
+        # resume下，若没有提供exp_config_file，则自动从out_dir/exp_config.py中覆盖参数
+        exec(open(os.path.join(out_dir, "exp_config.py")).read())
+        resume = True  # 记得设置回True，因为之前的第一次训练时的exp_config的resume是False
 # 最终的配置文件
 exp_config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
@@ -395,7 +406,6 @@ init_mode_optim_time = time.time() - init_mode_optim_time
 print_rank0(logger.info, f"Initialized  model and optimizer, {init_mode_optim_time:.4f}s")
 # -----------------------------------------------------------------------------
 # 使用自己的DDP和DistributedOptimizer包裹模型和优化器
-# 只有在从头开始训练时才会进行包裹
 if ddp:
     print_rank0(logger.info, f"Wrapping model into DDP container")
     
@@ -946,6 +956,9 @@ while True:
                     "lr": lr,
                     "mfu": running_mfu * 100,
                 }, name="train", step=iter_num)
+        # gradient_accumulation_steps少于3时，补充一下
+        while len(micro_times) < 3:
+            micro_times.append(0.0)
         print_rank0(logger.info, 
             f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt:.4f}s | mfu {running_mfu*100:.2f}% | micro_time0: {micro_times[0]:.4f}s | micro_time1: {micro_times[1]:.4f}s | last_micro_time: {micro_times[-1]:.4f}s | optim_step_time: {optim_step_time:.4f}s"
         )
