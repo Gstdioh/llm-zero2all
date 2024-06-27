@@ -684,12 +684,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 }
             )
             self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
-        # param到具体的梯度缓冲区的映射。
+        # self.gbuf_ranges，param到具体的梯度缓冲区的映射，只包含当前rank的参数
         # 基于model_param_gbuf_map和gbuf_ranges，则可以根据一个param，找到其对应的buffer区域
         # self.model_param_gbuf_map[param] = (gbuf_index, dtype, bucket_index)
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
         # Optimizer ranges.
+        # 将每个rank对应的参数收集到相应的optim组中
         # self.model_param_group_index_map, 某个dp rank，参数 -> 所处的组id和组内顺序
         # self.opt_group_ranges, 某个dp rank所包含的参数组，其中的参数还没有进行shard
         (
