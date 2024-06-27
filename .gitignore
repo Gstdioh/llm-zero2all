@@ -28,3 +28,4 @@ local_test_*
 my_*
 
 !requirements.txt
+!1.7B_pretrain_now.txt
